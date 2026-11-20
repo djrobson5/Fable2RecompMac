@@ -1,0 +1,34 @@
+From cc5968637e608e4488861d34414e6caa197c50ef Mon Sep 17 00:00:00 2001
+From: djrobson5 <djrobson5@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 21:58:00 -0800
+Subject: [PATCH 09/14] Metal: size boundless descriptor ranges by
+ boundlessRangeSize
+
+The argument encoder of a boundless range had capabilities.maxTextureSize
+entries (16384 on Apple GPUs) whatever the set's boundlessRangeSize, and the
+argument buffer was sized from that encoder. A set with more entries (a
+32768-texture bindless heap) wrote resource IDs past the end of its
+argument buffer for every index >= 16384; a small set (a 512-sampler heap)
+got 16384 sampler entries. The array now has boundlessRangeSize entries.
+---
+ plume_metal.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/plume_metal.cpp b/plume_metal.cpp
+index 07863b0..bc2fb5e 100644
+--- a/plume_metal.cpp
++++ b/plume_metal.cpp
+@@ -1115,7 +1115,9 @@ namespace plume {
+             MTL::ArgumentDescriptor *argumentDesc = MTL::ArgumentDescriptor::alloc()->init();
+             argumentDesc->setDataType(mapDataType(lastRange.type));
+             argumentDesc->setIndex(lastRange.binding);
+-            argumentDesc->setArrayLength(device->capabilities.maxTextureSize);
++            // As many entries as the set can hold: setDescriptor writes up to index
++            // boundlessRangeSize - 1, and the argument buffer is sized from this encoder.
++            argumentDesc->setArrayLength(std::max(desc.boundlessRangeSize, 1U));
+ 
+             if (lastRange.type == RenderDescriptorRangeType::TEXTURE) {
+                 argumentDesc->setTextureType(MTL::TextureType2D);
+-- 
+2.54.0 (Apple Git-157)
+

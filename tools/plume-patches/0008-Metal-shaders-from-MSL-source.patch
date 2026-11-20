@@ -1,0 +1,124 @@
+From 5201181796556ef2d69e95747ab0ce60f6b6f522 Mon Sep 17 00:00:00 2001
+From: djrobson5 <djrobson5@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 21:57:49 -0800
+Subject: [PATCH 08/14] Metal: shaders from MSL source
+
+RenderShaderFormat::METAL took only a metallib. Data that does not start
+with the metallib magic ("MTLB") is now MSL source, compiled with
+newLibraryWithSource, so SPIR-V converted at run time (SPIRV-Cross) needs
+no Metal toolchain on the player's Mac. MetalCompileLibrary holds the one
+set of compile options (MSL 3.0; fast math unless the source carries
+PLUME_METAL_SAFE_MATH_MARKER) for tools that compile the same sources.
+createShader returns nullptr when the library does not build (it returned
+a shader whose library was null, which crashed in createFunction).
+---
+ plume_metal.cpp | 47 +++++++++++++++++++++++++++++++++++++++++++++--
+ plume_metal.h   |  9 +++++++++
+ 2 files changed, 54 insertions(+), 2 deletions(-)
+
+diff --git a/plume_metal.cpp b/plume_metal.cpp
+index 267fa69..07863b0 100644
+--- a/plume_metal.cpp
++++ b/plume_metal.cpp
+@@ -1351,6 +1351,33 @@ namespace plume {
+ 
+     // MetalShader
+ 
++    MTL::Library *MetalCompileLibrary(MTL::Device *device, const char *source, uint64_t size, std::string *error) {
++        MetalAutoreleasePool releasePool;
++        const std::string text(source, size);
++        NS::String *nsSource = NS::String::string(text.c_str(), NS::UTF8StringEncoding);
++        if (nsSource == nullptr) {
++            if (error != nullptr) {
++                *error = "the MSL source is not UTF-8";
++            }
++            return nullptr;
++        }
++
++        MTL::CompileOptions *options = MTL::CompileOptions::alloc()->init();
++        options->setLanguageVersion(MTL::LanguageVersion3_0);
++        const bool safeMath = text.find(PLUME_METAL_SAFE_MATH_MARKER) != std::string::npos;
++        // fastMathEnabled rather than mathMode: mathMode needs macOS 15.
++        options->setFastMathEnabled(!safeMath);
++
++        NS::Error *nsError = nullptr;
++        MTL::Library *library = device->newLibrary(nsSource, options, &nsError);
++        options->release();
++        if (library == nullptr && error != nullptr) {
++            *error = (nsError != nullptr) ? nsError->localizedDescription()->utf8String() : "unknown error";
++        }
++
++        return library;
++    }
++
+     MetalShader::MetalShader(const MetalDevice *device, const void *data, uint64_t size, const char *entryPointName, const RenderShaderFormat format) {
+         assert(device != nullptr);
+         assert(data != nullptr);
+@@ -1363,12 +1390,23 @@ namespace plume {
+         functionName = (entryPointName != nullptr) ? NS::String::string(entryPointName, NS::UTF8StringEncoding) : MTLSTR("");
+         functionName->retain();
+ 
++        const bool metallib = (size >= 4) && (memcmp(data, "MTLB", 4) == 0);
++        if (!metallib) {
++            std::string error;
++            library = MetalCompileLibrary(device->mtl, static_cast<const char *>(data), size, &error);
++            if (library == nullptr) {
++                fprintf(stderr, "MTLDevice newLibraryWithSource: failed with error %s.\n", error.c_str());
++            }
++
++            return;
++        }
++
+         NS::Error *error = nullptr;
+         const dispatch_data_t dispatchData = dispatch_data_create(data, size, dispatch_get_main_queue(), ^{});
+         library = device->mtl->newLibrary(dispatchData, &error);
+ 
+         if (error != nullptr) {
+-            fprintf(stderr, "MTLDevice newLibraryWithSource: failed with error %s.\n", error->localizedDescription()->utf8String());
++            fprintf(stderr, "MTLDevice newLibraryWithData: failed with error %s.\n", error->localizedDescription()->utf8String());
+             return;
+         }
+     }
+@@ -3930,7 +3968,12 @@ namespace plume {
+     }
+ 
+     std::unique_ptr<RenderShader> MetalDevice::createShader(const void *data, uint64_t size, const char *entryPointName, RenderShaderFormat format) {
+-        return std::make_unique<MetalShader>(this, data, size, entryPointName, format);
++        std::unique_ptr<MetalShader> shader = std::make_unique<MetalShader>(this, data, size, entryPointName, format);
++        if (shader->library == nullptr) {
++            return nullptr;
++        }
++
++        return shader;
+     }
+ 
+     std::unique_ptr<RenderSampler> MetalDevice::createSampler(const RenderSamplerDesc &desc) {
+diff --git a/plume_metal.h b/plume_metal.h
+index 4e8dca2..a4dbc3e 100644
+--- a/plume_metal.h
++++ b/plume_metal.h
+@@ -646,12 +646,21 @@ namespace plume {
+         MTL::Library *library = nullptr;
+         NS::String *debugName = nullptr;
+ 
++        // RenderShaderFormat::METAL takes a metallib (it starts with "MTLB") or MSL source text,
++        // compiled here with MetalCompileLibrary (no Metal toolchain needed at run time).
+         MetalShader(const MetalDevice *device, const void *data, uint64_t size, const char *entryPointName, RenderShaderFormat format);
+         ~MetalShader() override;
+         virtual void setName(const std::string &name) override;
+         MTL::Function* createFunction(const RenderSpecConstant *specConstants, uint32_t specConstantsCount) const;
+     };
+ 
++    // Compiles MSL source text into a library (nullptr and *error on failure). A source that
++    // contains PLUME_METAL_SAFE_MATH_MARKER is compiled with safe math (no fast-math
++    // reassociation or contraction: the SPIR-V had NoContraction or float-controls modes).
++    // The same options are used by every MSL source shader, so tools can reuse it.
++    static constexpr const char *PLUME_METAL_SAFE_MATH_MARKER = "// plume-metal: safe-math";
++    MTL::Library *MetalCompileLibrary(MTL::Device *device, const char *source, uint64_t size, std::string *error);
++
+     struct MetalSampler : RenderSampler {
+         MTL::SamplerState *state = nullptr;
+         RenderBorderColor borderColor = RenderBorderColor::UNKNOWN;
+-- 
+2.54.0 (Apple Git-157)
+

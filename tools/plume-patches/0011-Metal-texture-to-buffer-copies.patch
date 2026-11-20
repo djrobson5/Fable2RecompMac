@@ -1,0 +1,71 @@
+From 4e23a3488397d4b406692192ba7fce9c385f38c9 Mon Sep 17 00:00:00 2001
+From: djrobson5 <djrobson5@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 21:58:47 -0800
+Subject: [PATCH 11/14] Metal: texture-to-buffer copies
+
+copyTextureRegion copied buffer to texture and texture to texture; a
+PLACED_FOOTPRINT destination with a SUBRESOURCE source (a readback) hit
+the texture-to-texture path's asserts. It is now a blit from the texture
+into the buffer: rows of rowWidth texels of the footprint's format, the
+source region from srcBox (default: the footprint's size at the origin).
+From a depth-stencil texture an R8_UINT/R8_TYPELESS footprint takes the
+stencil, any other the depth (BlitOptionStencil/DepthFromDepthStencil).
+---
+ plume_metal.cpp | 41 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 41 insertions(+)
+
+diff --git a/plume_metal.cpp b/plume_metal.cpp
+index b116c25..840d49f 100644
+--- a/plume_metal.cpp
++++ b/plume_metal.cpp
+@@ -3100,6 +3100,47 @@ namespace plume {
+                 dstOrigin
+             );
+             activeBlitEncoder->popDebugGroup();
++        } else if (dstLocation.type == RenderTextureCopyType::PLACED_FOOTPRINT && srcLocation.type == RenderTextureCopyType::SUBRESOURCE) {
++            // Texture to buffer (readbacks). The footprint's format gives the buffer's texel size;
++            // the depth or the stencil of a depth-stencil texture is chosen by that format.
++            assert(srcTexture != nullptr);
++            assert(dstBuffer != nullptr);
++
++            const RenderFormat footprintFormat = dstLocation.placedFootprint.format;
++            const uint32_t blockWidth = RenderFormatBlockWidth(footprintFormat);
++            const uint32_t horizontalBlocks = (dstLocation.placedFootprint.rowWidth + blockWidth - 1) / blockWidth;
++            const uint32_t verticalBlocks = (dstLocation.placedFootprint.height + blockWidth - 1) / blockWidth;
++            const uint32_t bytesPerRow = horizontalBlocks * RenderFormatSize(footprintFormat);
++            const uint32_t bytesPerImage = bytesPerRow * verticalBlocks;
++
++            MTL::Origin srcOrigin = { 0, 0, 0 };
++            MTL::Size size = { dstLocation.placedFootprint.width, dstLocation.placedFootprint.height, dstLocation.placedFootprint.depth };
++            if (srcBox != nullptr) {
++                srcOrigin = { NS::UInteger(srcBox->left), NS::UInteger(srcBox->top), NS::UInteger(srcBox->front) };
++                size = { NS::UInteger(srcBox->right - srcBox->left), NS::UInteger(srcBox->bottom - srcBox->top), NS::UInteger(srcBox->back - srcBox->front) };
++            }
++
++            MTL::BlitOption options = MTL::BlitOptionNone;
++            const MTL::PixelFormat srcFormat = srcTexture->mtl->pixelFormat();
++            if (srcFormat == MTL::PixelFormatDepth32Float_Stencil8 || srcFormat == MTL::PixelFormatDepth24Unorm_Stencil8) {
++                const bool stencil = (footprintFormat == RenderFormat::R8_UINT) || (footprintFormat == RenderFormat::R8_TYPELESS);
++                options = stencil ? MTL::BlitOptionStencilFromDepthStencil : MTL::BlitOptionDepthFromDepthStencil;
++            }
++
++            activeBlitEncoder->pushDebugGroup(MTLSTR("CopyTextureToBuffer"));
++            activeBlitEncoder->copyFromTexture(
++                srcTexture->mtl,
++                srcLocation.subresource.arrayIndex,
++                srcLocation.subresource.mipLevel,
++                srcOrigin,
++                size,
++                dstBuffer->mtl,
++                dstLocation.placedFootprint.offset,
++                bytesPerRow,
++                bytesPerImage,
++                options
++            );
++            activeBlitEncoder->popDebugGroup();
+         } else {
+             assert(dstTexture != nullptr);
+             assert(srcTexture != nullptr);
+-- 
+2.54.0 (Apple Git-157)
+

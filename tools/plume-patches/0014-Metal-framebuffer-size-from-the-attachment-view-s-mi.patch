@@ -1,0 +1,59 @@
+From 198a5f408ead0b234a2e1676a36f6b394929ddf1 Mon Sep 17 00:00:00 2001
+From: djrobson5 <djrobson5@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 22:18:46 -0800
+Subject: [PATCH 14/14] Metal: framebuffer size from the attachment view's mip
+ level
+
+The Metal side of 0004: a framebuffer whose attachment is a view of mip
+level N took the base level's size as its own and as the attachment's.
+Full-target clears and the default viewport and scissor then covered the
+base level's area, larger than the attachment. The sizes are now the
+view's mip level size, for colour and depth-only framebuffers.
+---
+ plume_metal.cpp | 16 ++++++++++------
+ 1 file changed, 10 insertions(+), 6 deletions(-)
+
+diff --git a/plume_metal.cpp b/plume_metal.cpp
+index 13cc55c..bfaa7f3 100644
+--- a/plume_metal.cpp
++++ b/plume_metal.cpp
+@@ -2222,8 +2222,10 @@ namespace plume {
+             attachment.texture = colorAttachment;
+             attachment.textureView = colorAttachmentView;
+             attachment.format = colorAttachmentView ? colorAttachmentView->desc.format : colorAttachment->desc.format;
+-            attachment.width = colorAttachment->desc.width;
+-            attachment.height = colorAttachment->desc.height;
++            // A view of mip level N: the attachment is that level's size, not the base level's.
++            const uint32_t colorMip = colorAttachmentView ? colorAttachmentView->desc.mipSlice : 0;
++            attachment.width = std::max(colorAttachment->desc.width >> colorMip, 1U);
++            attachment.height = std::max(colorAttachment->desc.height >> colorMip, 1U);
+             attachment.depth = colorAttachment->desc.depth;
+             attachment.sampleCount = colorAttachment->desc.multisampling.sampleCount;
+             colorAttachments.emplace_back(attachment);
+@@ -2241,8 +2243,9 @@ namespace plume {
+             depthAttachment.texture = interfaceDepthAttachment;
+             depthAttachment.textureView = depthAttachmentView;
+             depthAttachment.format = depthAttachmentView ? depthAttachmentView->desc.format : interfaceDepthAttachment->desc.format;
+-            depthAttachment.width = interfaceDepthAttachment->desc.width;
+-            depthAttachment.height = interfaceDepthAttachment->desc.height;
++            const uint32_t depthMip = depthAttachmentView ? depthAttachmentView->desc.mipSlice : 0;
++            depthAttachment.width = std::max(interfaceDepthAttachment->desc.width >> depthMip, 1U);
++            depthAttachment.height = std::max(interfaceDepthAttachment->desc.height >> depthMip, 1U);
+             depthAttachment.depth = interfaceDepthAttachment->desc.depth;
+             depthAttachment.sampleCount = interfaceDepthAttachment->desc.multisampling.sampleCount;
+ 
+@@ -2252,8 +2255,9 @@ namespace plume {
+         }
+ 
+         if (firstTexture) {
+-            width = firstTexture->desc.width;
+-            height = firstTexture->desc.height;
++            const MetalAttachment &firstAttachment = (desc.colorAttachmentsCount > 0) ? colorAttachments[0] : depthAttachment;
++            width = firstAttachment.width;
++            height = firstAttachment.height;
+ 
+             sampleCount = firstTexture->desc.multisampling.sampleCount;
+             samplePositionsEnabled = sampleCount > 1 && firstTexture->desc.multisampling.sampleLocationsEnabled;
+-- 
+2.54.0 (Apple Git-157)
+

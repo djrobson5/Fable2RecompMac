@@ -1,0 +1,54 @@
+From 48a8571b797f59b6ad86e10765472c88c0bef54e Mon Sep 17 00:00:00 2001
+From: djrobson5 <djrobson5@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 21:59:53 -0800
+Subject: [PATCH 13/14] Metal: scaled and 10:10:10:2 vertex formats
+
+The Metal side of 0001: the USCALED/SSCALED formats map to Metal's
+unnormalized integer vertex formats (Metal converts them to float for a
+float shader input, as for the SSCALED formats plume already mapped), and
+A2B10G10R10 UNORM/SNORM to UInt1010102Normalized/Int1010102Normalized.
+They were VertexFormatInvalid.
+---
+ plume_metal.cpp | 26 ++++++++++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+diff --git a/plume_metal.cpp b/plume_metal.cpp
+index 8b8d46e..13cc55c 100644
+--- a/plume_metal.cpp
++++ b/plume_metal.cpp
+@@ -544,6 +544,32 @@ namespace plume {
+                 return MTL::VertexFormatCharNormalized;
+             case RenderFormat::R8_SINT:
+                 return MTL::VertexFormatChar;
++            // USCALED/SSCALED: integer formats, which Metal converts to float without
++            // normalizing when the shader input is a float (as the SSCALED ones above).
++            case RenderFormat::R16G16B16A16_USCALED:
++                return MTL::VertexFormatUShort4;
++            case RenderFormat::R8G8B8A8_USCALED:
++                return MTL::VertexFormatUChar4;
++            case RenderFormat::R8G8B8A8_SSCALED:
++                return MTL::VertexFormatChar4;
++            case RenderFormat::R16G16_USCALED:
++                return MTL::VertexFormatUShort2;
++            case RenderFormat::R8G8_USCALED:
++                return MTL::VertexFormatUChar2;
++            case RenderFormat::R8G8_SSCALED:
++                return MTL::VertexFormatChar2;
++            case RenderFormat::R16_USCALED:
++                return MTL::VertexFormatUShort;
++            case RenderFormat::R16_SSCALED:
++                return MTL::VertexFormatShort;
++            case RenderFormat::R8_USCALED:
++                return MTL::VertexFormatUChar;
++            case RenderFormat::R8_SSCALED:
++                return MTL::VertexFormatChar;
++            case RenderFormat::A2B10G10R10_UNORM_PACK32:
++                return MTL::VertexFormatUInt1010102Normalized;
++            case RenderFormat::A2B10G10R10_SNORM_PACK32:
++                return MTL::VertexFormatInt1010102Normalized;
+             default:
+                 assert(false && "Unsupported vertex format.");
+                 return MTL::VertexFormatInvalid;
+-- 
+2.54.0 (Apple Git-157)
+

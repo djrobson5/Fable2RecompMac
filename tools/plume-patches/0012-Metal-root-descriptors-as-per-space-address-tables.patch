@@ -1,0 +1,160 @@
+From 444c0987cf12a1118ed88492a41cf16323c66b51 Mon Sep 17 00:00:00 2001
+From: djrobson5 <djrobson5@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 21:59:40 -0800
+Subject: [PATCH 12/14] Metal: root descriptors as per-space address tables
+
+setGraphicsRootDescriptor asserted on Metal. A root descriptor (register
+b, space s) is now entry b of set s's argument buffer: SPIRV-Cross lays out
+a set of buffers as an argument buffer of buffer addresses, so the command
+list keeps the addresses per space and binds them with setVertexBytes and
+setFragmentBytes at that set's index, as Vulkan's push descriptor sets do
+(0002). Spaces sit after the layout's descriptor sets and below
+MAX_DESCRIPTOR_SET_BINDINGS, registers below 16. Without a residency set
+the buffers are made resident with useResource.
+---
+ plume_metal.cpp | 51 ++++++++++++++++++++++++++++++++++++++++++++++++-
+ plume_metal.h   | 21 +++++++++++++++++++-
+ 2 files changed, 70 insertions(+), 2 deletions(-)
+
+diff --git a/plume_metal.cpp b/plume_metal.cpp
+index 840d49f..8b8d46e 100644
+--- a/plume_metal.cpp
++++ b/plume_metal.cpp
+@@ -2670,8 +2670,11 @@ namespace plume {
+             // Clear descriptor set bindings since they're no longer valid with the new layout
+             for (uint32_t i = 0; i < MAX_DESCRIPTOR_SET_BINDINGS; i++) {
+                 renderDescriptorSets[i] = nullptr;
++                renderRootTables[i] = {};
+             }
+ 
++            renderRootSpaceMask = 0;
++
+             // Clear push constants since they might have different layouts/ranges
+             pushConstants.clear();
+             stateCache.lastPushConstants.clear();
+@@ -2717,7 +2720,22 @@ namespace plume {
+     }
+ 
+     void MetalCommandList::setGraphicsRootDescriptor(RenderBufferReference bufferReference, uint32_t rootDescriptorIndex) {
+-        assert(false && "Root descriptors are not supported in Metal.");
++        assert(activeGraphicsPipelineLayout != nullptr);
++        assert(rootDescriptorIndex < activeGraphicsPipelineLayout->rootDescriptors.size());
++        assert(bufferReference.ref != nullptr);
++
++        const MetalPipelineLayout::RootDescriptor &root = activeGraphicsPipelineLayout->rootDescriptors[rootDescriptorIndex];
++        if ((root.space >= MAX_DESCRIPTOR_SET_BINDINGS) || (root.binding >= MAX_ROOT_DESCRIPTOR_BINDINGS)) {
++            return;
++        }
++
++        const MetalBuffer *buffer = static_cast<const MetalBuffer *>(bufferReference.ref);
++        RootDescriptorTable &table = renderRootTables[root.space];
++        table.addresses[root.binding] = buffer->mtl->gpuAddress() + bufferReference.offset;
++        table.buffers[root.binding] = buffer->mtl;
++        table.count = std::max(table.count, root.binding + 1);
++        renderRootSpaceMask |= 1U << root.space;
++        dirtyGraphicsState.rootDescriptors = 1;
+     }
+ 
+     void MetalCommandList::setRaytracingPipelineLayout(const RenderPipelineLayout *pipelineLayout) {
+@@ -3644,6 +3662,27 @@ namespace plume {
+             }
+             dirtyGraphicsState.pushConstants = 0;
+         }
++
++        // Root descriptors: each space's buffer addresses, bound as that set's argument buffer.
++        if (dirtyGraphicsState.rootDescriptors) {
++            uint32_t spaceMask = renderRootSpaceMask;
++            while (spaceMask != 0) {
++                const uint32_t space = __builtin_ctz(spaceMask);
++                spaceMask &= ~(1U << space);
++                const RootDescriptorTable &table = renderRootTables[space];
++                const uint32_t bindIndex = DESCRIPTOR_SETS_BINDING_INDEX + space;
++                activeRenderEncoder->setVertexBytes(table.addresses, table.count * sizeof(uint64_t), bindIndex);
++                activeRenderEncoder->setFragmentBytes(table.addresses, table.count * sizeof(uint64_t), bindIndex);
++                if (device->residencySet == nullptr) {
++                    for (uint32_t i = 0; i < table.count; i++) {
++                        if (table.buffers[i] != nullptr) {
++                            activeRenderEncoder->useResource(table.buffers[i], MTL::ResourceUsageRead, MTL::RenderStageVertex | MTL::RenderStageFragment);
++                        }
++                    }
++                }
++            }
++            dirtyGraphicsState.rootDescriptors = 0;
++        }
+     }
+ 
+     void MetalCommandList::endActiveRenderEncoder() {
+@@ -3870,6 +3909,16 @@ namespace plume {
+ 
+         this->setLayoutCount = desc.descriptorSetDescsCount;
+ 
++        for (uint32_t i = 0; i < desc.rootDescriptorDescsCount; i++) {
++            const RenderRootDescriptorDesc &root = desc.rootDescriptorDescs[i];
++            if ((root.registerSpace < setLayoutCount) || (root.registerSpace >= MAX_DESCRIPTOR_SET_BINDINGS) || (root.shaderRegister >= MetalCommandList::MAX_ROOT_DESCRIPTOR_BINDINGS)) {
++                fprintf(stderr, "Root descriptor (register %u, space %u) is outside what Metal binds: spaces %u-%u, registers below %u.\n",
++                    root.shaderRegister, root.registerSpace, setLayoutCount, MAX_DESCRIPTOR_SET_BINDINGS - 1, MetalCommandList::MAX_ROOT_DESCRIPTOR_BINDINGS);
++            }
++
++            rootDescriptors.push_back({ root.registerSpace, root.shaderRegister });
++        }
++
+         pushConstantRanges.resize(desc.pushConstantRangesCount);
+         memcpy(pushConstantRanges.data(), desc.pushConstantRanges, sizeof(RenderPushConstantRange) * desc.pushConstantRangesCount);
+     }
+diff --git a/plume_metal.h b/plume_metal.h
+index a4dbc3e..d98c809 100644
+--- a/plume_metal.h
++++ b/plume_metal.h
+@@ -119,6 +119,7 @@ namespace plume {
+                 uint32_t depthStencil : 1;
+                 uint32_t rasterizer : 1;
+                 uint32_t blendConstants : 1;
++                uint32_t rootDescriptors : 1;
+             };
+             uint32_t value;
+         };
+@@ -130,7 +131,7 @@ namespace plume {
+         uint32_t vertexBufferSlots;
+ 
+         void setAll() {
+-            value = 0x3FF; // All 10 bits set
++            value = 0x7FF; // All 11 bits set
+             descriptorSetDirtyIndex = 0;
+             vertexBufferSlots = (1U << MAX_VERTEX_BUFFER_BINDINGS) - 1;
+         }
+@@ -451,6 +452,15 @@ namespace plume {
+         const MetalRenderState *activeRenderState = nullptr;
+         const MetalComputeState *activeComputeState = nullptr;
+         MetalDescriptorSet* renderDescriptorSets[MAX_DESCRIPTOR_SET_BINDINGS] = {};
++
++        static constexpr uint32_t MAX_ROOT_DESCRIPTOR_BINDINGS = 16;
++        struct RootDescriptorTable {
++            uint64_t addresses[MAX_ROOT_DESCRIPTOR_BINDINGS] = {};
++            MTL::Buffer *buffers[MAX_ROOT_DESCRIPTOR_BINDINGS] = {};
++            uint32_t count = 0;
++        };
++        RootDescriptorTable renderRootTables[MAX_DESCRIPTOR_SET_BINDINGS];
++        uint32_t renderRootSpaceMask = 0;
+         MetalDescriptorSet* computeDescriptorSets[MAX_DESCRIPTOR_SET_BINDINGS] = {};
+ 
+         MTL::Fence *timestampQueryFence = nullptr;
+@@ -703,7 +713,16 @@ namespace plume {
+     };
+ 
+     struct MetalPipelineLayout : RenderPipelineLayout {
++        // A root descriptor is entry `binding` (the shader register) of the argument buffer
++        // of set `space` (the register space): a buffer address, as SPIRV-Cross lays out a
++        // set of buffers. The command list binds the addresses as bytes at that set's index.
++        struct RootDescriptor {
++            uint32_t space = 0;
++            uint32_t binding = 0;
++        };
++
+         std::vector<RenderPushConstantRange> pushConstantRanges;
++        std::vector<RootDescriptor> rootDescriptors;
+         uint32_t setLayoutCount = 0;
+ 
+         MetalPipelineLayout(MetalDevice *device, const RenderPipelineLayoutDesc &desc);
+-- 
+2.54.0 (Apple Git-157)
+
