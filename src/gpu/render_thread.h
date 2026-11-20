@@ -35,9 +35,12 @@ bool UploadRingInit();
 constexpr u32 kUploadRingSlots = 2;
 void UploadRingNextCapturedFrame();  // game's thread, at its Present
 void UploadRingFramePresented();     // render thread, PresentLocked
+void UploadRingFrameReleased();      // render thread, PresentLocked: its guest reads are over
 void UploadRingSlotSubmitted(u32 command_slot);
 void UploadRingSlotFinished(u32 command_slot);
+void UploadRingFramesDone(u64 frames);  // frames 0..frames-1 are off the GPU
 u32 UploadRingSlot();
+u64 UploadRingCaptureFrame();  // the frame the game is capturing (from 0)
 void UploadRingParkExcess(VideoState &s);  // render thread
 u64 UploadRingEpoch();
 
@@ -149,6 +152,10 @@ struct DrawPacket {
   // slot n recorded); the replay looks the textures up by these.
   u32 texHeaderMask = 0;
   u32 texHeaders[16][6] = {};
+  // fable2_diag_late_reads: the global unlock sequence and the vertex streams'
+  // endian bits (2 per stream) when the draw was recorded.
+  u64 unlockGlobal = 0;
+  u32 streamEndian = 0;
 };
 
 struct ClearPacket {

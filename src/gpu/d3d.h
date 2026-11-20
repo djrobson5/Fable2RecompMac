@@ -180,6 +180,12 @@ enum class DeclUsage : u8 {
 constexpr u32 kDevicePageShift = 5;
 inline std::atomic<u32> g_device_block_misses{0};
 inline std::atomic<u32> g_device_block_miss_offset{0};
+// fable2_diag_window_misses: replay-time device reads outside the captured
+// window, by dword offset (they read live guest memory, which the game may
+// already have changed for its next frame).
+constexpr u32 kDeviceMissHistDwords = 0x3400 / 4;
+inline std::atomic<bool> g_device_miss_hist_on{false};
+inline std::atomic<u32> g_device_miss_hist[kDeviceMissHistDwords];
 
 struct DeviceView {
   u32 va = 0;
@@ -192,6 +198,9 @@ struct DeviceView {
     if (pages && !(pages[off >> kDevicePageShift] && pages[(off + bytes - 1) >> kDevicePageShift])) {
       if (g_device_block_misses.fetch_add(1, std::memory_order_relaxed) == 0)
         g_device_block_miss_offset.store(off, std::memory_order_relaxed);
+      if (g_device_miss_hist_on.load(std::memory_order_relaxed))
+        for (u32 d = off >> 2; d <= (off + bytes - 1) >> 2 && d < kDeviceMissHistDwords; ++d)
+          g_device_miss_hist[d].fetch_add(1, std::memory_order_relaxed);
       return nullptr;
     }
     return snapshot + off;

@@ -11,8 +11,13 @@
 #include <mutex>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <format>
+#include <thread>
 #include <vector>
+#if defined(__APPLE__)
+#include <pthread.h>
+#endif
 
 #if defined(EOT_D3D12)
 #include <plume_d3d12.h>
@@ -359,6 +364,8 @@ void FlushRetiredLocked(VideoState &s) {
   s.buffer_retired.clear();
 }
 
+static bool DoneMarkersOn();
+
 void AdvanceAndWaitReused(VideoState &s) {
   UploadRingSlotSubmitted(s.frame.load(std::memory_order_relaxed));
   const u32 slot = s.next_frame;
@@ -366,10 +373,19 @@ void AdvanceAndWaitReused(VideoState &s) {
   s.frame_chunks = 0;
   s.next_frame = (slot + 1) % kNumFrames;
   s.command_list = s.command_lists[slot].get();
+  // With GPU-done markers the game's thread may be waiting here because the
+  // marker thread fell behind; it is released (UploadRingSlotFinished) only
+  // after the slot's query counts and write-backs are published below, since
+  // it reads them. Without markers the release stays first (as before).
+  const bool publish_first = DoneMarkersOn();
+  bool slot_finished = false;
   if (s.command_list_submitted[slot]) {
     s.queue->waitForCommandFence(s.fences[slot].get());
     s.command_list_submitted[slot] = false;
-    UploadRingSlotFinished(slot);
+    if (publish_first)
+      slot_finished = true;
+    else
+      UploadRingSlotFinished(slot);
     // The slot's chunks ran before its fenced submit.
     for (auto &l : s.chunk_inflight[slot])
       s.chunk_spare[slot].push_back(std::move(l));
@@ -383,7 +399,10 @@ void AdvanceAndWaitReused(VideoState &s) {
 #endif
   } else if (s.chunk_inflight[slot].empty()) {
     // Nothing of this slot's frames is on the GPU (no submit, no chunks).
-    UploadRingSlotFinished(slot);
+    if (publish_first)
+      slot_finished = true;
+    else
+      UploadRingSlotFinished(slot);
   }
   // Fable 2: the bindless texture set is shared by both frames in flight.
   // Textures released while this slot's frame was recorded were still in the
@@ -406,6 +425,8 @@ void AdvanceAndWaitReused(VideoState &s) {
   s.buffer_graveyard[slot].clear();
   QueriesSlotRecycledLocked(s, slot);
   WritebacksSlotRecycledLocked(s, slot);
+  if (slot_finished)
+    UploadRingSlotFinished(slot);
   DrainDescriptorSlotsLocked(s, slot);
   for (auto &v : s.view_graveyard[slot])
     s.view_deferred.push_back(std::move(v));
@@ -687,7 +708,23 @@ static u32 SlotOf(u64 frame) { return static_cast<u32>(frame % kRingSlots); }
 // Chunks over the usual 4 left by a slot reset, for the render thread to park.
 static std::vector<std::unique_ptr<plume::RenderBuffer>> g_ring_excess;
 
+REXCVAR_DEFINE_BOOL(fable2_gpu_done_wait_replay, false, "Fable2",
+                    "Native renderer: with fable2_gpu_done_markers, the game's next frame also waits until the "
+                    "render thread has read the previous frame's guest data (safety switch; ~0.6 ms slower)");
+
 void UploadRingFramePresented() { g_frames_presented.fetch_add(1, std::memory_order_acq_rel); }
+
+// Presents whose guest-memory reads are over (the front buffer, announced
+// texture preloads): the render thread is done with that frame's guest data.
+static std::atomic<u64> g_frames_released{0};
+static bool DoneMarkersOn();
+void UploadRingFrameReleased() {
+  g_frames_released.fetch_add(1, std::memory_order_acq_rel);
+  if (DoneMarkersOn() && REXCVAR_GET(fable2_gpu_done_wait_replay)) {
+    { std::lock_guard lock(g_done_mutex); }
+    g_done_cv.notify_all();
+  }
+}
 static void ResetRingSlotLocked(u32 slot);
 
 void UploadRingNextCapturedFrame() {
@@ -696,11 +733,25 @@ void UploadRingNextCapturedFrame() {
     // The slot's previous user is frame next - kRingSlots: frames 0..that one done.
     const u64 need = next - kRingSlots + 1;
     std::unique_lock lock(g_done_mutex);
-    if (!g_done_cv.wait_for(lock, std::chrono::seconds(2), [&] { return g_gpu_done_frames >= need; })) {
+    // With GPU-done markers the game may start this frame while the render
+    // thread still replays the previous one. Replay takes its guest data from
+    // the draw packets and the upload ring, except a few live reads: texture
+    // uploads and content checks, a stream's endian bits, the front buffer.
+    // Those can see the game's next frame. fable2_diag_late_reads counted none
+    // in Bowerstone market, but it cannot see writes still in progress (a
+    // texture locked, not yet unlocked) or writes made without an Unlock.
+    // fable2_gpu_done_wait_replay also waits until the render thread's Present
+    // has read the frame's last guest data.
+    const bool markers = DoneMarkersOn() && REXCVAR_GET(fable2_gpu_done_wait_replay);
+    if (!g_done_cv.wait_for(lock, std::chrono::seconds(2), [&] {
+          return g_gpu_done_frames >= need &&
+                 (!markers || g_frames_released.load(std::memory_order_acquire) >= next);
+        })) {
       static std::atomic<u32> logged{0};
       if (logged.fetch_add(1) < 8)
-        EOT_WARN("[upload-ring] frame {}: the GPU finished only {} of {} frames after 2 s; reusing the slot",
-                 next, g_gpu_done_frames, need);
+        EOT_WARN("[upload-ring] frame {}: the GPU finished only {} of {} frames (render thread released {}) "
+                 "after 2 s; reusing the slot",
+                 next, g_gpu_done_frames, need, g_frames_released.load(std::memory_order_relaxed));
     }
   }
   std::lock_guard lock(g_ring_mutex);
@@ -728,6 +779,219 @@ void UploadRingSlotFinished(u32 command_slot) {
     g_gpu_done_frames = std::max(g_gpu_done_frames, g_slot_frames[command_slot]);
   }
   g_done_cv.notify_all();
+}
+
+void UploadRingFramesDone(u64 frames) {
+  {
+    std::lock_guard lock(g_done_mutex);
+    if (frames <= g_gpu_done_frames)
+      return;
+    g_gpu_done_frames = frames;
+  }
+  g_done_cv.notify_all();
+}
+
+// GPU-done markers (fable2_gpu_done_markers). Without them the game's thread
+// learns that frame N is off the GPU only when the render thread waits for
+// that slot's fence, at its Present of frame N+1: the game's Present then waits
+// for the render thread's whole tail, not for the GPU. With them, an empty
+// command list with its own fence follows each Present's submit, and a helper
+// thread waits that fence, publishes the frame's occlusion query counts
+// (QueriesPublishSubmitted) and then the frame count. The queue runs in submit
+// order, so the marker signals after everything before it (the frame's chunks
+// and its fenced submit). Two upload-ring slots stay, so the game's lead over
+// the GPU is unchanged.
+//
+// The query counts must come from here: published only at the render thread's
+// recycle, they arrived after the released game had already asked for them,
+// so 80-100% of its reads got the stale "fully visible" answer (occlusion
+// culling off, extra draws, and flicker in the host counts when on from boot).
+namespace {
+
+constexpr u32 kDoneMarkers = 4;
+
+struct DoneMarkers {
+  std::unique_ptr<plume::RenderCommandFence> fence[kDoneMarkers];
+  std::unique_ptr<plume::RenderCommandList> list[kDoneMarkers];
+  u64 frames[kDoneMarkers] = {};
+  u32 querySlot[kDoneMarkers] = {};
+  u64 querySerial[kDoneMarkers] = {};
+  std::atomic<bool> busy[kDoneMarkers] = {};
+  u32 next = 0; // render thread only
+  // Set on a fence error (device lost) or a failed init: back to Present-time
+  // publishing. Read by the game's thread too.
+  std::atomic<bool> failed{false};
+  // The thread left with a marker unsignalled: its fence and list may still be
+  // used by the GPU or plume's completion handler, so they are never destroyed.
+  bool abandoned = false;
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::deque<u32> pending;
+  bool stop = false;
+  std::thread thread;
+  plume::RenderDevice *device = nullptr;
+  u64 skipped = 0;
+};
+
+// Never destroyed: a renderer that skipped its drain leaves the thread running at exit.
+DoneMarkers &g_markers = *new DoneMarkers;
+
+#if !defined(EOT_D3D12)
+
+enum class FenceWait { Signalled, Timeout, Error };
+
+// Waits up to timeout_ms for marker i's fence and resets it.
+FenceWait WaitMarkerFence(u32 i, u32 timeout_ms) {
+  auto &m = g_markers;
+#if defined(FABLE2_METAL_BACKEND)
+  if (UseMetal()) {
+    auto *fence = static_cast<plume::MetalCommandFence *>(m.fence[i].get());
+    return dispatch_semaphore_wait(fence->semaphore,
+                                   dispatch_time(DISPATCH_TIME_NOW, int64_t(timeout_ms) * int64_t(NSEC_PER_MSEC))) == 0
+               ? FenceWait::Signalled
+               : FenceWait::Timeout;
+  }
+#endif
+  auto *dev = static_cast<plume::VulkanDevice *>(m.device);
+  VkFence fence = static_cast<plume::VulkanCommandFence *>(m.fence[i].get())->vk;
+  const VkResult res = vkWaitForFences(dev->vk, 1, &fence, VK_TRUE, u64(timeout_ms) * 1000000ull);
+  if (res == VK_TIMEOUT)
+    return FenceWait::Timeout;
+  if (res != VK_SUCCESS)
+    return FenceWait::Error; // device lost: returns at once, so retrying would spin
+  vkResetFences(dev->vk, 1, &fence);
+  return FenceWait::Signalled;
+}
+
+void DoneMarkerThread() {
+#if defined(__APPLE__)
+  pthread_setname_np("Fable2 GPU done");
+  // The game's thread waits on this one: wake it on a performance core.
+  pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+  auto &m = g_markers;
+  for (;;) {
+    u32 i;
+    {
+      std::unique_lock lock(m.mutex);
+      m.cv.wait(lock, [&] { return m.stop || !m.pending.empty(); });
+      if (m.pending.empty())
+        return;
+      i = m.pending.front();
+      m.pending.pop_front();
+    }
+    for (;;) {
+      const FenceWait w = WaitMarkerFence(i, 100);
+      if (w == FenceWait::Signalled)
+        break;
+      std::lock_guard lock(m.mutex);
+      if (w == FenceWait::Error) {
+        EOT_WARN("[upload-ring] GPU-done marker fence failed (device lost?); back to Present-time publishing");
+        m.failed.store(true, std::memory_order_release);
+        m.abandoned = true;
+        return;
+      }
+      if (m.stop) {
+        m.abandoned = true; // the GPU never finished it: leave it
+        return;
+      }
+    }
+    // The frame's occlusion counts first: the game, once released, reads them.
+    QueriesPublishSubmitted(m.querySlot[i], m.querySerial[i]);
+    UploadRingFramesDone(m.frames[i]);
+    m.busy[i].store(false, std::memory_order_release);
+  }
+}
+#endif
+
+}
+
+REXCVAR_DEFINE_BOOL(fable2_gpu_done_markers, false, "Fable2",
+                    "Native renderer: let the game's thread start its next frame as soon as the GPU has "
+                    "finished the frame its upload slot held, not at the render thread's next Present "
+                    "(Bowerstone market on Metal: 9.6 -> 8.3 ms)");
+
+static bool DoneMarkersOn() {
+  return REXCVAR_GET(fable2_gpu_done_markers) && !g_markers.failed.load(std::memory_order_acquire);
+}
+
+void SubmitDoneMarkerLocked(VideoState &s) {
+#if defined(EOT_D3D12)
+  (void)s;
+#else
+  auto &m = g_markers;
+  if (!REXCVAR_GET(fable2_gpu_done_markers) || m.failed.load(std::memory_order_relaxed))
+    return;
+  if (!m.thread.joinable()) {
+    m.device = s.device.get();
+    for (u32 i = 0; i < kDoneMarkers; ++i) {
+      m.fence[i] = s.device->createCommandFence();
+      m.list[i] = s.queue->createCommandList();
+      if (!m.fence[i] || !m.list[i]) {
+        EOT_WARN("[upload-ring] GPU-done markers: no fence or command list; staying with Present-time publishing");
+        m.failed.store(true, std::memory_order_release);
+        return;
+      }
+    }
+    m.stop = false;
+    m.thread = std::thread(DoneMarkerThread);
+    EOT_INFO("[upload-ring] GPU-done markers on");
+  }
+  const u32 i = m.next;
+  if (m.busy[i].load(std::memory_order_acquire)) {
+    // Four frames' markers still unsignalled (GPU far behind): the next one
+    // covers this frame's count; its query counts wait for the slot recycle.
+    if (m.skipped++ % 600 == 0)
+      EOT_INFO("[upload-ring] GPU-done markers skipped: {} (all four in flight)", m.skipped);
+    return;
+  }
+  m.next = (i + 1) % kDoneMarkers;
+  m.list[i]->begin();
+  m.list[i]->end();
+  m.frames[i] = g_frames_presented.load(std::memory_order_acquire);
+  m.querySlot[i] = s.frame.load(std::memory_order_relaxed);
+  m.querySerial[i] = QueriesSlotSerial(m.querySlot[i]);
+  m.busy[i].store(true, std::memory_order_relaxed);
+  const plume::RenderCommandList *lists[] = {m.list[i].get()};
+  s.queue->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, m.fence[i].get());
+  NoteQueueSubmittedLocked(s);
+  {
+    std::lock_guard lock(m.mutex);
+    m.pending.push_back(i);
+  }
+  m.cv.notify_one();
+#endif
+}
+
+void DoneMarkersShutdown() {
+#if !defined(EOT_D3D12)
+  auto &m = g_markers;
+  if (m.thread.joinable()) {
+    {
+      std::lock_guard lock(m.mutex);
+      m.stop = true;
+    }
+    m.cv.notify_all();
+    m.thread.join();
+  }
+  // Markers still pending were never waited: their fences may yet be signalled.
+  const bool leak = m.abandoned || !m.pending.empty();
+  m.pending.clear();
+  for (u32 i = 0; i < kDoneMarkers; ++i) {
+    if (leak) {
+      (void)m.list[i].release();
+      (void)m.fence[i].release();
+    } else {
+      m.list[i].reset();
+      m.fence[i].reset();
+    }
+    m.busy[i].store(false, std::memory_order_relaxed);
+  }
+  m.next = 0;
+  m.abandoned = false;
+  m.device = nullptr;
+  m.failed.store(false, std::memory_order_relaxed);
+#endif
 }
 
 static void ResetRingSlotLocked(u32 slot) {
@@ -804,6 +1068,7 @@ u64 UploadRingBytesThisFrame() {
   return ring().frame_bytes[SlotOf(g_capture_frame.load(std::memory_order_relaxed))];
 }
 u32 UploadRingSlot() { return SlotOf(g_capture_frame.load(std::memory_order_relaxed)); }
+u64 UploadRingCaptureFrame() { return g_capture_frame.load(std::memory_order_relaxed); }
 
 u64 UploadRingCapacityBytes(u32 *chunks) {
   std::lock_guard lock(g_ring_mutex);

@@ -545,6 +545,9 @@ void NoteQueueSubmittedLocked(VideoState &s);
 // The fence of the last submission was just waited for: the queue is idle.
 void NoteQueueDrainedLocked(VideoState &s);
 void SubmitQueueMarkerLocked(VideoState &s);
+// fable2_gpu_done_markers: after a Present submit (before the queue marker).
+void SubmitDoneMarkerLocked(VideoState &s);
+void DoneMarkersShutdown();
 void FlushRetiredLocked(VideoState &s);
 void ParkTexture(VideoState &s, std::unique_ptr<plume::RenderTexture> t);
 void ParkView(VideoState &s, std::unique_ptr<plume::RenderTextureView> v);

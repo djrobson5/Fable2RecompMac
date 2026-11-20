@@ -18,6 +18,11 @@ void QueryEndLocked(VideoState &s, u32 query_va, u32 generation);
 bool QueryActiveLocked();
 void QueriesBeforeSubmitLocked(VideoState &s);
 void QueriesSlotRecycledLocked(VideoState &s, u32 slot);
+// GPU-done markers: the slot's serial when its frame is submitted, and (from
+// the marker thread, once the GPU has finished that submit) its counts published
+// before the render thread recycles it. No-op if it was recycled meanwhile.
+u64 QueriesSlotSerial(u32 slot);
+void QueriesPublishSubmitted(u32 slot, u64 serial);
 
 // Guest threads.
 void QueryIssued(u32 query_va, bool begin, bool end);

@@ -6,6 +6,7 @@
 #include "gpu/queries.h"
 
 #include <thread>
+#include <map>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -66,6 +67,9 @@ REXCVAR_DEFINE_INT32(fable2_debug_null_slots, 0, "Fable2",
                      "Native renderer diagnostic: bitmask of texture slots left unbound");
 REXCVAR_DEFINE_BOOL(fable2_debug_depth_always, false, "Fable2", "Debug: depth test always passes");
 REXCVAR_DEFINE_BOOL(fable2_debug_cull_none, false, "Fable2", "Debug: no face culling");
+REXCVAR_DEFINE_BOOL(fable2_diag_late_reads, false, "Fable2",
+                    "Diagnostic: count replay-time reads of guest data the game changed after the draw was "
+                    "recorded (textures unlocked later, vertex stream endianness) ([late])");
 REXCVAR_DEFINE_BOOL(fable2_pop_counter, false, "Fable2", "Diagnostic: count objects that vanish for 1-3 frames ([pops]; the smoke test turns it on)");
 REXCVAR_DEFINE_BOOL(fable2_pull_preswap, false, "Fable2", "Native renderer: vertex-pulled 8-in-32 data is byte-swapped on the CPU while copied (the shader skips it)");
 REXCVAR_DEFINE_BOOL(fable2_diag_morph, false, "Fable2",
@@ -1006,7 +1010,10 @@ void BindPullSites(DeviceView dev, const GuestShader &vs, PullSiteEntry (&sites)
 
 bool DrawMatchesList(const std::string &list, u64 hash, u32 count);
 
-void NotePopCandidate(u64 key, u64 frame) {
+// frame: the game's capture frame (UploadRingCaptureFrame), not s.guest_frames:
+// the render thread bumps that at its Present, which may come after the game
+// has started its next frame (fable2_gpu_done_markers), splitting a frame.
+void NotePopCandidate(u64 key, u64 frame, u64 vs_hash, u64 ps_hash) {
   // A pop: an object drawn in at least 8 frames in a row, then missing for
   // 1-3 frames, then drawn again (objects the game draws every second or
   // third frame on purpose never build a streak).
@@ -1015,6 +1022,8 @@ void NotePopCandidate(u64 key, u64 frame) {
     u32 streak = 0;
   };
   static std::unordered_map<u64, Seen> seen;
+  // Pop events by (vs, ps), logged every 600 frames ([pops-by]).
+  static std::map<std::pair<u64, u64>, u32> by_shaders;
   static u64 pruned_at = 0;
   g_pop_draws.fetch_add(1, std::memory_order_relaxed);
   auto [it, inserted] = seen.try_emplace(key, Seen{frame, 1});
@@ -1024,14 +1033,26 @@ void NotePopCandidate(u64 key, u64 frame) {
     if (gap == 1) {
       e.streak++;
     } else if (gap >= 2) {
-      if (gap <= 4 && e.streak >= 8)
+      if (gap <= 4 && e.streak >= 8) {
         g_pop_events.fetch_add(1, std::memory_order_relaxed);
+        by_shaders[{vs_hash, ps_hash}]++;
+      }
       e.streak = 1;
     }
     e.last = frame;
   }
   if (frame - pruned_at > 600) {
     pruned_at = frame;
+    std::vector<std::pair<u32, std::pair<u64, u64>>> top;
+    for (auto &[k, n] : by_shaders)
+      top.push_back({n, k});
+    std::sort(top.begin(), top.end(), std::greater<>());
+    std::string line;
+    for (size_t i = 0; i < top.size() && i < 8; ++i)
+      line += std::format(" | vs {:016x} ps {:016x} x{}", top[i].second.first, top[i].second.second, top[i].first);
+    if (!top.empty())
+      EOT_INFO("[pops-by] over ~600 frames{}", line);
+    by_shaders.clear();
     for (auto e = seen.begin(); e != seen.end();)
       e = frame - e->second.last > 300 ? seen.erase(e) : std::next(e);
   }
@@ -3127,6 +3148,14 @@ bool CaptureDraw(VideoState &s, u32 device_va, u32 prim, GeometryPlan &geom,
     return false;
   }
   pk.window.Capture(regs);
+  pk.unlockGlobal = 0;
+  pk.streamEndian = 0;
+  if (REXCVAR_GET(fable2_diag_late_reads)) {
+    pk.unlockGlobal = ResourceUnlockGlobal();
+    for (u32 stream = 0; stream < 16; ++stream)
+      pk.streamEndian |= (*reinterpret_cast<const be_u32 *>(regs + dev::StreamFetchSlotOffset(stream) + 4) & 3u)
+                         << (2 * stream);
+  }
   pk.texHeaderMask = 0;
   for (u32 slot = 0; slot < 16; ++slot) {
     const u32 tex_va = *reinterpret_cast<const be_u32 *>(regs + dev::kTextureObject0 + 4 * slot);
@@ -3617,7 +3646,7 @@ bool CaptureDraw(VideoState &s, u32 device_va, u32 prim, GeometryPlan &geom,
     mix(static_cast<u32>(geom.baseVertex));
     mix((u64(vs_va) << 32) | ps_va);
     mix(pk.indexed ? pk.index_count : pk.vertexCount);
-    NotePopCandidate(key, s.guest_frames);
+    NotePopCandidate(key, UploadRingCaptureFrame(), vs ? vs->hash : 0, ps ? ps->hash : 0);
   }
 
   pk.velocity = false;
@@ -3873,6 +3902,11 @@ void ReplayDraw(VideoState &s, const DrawPacket &pk) {
   dev.snapshot = pk.window.image;
   dev.snapshotSize = kDeviceSnapshotBytes;
   dev.pages = DeviceWindow::PageTable();
+  const bool late_diag = REXCVAR_GET(fable2_diag_late_reads);
+  struct ReplayUnlockScope {
+    explicit ReplayUnlockScope(u64 v) { g_replay_unlock_global = v; }
+    ~ReplayUnlockScope() { g_replay_unlock_global = ~0ull; }
+  } replay_unlock_scope(late_diag ? pk.unlockGlobal : ~0ull);
   GuestShader *vs = pk.vs;
   GuestShader *ps = pk.ps;
   const InputLayout *layout = pk.layout;
@@ -4367,7 +4401,10 @@ void ReplayDraw(VideoState &s, const DrawPacket &pk) {
     // pairs in Xenos order for 8-in-32 streams; only 8-in-16 streams need
     // their halves swapped back.
     for (const InputLayout::SwapElement &e : layout->swapElements) {
-      if ((dev.U32(dev::StreamFetchSlotOffset(e.stream) + 4) & 3) == 1)
+      const u32 endian = dev.U32(dev::StreamFetchSlotOffset(e.stream) + 4) & 3;
+      if (late_diag && e.stream < 16 && endian != ((pk.streamEndian >> (2 * e.stream)) & 3))
+        g_late_endian.fetch_add(1, std::memory_order_relaxed);
+      if (endian == 1)
         continue;
       const u32 clear = ~(1u << (e.index & 31));
       switch (static_cast<DeclUsage>(e.usage)) {

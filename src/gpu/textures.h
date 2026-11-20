@@ -72,6 +72,10 @@ plume::RenderFramebuffer *GetMipFramebuffer(VideoState &s, GuestTexture &t, u32 
 void NotifyResourceUnlocked(u32 resource_va);
 void NotifyResourceUnlockedLocked(VideoState &s, u32 resource_va);
 u64 ResourceUnlockSeq(u32 resource_va);
+u64 ResourceUnlockGlobal();
+// fable2_diag_late_reads: the replayed draw's unlock sequence at capture (~0 outside draws).
+inline u64 g_replay_unlock_global = ~0ull;
+inline std::atomic<u64> g_late_texture_uploads{0}, g_replay_texture_uploads{0}, g_late_endian{0};
 
 }
 

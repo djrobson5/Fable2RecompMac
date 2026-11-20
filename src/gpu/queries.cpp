@@ -72,6 +72,12 @@ struct Slot {
   u32 used = 0;
   bool needsReset = true;
   std::vector<Entry> done;
+  // GPU-done markers publish a submitted slot's counts from their own thread
+  // (QueriesPublishSubmitted); the recycle then only clears it. serial counts
+  // recycles, so a late marker never reads a slot that is being recorded again.
+  std::mutex publishMutex;
+  u64 serial = 0;
+  bool published = false;
 };
 
 struct Active {
@@ -257,13 +263,18 @@ void QueriesBeforeSubmitLocked(VideoState &s) {
   q.active.clear();
 }
 
-void QueriesSlotRecycledLocked(VideoState &s, u32 slot_index) {
-  (void)s;
+namespace {
+
+// Reads a submitted slot's host counts (the GPU has finished it) and publishes
+// them; false if the pool did not have them yet (Metal: its command buffer not
+// marked completed; Vulkan: not available), so the recycle tries again.
+bool PublishSlot(Slot &slot) {
   auto &q = st();
-  Slot &slot = q.slots[slot_index];
   if (slot.pool && !slot.done.empty()) {
     std::vector<u64> raw(slot.used, 0);
-    if (slot.pool->getRawResults(0, slot.used, raw.data())) {
+    if (!slot.pool->getRawResults(0, slot.used, raw.data()))
+      return false;
+    {
       const float k = RenderScaleFactor();
       const double scale = k > 0.0f ? 1.0 / (double(k) * double(k)) : 1.0;
       static u32 log_tick = 0;
@@ -311,9 +322,36 @@ void QueriesSlotRecycledLocked(VideoState &s, u32 slot_index) {
       }
     }
   }
+  return true;
+}
+
+}  // namespace
+
+void QueriesSlotRecycledLocked(VideoState &s, u32 slot_index) {
+  (void)s;
+  Slot &slot = st().slots[slot_index];
+  std::lock_guard lock(slot.publishMutex);
+  if (!slot.published)
+    PublishSlot(slot);
+  slot.published = false;
+  slot.serial++;
   slot.done.clear();
   slot.used = 0;
   slot.needsReset = true;
+}
+
+u64 QueriesSlotSerial(u32 slot_index) {
+  Slot &slot = st().slots[slot_index];
+  std::lock_guard lock(slot.publishMutex);
+  return slot.serial;
+}
+
+void QueriesPublishSubmitted(u32 slot_index, u64 serial) {
+  Slot &slot = st().slots[slot_index];
+  std::lock_guard lock(slot.publishMutex);
+  if (slot.serial != serial || slot.published)
+    return;
+  slot.published = PublishSlot(slot);
 }
 
 void QueryFlickerStats(u64 *flicker, u64 *zero, u64 *published) {

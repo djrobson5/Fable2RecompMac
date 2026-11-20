@@ -1533,6 +1533,7 @@ void Video::Shutdown() {
       static_cast<plume::MetalCommandQueue *>(s.queue.get())->waitIdle();
 #endif
   }
+  DoneMarkersShutdown();
   s.swap_framebuffers.clear();
   s.render_semaphores.clear();
   s.swap_chain.reset();

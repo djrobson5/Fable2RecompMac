@@ -695,6 +695,8 @@ void NotifyResourceUnlockedLocked(VideoState &s, u32 resource_va) {
     texture->second->bindingGeneration++;
 }
 
+u64 ResourceUnlockGlobal() { return unlocks().global.load(std::memory_order_acquire); }
+
 u64 ResourceUnlockSeq(u32 resource_va) {
   auto &u = unlocks();
   struct Cached {
@@ -1184,6 +1186,16 @@ u32 PrepareTextureForSampling(VideoState &s, GuestTexture &t, u32 swizzle) {
   } else if (stale) {
     auto it = infos().find(t.va);
     if (it != infos().end()) {
+      if (g_replay_unlock_global != ~0ull) {
+        g_replay_texture_uploads.fetch_add(1, std::memory_order_relaxed);
+        if (seq > g_replay_unlock_global) {
+          // Unlocked by the game after this draw was recorded: these are its later bytes.
+          static u32 logs = 0;
+          if (g_late_texture_uploads.fetch_add(1, std::memory_order_relaxed), logs++ < 40)
+            EOT_INFO("[late] texture {:#x} {}x{} fmt {}: unlocked after the draw was recorded (seq {} > {})",
+                     t.va, t.width, t.height, static_cast<u32>(t.format), seq, g_replay_unlock_global);
+        }
+      }
       UploadFromGuest(s, t, it->second);
       t.uploadedUnlockSeq = seq;
       if (WatchesGuestContent(t)) {

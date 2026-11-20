@@ -934,11 +934,55 @@ void FrameLimitWait(const VideoState &s) {
 
 }
 
+REXCVAR_DEFINE_BOOL(fable2_diag_window_misses, false, "Fable2",
+                    "Diagnostic: log the device dwords the replay reads outside the captured window "
+                    "([winmiss] top offsets, every 600 frames)");
+
+static void LogWindowMisses(const VideoState &s) {
+  g_device_miss_hist_on.store(REXCVAR_GET(fable2_diag_window_misses), std::memory_order_relaxed);
+  if (!REXCVAR_GET(fable2_diag_window_misses) || s.guest_frames % 600 != 0)
+    return;
+  std::vector<std::pair<u32, u32>> top;
+  for (u32 d = 0; d < kDeviceMissHistDwords; ++d)
+    if (const u32 n = g_device_miss_hist[d].exchange(0, std::memory_order_relaxed))
+      top.push_back({n, d * 4});
+  std::sort(top.begin(), top.end(), std::greater<>());
+  std::string line;
+  u64 total = 0;
+  for (auto &[n, off] : top)
+    total += n;
+  for (size_t i = 0; i < top.size() && i < 24; ++i)
+    line += std::format(" {:#x}:{}", top[i].second, top[i].first);
+  EOT_INFO("[winmiss] {} dword reads over 600 frames, {} offsets:{}", total, top.size(), line);
+}
+
+static void LogLateReads(const VideoState &s) {
+  if (s.guest_frames % 600 != 0)
+    return;
+  const u64 late = g_late_texture_uploads.exchange(0), uploads = g_replay_texture_uploads.exchange(0),
+            endian = g_late_endian.exchange(0);
+  if (uploads || late || endian)
+    EOT_INFO("[late] over 600 frames: {} of {} replay texture uploads unlocked after recording; {} endian mismatches",
+             late, uploads, endian);
+}
+
 REXCVAR_DEFINE_BOOL(fable2_present_guest_memory, false, "Fable2",
                     "Debug: present the front buffer from guest memory (videos written by the CPU)");
 
 void PresentLocked(VideoState &s, u32 front_buffer_texture_va) {
   UploadRingFramePresented();
+  LogWindowMisses(s);
+  LogLateReads(s);
+  // Once per Present, after its last guest-memory read (or on an early return).
+  struct ReleaseFrame {
+    bool done = false;
+    void operator()() {
+      if (!done)
+        UploadRingFrameReleased();
+      done = true;
+    }
+    ~ReleaseFrame() { (*this)(); }
+  } release_frame;
   EOT_CPU_ZONE("PresentLocked");
   taa::EndFrame(s);
   velocity::EndFrame(s);
@@ -970,6 +1014,7 @@ void PresentLocked(VideoState &s, u32 front_buffer_texture_va) {
       front = nullptr;
   }
   PreloadAnnouncedTextures(s, PsoCacheInLoadingScreen() ? 8.0 : 1.0);
+  release_frame();
   plume::g_passTrace.store(plume::g_passTraceFn && (Settings::DiagFrame() > 0 || REXCVAR_GET(fable2_diag_pass_gpu)),
                            std::memory_order_relaxed);
   plume::g_lazyClears.store(REXCVAR_GET(fable2_lazy_clears), std::memory_order_relaxed);
@@ -1126,6 +1171,8 @@ void PresentLocked(VideoState &s, u32 front_buffer_texture_va) {
     s.queue->executeCommandLists(lists, 1, wait, 1, signal, 1, s.fences[cur].get());
     s.command_list_submitted[cur] = true;
     NoteQueueSubmittedLocked(s);
+    // Before the present: the marker then does not wait for the present's own work.
+    SubmitDoneMarkerLocked(s);
 #if defined(EOT_D3D12)
     const u32 sync_interval = PresentSyncInterval();
     const bool presented =
