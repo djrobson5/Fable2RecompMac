@@ -3,6 +3,7 @@
 
 #include "gpu/shaders/msl_convert.h"
 
+#include <algorithm>
 #include <cstring>
 #include <exception>
 #include <sstream>
@@ -37,6 +38,27 @@ bool NeedsSafeMath(const uint32_t *words, size_t count) {
     i += length;
   }
   return false;
+}
+
+// The module without its NoContraction decorations. SPIRV-Cross turns each
+// decorated op into a call to an [[clang::optnone]] helper (spvFMul, spvFAdd,
+// ...) that the Metal compiler can neither inline nor schedule: the vertex
+// phase took ~5x the MoltenVK path's time (market: 13.6 vs 2.8 ms a frame).
+// The library is compiled with safe math instead (NeedsSafeMath), as MoltenVK
+// does for the same shaders after StrictMathForMetal (guest_shaders.cpp).
+std::vector<uint32_t> WithoutNoContraction(std::vector<uint32_t> words) {
+  std::vector<uint32_t> out(words.begin(), words.begin() + std::min<size_t>(5, words.size()));
+  out.reserve(words.size());
+  for (size_t i = 5; i < words.size();) {
+    const uint32_t opcode = words[i] & 0xFFFFu;
+    const uint32_t length = words[i] >> 16;
+    if (length == 0 || i + length > words.size())
+      return words;
+    if (!(opcode == kOpDecorate && length == 3 && words[i + 2] == kDecorationNoContraction))
+      out.insert(out.end(), words.begin() + i, words.begin() + i + length);
+    i += length;
+  }
+  return out;
 }
 
 spv::ExecutionModel EntryModel(const uint32_t *words, size_t count) {
@@ -137,6 +159,8 @@ MslShader SpirvToMsl(const void *spirv, size_t size, const MslOptions &options) 
     return result;
   }
   result.safeMath = NeedsSafeMath(words.data(), words.size());
+  if (result.safeMath)
+    words = WithoutNoContraction(std::move(words));
 
   try {
     spirv_cross::Parser parser(std::move(words));
