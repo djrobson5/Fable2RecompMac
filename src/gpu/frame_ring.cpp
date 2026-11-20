@@ -906,7 +906,7 @@ void DoneMarkerThread() {
 
 }
 
-REXCVAR_DEFINE_BOOL(fable2_gpu_done_markers, false, "Fable2",
+REXCVAR_DEFINE_BOOL(fable2_gpu_done_markers, true, "Fable2",
                     "Native renderer: let the game's thread start its next frame as soon as the GPU has "
                     "finished the frame its upload slot held, not at the render thread's next Present "
                     "(Bowerstone market on Metal: 9.6 -> 8.3 ms)");
