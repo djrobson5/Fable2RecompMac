@@ -33,6 +33,9 @@
 #include "gpu/render_thread.h"
 #include "gpu/settings.h"
 
+REXCVAR_DEFINE_INT32(fable2_frame_lock_pause_us, 100, "Fable2",
+                     "Pause after each 3D Engine frame so threads waiting on the render object's lock get in "
+                     "(see Fable2FramePause); 0 = none. Was 500: 100 measured -0.34 ms in the market (2026-11-19), 0 gave hitches");
 REXCVAR_DEFINE_BOOL(fable2_deliver_gpu_callbacks, true, "Fable2",
                     "Native renderer: deliver each InsertCallback to the guest interrupt handler once "
                     "the render thread has passed it (the GPU's copy of the callback into the device's "
@@ -436,7 +439,7 @@ void Fable2FrameEnd();
 namespace {
 void Fable2FramePause() {
   using clock = std::chrono::steady_clock;
-  constexpr auto kLockPause = std::chrono::microseconds(500);
+  const auto kLockPause = std::chrono::microseconds(std::max(0, REXCVAR_GET(fable2_frame_lock_pause_us)));
   static clock::time_point deadline{};
   static int32_t cadence_fps = 0;
   const int32_t fps = eot::gpu::Settings::FpsLimit();
@@ -444,7 +447,8 @@ void Fable2FramePause() {
   if (fps <= 0) {
     deadline = clock::time_point{};
     cadence_fps = 0;
-    rex::thread::Sleep(kLockPause);
+    if (kLockPause.count() > 0)
+      rex::thread::Sleep(kLockPause);
     return;
   }
   const auto period = std::chrono::duration_cast<clock::duration>(std::chrono::duration<double>(1.0 / fps));
