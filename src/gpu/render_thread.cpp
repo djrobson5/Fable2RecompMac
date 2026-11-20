@@ -35,6 +35,8 @@
 
 #include <rex/cvar.h>
 REXCVAR_DECLARE(bool, fable2_zpass_restore_depth);
+REXCVAR_DEFINE_INT32(fable2_debug_render_spin_us, 0, "Fable2",
+                     "Debug: busy-wait this long on the render thread before each Present (is that thread the limit?)");
 // Off: with it on the menu and the game flickered (user, 2026-11-07): the game
 // thread's next frame overlapped the render thread's end-of-frame work (frame
 // slot recycling, texture/buffer retirement, bookkeeping), which is not safe
@@ -166,6 +168,11 @@ void Execute(VideoState &s, Queue &q, RenderCommand &c) {
     MaybeSubmitChunkLocked(s);
     break;
   case RenderCommandType::Present:
+    if (const i32 us = REXCVAR_GET(fable2_debug_render_spin_us); us > 0) {
+      const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(us);
+      while (std::chrono::steady_clock::now() < until) {
+      }
+    }
     g_present_seq = c.seq;
     PresentLocked(s, c.va);
     g_present_seq = 0;
