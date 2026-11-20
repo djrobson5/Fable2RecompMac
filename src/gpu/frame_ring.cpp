@@ -679,19 +679,27 @@ bool MakeChunk(Chunk &chunk, u64 size) {
 
 }
 
+static std::mutex g_ring_mutex;
+// Bumped after the ring's chunks are rebuilt, under g_ring_mutex, so a
+// thread's sub-block (UploadAllocate with fable2_ring_subblock) taken from the
+// old chunks fails its check. Today the ring is built once, at boot.
+static std::atomic<u64> g_ring_generation{1};
+
 bool UploadRingInit() {
   auto &r = ring();
-  for (u32 i = 0; i < kRingSlots; ++i) {
+  std::lock_guard lock(g_ring_mutex);
+  bool ok = true;
+  for (u32 i = 0; i < kRingSlots && ok; ++i) {
     r.chunks[i].clear();
     Chunk c;
-    if (!MakeChunk(c, kChunkSize))
-      return false;
-    r.chunks[i].push_back(std::move(c));
+    ok = MakeChunk(c, kChunkSize);
+    if (ok)
+      r.chunks[i].push_back(std::move(c));
   }
-  return true;
+  g_ring_generation.fetch_add(1, std::memory_order_acq_rel);
+  return ok;
 }
 
-static std::mutex g_ring_mutex;
 static std::atomic<u64> g_ring_epoch{0};
 u64 UploadRingEpoch() { return g_ring_epoch.load(std::memory_order_acquire); }
 
@@ -1021,17 +1029,86 @@ static void ResetRingSlotLocked(u32 slot) {
   r.frame_bytes[slot] = 0;
 }
 
+REXCVAR_DEFINE_BOOL(fable2_ring_subblock, true, "Fable2",
+                     "Native renderer: each thread takes 64 KB blocks of the upload ring under its lock and "
+                     "places small allocations in them without it (one lock per block, not per allocation)");
+
+static bool UploadAllocateLocked(u64 size, u64 alignment, UploadAlloc *out, u64 *frame_out, u64 *gen_out);
+
+// A thread's current block of the upload ring (fable2_ring_subblock), taken
+// under the lock in the slot of capture frame C and used only while
+// g_capture_frame is still C at check time. An allocation handed out just
+// before the game advances stays valid for the same reason a locked one does:
+// slot C is reset only at the advance to C + kRingSlots, which first waits for
+// the GPU to finish frame C + 1, and replay never runs ahead of capture.
+// frame_bytes counts whole blocks, not the bytes placed in them; each thread
+// abandons up to one block's tail per frame change.
+namespace {
+constexpr u64 kSubBlockBytes = 64 * 1024;
+struct SubBlock {
+  u64 frame = ~0ull, gen = 0;
+  plume::RenderBuffer *buffer = nullptr;
+  u8 *cpu = nullptr;     // the buffer's mapping at offset 0
+  u64 gpuVa = 0;         // the buffer's device address at offset 0 (0 if none)
+  u64 next = 0, end = 0; // offsets in the buffer
+};
+thread_local SubBlock t_block;
+}  // namespace
+
 bool UploadAllocate(u64 size, u64 alignment, UploadAlloc *out) {
   *out = UploadAlloc{};
   if (size == 0)
     return false;
-  auto &s = state();
-  auto &r = ring();
   if (alignment == 0)
     alignment = 1;
+  if (size <= kSubBlockBytes / 4 && alignment <= kTexturePlacementAlignment &&
+      REXCVAR_GET(fable2_ring_subblock)) {
+    SubBlock &b = t_block;
+    for (u32 attempt = 0; attempt < 2; ++attempt) {
+      if (b.buffer && b.frame == g_capture_frame.load(std::memory_order_relaxed) &&
+          b.gen == g_ring_generation.load(std::memory_order_relaxed)) {
+        const u64 start = (b.next + alignment - 1) / alignment * alignment;
+        if (start + size <= b.end) {
+          out->buffer = b.buffer;
+          out->offset = start;
+          out->cpu = b.cpu + start;
+          out->size = size;
+          out->gpuVa = b.gpuVa ? b.gpuVa + start : 0;
+          b.next = start + size;
+          return true;
+        }
+      }
+      if (attempt)
+        break;
+      UploadAlloc blk;
+      u64 frame = 0, gen = 0;
+      if (!UploadAllocateLocked(kSubBlockBytes, kTexturePlacementAlignment, &blk, &frame, &gen)) {
+        b = SubBlock{};
+        break;
+      }
+      b.frame = frame;
+      b.gen = gen;
+      b.buffer = blk.buffer;
+      b.cpu = blk.cpu - blk.offset;
+      b.gpuVa = blk.gpuVa ? blk.gpuVa - blk.offset : 0;
+      b.next = blk.offset;
+      b.end = blk.offset + blk.size;
+    }
+    // Fall through: allocate this one directly.
+  }
+  return UploadAllocateLocked(size, alignment, out, nullptr, nullptr);
+}
+
+static bool UploadAllocateLocked(u64 size, u64 alignment, UploadAlloc *out, u64 *frame_out, u64 *gen_out) {
+  *out = UploadAlloc{};
+  auto &r = ring();
   std::lock_guard lock(g_ring_mutex);
-  const u32 slot = SlotOf(g_capture_frame.load(std::memory_order_relaxed));
-  (void)s;
+  const u64 frame = g_capture_frame.load(std::memory_order_relaxed);
+  if (frame_out)
+    *frame_out = frame;
+  if (gen_out)
+    *gen_out = g_ring_generation.load(std::memory_order_relaxed);
+  const u32 slot = SlotOf(frame);
   auto &chunks = r.chunks[slot];
   for (u32 attempt = 0; attempt < 2; ++attempt) {
     for (auto &c : chunks) {
