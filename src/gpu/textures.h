@@ -26,7 +26,12 @@ GuestTexture *GetGuestTextureForFetch(VideoState &s, u32 header_va, const u32 fe
 // headers at other render targets later in the frame, before the replay.
 bool ReadTextureHeader(u32 header_va, u32 out[6]);
 u32 StorageFormat(u32 format);
-u32 PhysicalBase(u32 word1);
+// A fetch constant's base as a physical address: headers hold the 0xE0000000
+// alias (the physical page 0x1000 above), the device's copy the physical one.
+inline u32 PhysicalBase(u32 word1) {
+  const u32 base = word1 & 0xFFFFF000u;
+  return (base >= 0xE0000000u ? base - 0xE0000000u + 0x1000u : base) & 0x1FFFF000u;
+}
 // Fable 2 re-points the header objects of its render targets at other targets
 // right after binding them (the shadow map's at a bloom buffer), while the GPU
 // samples what the device's fetch constant names. Resolve destinations are kept
@@ -35,6 +40,21 @@ u32 PhysicalBase(u32 word1);
 // them by their fetch constant (null: not a render target, or switched off).
 u32 RenderTargetKey(const u32 fetch[6]);
 GuestTexture *FindRenderTarget(VideoState &s, const u32 fetch[6]);
+
+// Storage index over VideoState::textures (physical base | storage format of
+// fetch[1], and fetch[2]): a texture is listed while at least one table entry
+// holds it. Every change to the table goes through these, and every write to a
+// listed texture's fetch[1] or fetch[2] is followed by TextureIndexRekey.
+// TextureIndexRemove is called before the entry's shared_ptr is dropped.
+void TextureIndexAdd(VideoState &s, GuestTexture *t);
+void TextureIndexRemove(VideoState &s, GuestTexture *t);
+void TextureIndexRekey(VideoState &s, GuestTexture *t);
+// The vertex-texture pick: among the textures with this fetch constant's
+// storage that have a host image and are not depth, the one sampled most
+// recently (the first of equals). The old scan over the whole table picked the
+// first equal in unordered_map order, which the index cannot reproduce; *ties
+// (if given) is the number of distinct candidates sharing the best frame.
+GuestTexture *FindTextureByStorage(VideoState &s, const u32 fc[6], u32 *ties = nullptr);
 
 u32 PrepareTextureForSampling(VideoState &s, GuestTexture &t,
                               u32 swizzle = kIdentityFetchSwizzle);

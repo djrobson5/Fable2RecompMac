@@ -130,6 +130,20 @@ struct GuestTexture {
   std::shared_ptr<ResolvePacket> lastResolve;
 };
 
+// A secondary index over VideoState::textures for the vertex-texture lookup
+// by storage (physical base, storage format, fetch word 2). Kept only through
+// the helpers in gpu/textures.h; the table's entries are shared_ptrs and
+// header aliases make several entries share one texture, so each distinct
+// texture is listed once and counts the table entries that hold it.
+struct TextureStorageIndex {
+  struct Owner {
+    u64 key = 0;
+    u32 refs = 0;
+  };
+  std::unordered_map<u64, std::vector<GuestTexture *>> byKey;
+  std::unordered_map<const GuestTexture *, Owner> owners;
+};
+
 struct GuestSurface {
   u32 va = 0;
   u32 surfaceInfo = 0; // +0x18

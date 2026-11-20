@@ -363,6 +363,8 @@ struct VideoState {
   std::vector<RetiredDescriptorSlot> descriptor_graveyard[kNumFrames];
 
   std::unordered_map<u32, std::shared_ptr<GuestTexture>> textures;
+  // Mirrors `textures` by storage key; see TextureTableErase/Add in gpu/textures.h.
+  TextureStorageIndex texture_storage_index;
 
   PerfCounters perf;
   PerfCounters perf_prev_frame;

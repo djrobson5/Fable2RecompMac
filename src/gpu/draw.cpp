@@ -97,6 +97,12 @@ REXCVAR_DEFINE_BOOL(fable2_debug_no_alpha_test, false, "Fable2", "Debug: alpha t
 // distant tree billboards drew black over the sky.
 REXCVAR_DEFINE_BOOL(fable2_vertex_textures, true, "Fable2",
                     "Native renderer: bind vertex shader textures (fetch constants 16..19)");
+REXCVAR_DEFINE_BOOL(fable2_vtex_index, true, "Fable2",
+                    "Native renderer: a vertex texture's storage lookup uses the table's storage index instead of a scan "
+                    "over every texture (same pick; equal sampled frames may differ)");
+REXCVAR_DEFINE_BOOL(fable2_debug_vtex_index_check, false, "Fable2",
+                    "Debug: run the vertex-texture scan and the index lookup, count and log the picks that differ "
+                    "([vtex-index], every 600 frames)");
 REXCVAR_DEFINE_BOOL(fable2_zero_tile_offset, true, "Fable2",
                     "Native renderer: drop the predicated-tiling offset from g_TileOffsetSize");
 REXCVAR_DEFINE_STRING(fable2_tile_offset_exempt, "", "Fable2",
@@ -2431,6 +2437,63 @@ bool FlushAliasCopyForDraw(VideoState &s, GuestTexture &t) {
   return copied;
 }
 
+// The texture the guest keeps at a vertex texture's storage: the old scan over
+// the whole table, kept as written. Ties on lastSampledFrame went to whichever
+// came first in unordered_map order, which the storage index cannot reproduce.
+static GuestTexture *ScanVertexTextureByStorage(VideoState &s, const u32 fc[6]) {
+  GuestTexture *gt = nullptr;
+  const u32 base = PhysicalBase(fc[1]), format = StorageFormat(fc[1] & 0x3F);
+  for (auto &[other_va, other] : s.textures)
+    if (other && other->host.texture && !other->host.isDepth && PhysicalBase(other->fetch[1]) == base &&
+        StorageFormat(other->fetch[1] & 0x3F) == format && other->fetch[2] == fc[2] &&
+        (!gt || other->lastSampledFrame > gt->lastSampledFrame))
+      gt = other.get();
+  return gt;
+}
+
+static GuestTexture *FindVertexTextureByStorage(VideoState &s, const u32 fc[6]) {
+  const bool use_index = REXCVAR_GET(fable2_vtex_index);
+  if (!REXCVAR_GET(fable2_debug_vtex_index_check))
+    return use_index ? FindTextureByStorage(s, fc) : ScanVertexTextureByStorage(s, fc);
+
+  static u64 lookups = 0, mismatches = 0, ties = 0, differing_ties = 0, empty = 0, summary_frame = 0;
+  static u32 logged = 0;
+  u32 tied = 0;
+  GuestTexture *indexed = FindTextureByStorage(s, fc, &tied);
+  GuestTexture *scanned = ScanVertexTextureByStorage(s, fc);
+  lookups++;
+  empty += !scanned && !indexed;
+  ties += tied > 0;
+  if (indexed != scanned) {
+    // Two listed textures sampled in the same frame are an exact tie: the scan may pick either.
+    if (indexed && scanned && indexed->lastSampledFrame == scanned->lastSampledFrame && tied > 0 &&
+        s.texture_storage_index.owners.contains(scanned)) {
+      differing_ties++;
+    } else {
+      mismatches++;
+      if (logged++ < 8) {
+        auto describe = [](const GuestTexture *t) {
+          return t ? std::format("{:#x} fetch {:08x} {:08x} {:08x} sampled {}", t->va, t->fetch[0], t->fetch[1],
+                                 t->fetch[2], t->lastSampledFrame)
+                   : std::string("none");
+        };
+        EOT_WARN("[vtex-index] mismatch: fc {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}; index {}; scan {}", fc[0], fc[1],
+                 fc[2], fc[3], fc[4], fc[5], describe(indexed), describe(scanned));
+      }
+    }
+  }
+  if (s.guest_frames - summary_frame >= 600) {
+    if (lookups)
+      EOT_INFO("[vtex-index] frame {}: {} lookups, {} mismatches, {} with tied candidates ({} of them picked "
+               "differently), {} found nothing; {} textures in {} keys",
+               s.guest_frames, lookups, mismatches, ties, differing_ties, empty, s.texture_storage_index.owners.size(),
+               s.texture_storage_index.byKey.size());
+    lookups = mismatches = ties = differing_ties = empty = 0;
+    summary_frame = s.guest_frames;
+  }
+  return use_index ? indexed : scanned;
+}
+
 void BindTexturesAndSamplers(VideoState &s, DeviceView dev, u32 texture_mask,
                              SharedConstants &sc, const Targets *refresh_targets, bool vertex_textures,
                              const DrawPacket &pk, float target_scale) {
@@ -2740,14 +2803,8 @@ void BindTexturesAndSamplers(VideoState &s, DeviceView dev, u32 texture_mask,
     // pixel sampler's header made (refreshed when the CPU rewrites it). Headers
     // hold the 0xE0000000 alias, the fetch constant the physical address.
     GuestTexture *gt = FindRenderTarget(s, fc);
-    if (!gt) {
-      const u32 base = PhysicalBase(fc[1]), format = StorageFormat(fc[1] & 0x3F);
-      for (auto &[other_va, other] : s.textures)
-        if (other && other->host.texture && !other->host.isDepth && PhysicalBase(other->fetch[1]) == base &&
-            StorageFormat(other->fetch[1] & 0x3F) == format && other->fetch[2] == fc[2] &&
-            (!gt || other->lastSampledFrame > gt->lastSampledFrame))
-          gt = other.get();
-    }
+    if (!gt)
+      gt = FindVertexTextureByStorage(s, fc);
     if (!gt)
       gt = GetGuestTextureForFetch(s, tex_va, fc);
     if (!gt) {

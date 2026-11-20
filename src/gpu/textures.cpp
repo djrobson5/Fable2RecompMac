@@ -604,6 +604,7 @@ void EvictStaleGuestTextures(VideoState &s) {
         ParkHostTexture(s, it->second->host);
       }
       infos().erase(it->first);
+      TextureIndexRemove(s, it->second.get());
       s.textures.erase(it);
       s.perf.textures_evicted++;
       s.perf.textures_released++;
@@ -640,6 +641,7 @@ void EvictStaleGuestTextures(VideoState &s) {
       ParkHostTexture(s, slot->host);
     }
     infos().erase(it->first);
+    TextureIndexRemove(s, slot.get());
     it = s.textures.erase(it);
     s.perf.textures_evicted++;
     evicted = true;
@@ -733,11 +735,88 @@ u32 StorageFormat(u32 format) {
   }
 }
 
-// A fetch constant's base as a physical address: headers hold the 0xE0000000
-// alias (the physical page 0x1000 above), the device's copy the physical one.
-u32 PhysicalBase(u32 word1) {
-  const u32 base = word1 & 0xFFFFF000u;
-  return (base >= 0xE0000000u ? base - 0xE0000000u + 0x1000u : base) & 0x1FFFF000u;
+static u64 StorageIndexKey(const u32 fetch[6]) {
+  return (u64(fetch[2]) << 32) | (PhysicalBase(fetch[1]) | StorageFormat(fetch[1] & 0x3F));
+}
+
+void TextureIndexAdd(VideoState &s, GuestTexture *t) {
+  if (!t)
+    return;
+  TextureStorageIndex &idx = s.texture_storage_index;
+  auto [it, inserted] = idx.owners.try_emplace(t);
+  if (!inserted) {
+    it->second.refs++;
+    return;
+  }
+  it->second.key = StorageIndexKey(t->fetch);
+  it->second.refs = 1;
+  idx.byKey[it->second.key].push_back(t);
+}
+
+static void StorageIndexUnlist(TextureStorageIndex &idx, u64 key, GuestTexture *t) {
+  const auto list = idx.byKey.find(key);
+  if (list == idx.byKey.end())
+    return;
+  auto &v = list->second;
+  const auto at = std::find(v.begin(), v.end(), t);
+  if (at != v.end()) {
+    *at = v.back();
+    v.pop_back();
+  }
+  if (v.empty())
+    idx.byKey.erase(list);
+}
+
+void TextureIndexRemove(VideoState &s, GuestTexture *t) {
+  if (!t)
+    return;
+  TextureStorageIndex &idx = s.texture_storage_index;
+  const auto it = idx.owners.find(t);
+  if (it == idx.owners.end())
+    return;
+  if (--it->second.refs)
+    return;
+  StorageIndexUnlist(idx, it->second.key, t);
+  idx.owners.erase(it);
+}
+
+void TextureIndexRekey(VideoState &s, GuestTexture *t) {
+  TextureStorageIndex &idx = s.texture_storage_index;
+  const auto it = idx.owners.find(t);
+  if (it == idx.owners.end())
+    return;
+  const u64 key = StorageIndexKey(t->fetch);
+  if (key == it->second.key)
+    return;
+  StorageIndexUnlist(idx, it->second.key, t);
+  it->second.key = key;
+  idx.byKey[key].push_back(t);
+}
+
+GuestTexture *FindTextureByStorage(VideoState &s, const u32 fc[6], u32 *ties) {
+  if (ties)
+    *ties = 0;
+  const auto list = s.texture_storage_index.byKey.find(StorageIndexKey(fc));
+  if (list == s.texture_storage_index.byKey.end())
+    return nullptr;
+  const u32 base = PhysicalBase(fc[1]), format = StorageFormat(fc[1] & 0x3F);
+  GuestTexture *best = nullptr;
+  u32 tied = 0;
+  for (GuestTexture *other : list->second) {
+    // The key's fields are rechecked: the index is only a shortlist.
+    if (!other->host.texture || other->host.isDepth || PhysicalBase(other->fetch[1]) != base ||
+        StorageFormat(other->fetch[1] & 0x3F) != format || other->fetch[2] != fc[2])
+      continue;
+    if (!best || other->lastSampledFrame > best->lastSampledFrame) {
+      best = other;
+      tied = 1;
+    } else if (other->lastSampledFrame == best->lastSampledFrame) {
+      tied++;
+    }
+  }
+  if (ties)
+    *ties = tied > 1 ? tied : 0;
+  return best;
 }
 
 u32 RenderTargetKey(const u32 fetch[6]) {
@@ -778,8 +857,10 @@ GuestTexture *GetGuestTextureForFetch(VideoState &s, u32 header_va, const u32 fe
            a[2] == b[2] && a[5] == b[5];
   };
   if (slot && same_storage(slot->fetch, fetch)) {
-    if (std::memcmp(slot->fetch, fetch, 6 * sizeof(u32)) != 0)
+    if (std::memcmp(slot->fetch, fetch, 6 * sizeof(u32)) != 0) {
       std::memcpy(slot->fetch, fetch, 6 * sizeof(u32));
+      TextureIndexRekey(s, slot.get());
+    }
     if (create_host_image && !slot->host.texture) {
       const auto info = infos().find(header_va);
       if (info != infos().end() && CreateHostImage(s, *slot, info->second))
@@ -813,6 +894,7 @@ GuestTexture *GetGuestTextureForFetch(VideoState &s, u32 header_va, const u32 fe
       ParkHostTexture(s, slot->host);
     }
     s.texture_generation.fetch_add(1, std::memory_order_relaxed);
+    TextureIndexRemove(s, slot.get());
     slot.reset();
   }
   for (auto &[other_va, other] : s.textures) {
@@ -825,6 +907,7 @@ GuestTexture *GetGuestTextureForFetch(VideoState &s, u32 header_va, const u32 fe
                other->width, other->height, static_cast<u32>(other->format), other->baseAddress);
     infos()[header_va] = info;
     slot = other;
+    TextureIndexAdd(s, slot.get());
     return slot.get();
   }
   auto t = std::make_shared<GuestTexture>();
@@ -850,6 +933,7 @@ GuestTexture *GetGuestTextureForFetch(VideoState &s, u32 header_va, const u32 fe
             t->gammaSigned ? "gamma" : "linear-sign", t->baseAddress, t->mipAddress,
             static_cast<u32>(t->host.format));
   slot = std::move(t);
+  TextureIndexAdd(s, slot.get());
   return slot.get();
 }
 
