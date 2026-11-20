@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -27,6 +28,8 @@
 #include <string>
 #include <vector>
 
+#include <time.h>
+
 #include <smolv.h>
 #include <zstd.h>
 
@@ -34,6 +37,7 @@
 #include <plume_render_interface.h>
 #include <plume_render_interface_builders.h>
 
+#include "gpu/gpu_busy.h"
 #include "gpu/main_layout.h"
 #include "gpu/shaders/msl_convert.h"
 #include "gpu/shaders/shader_cache.h"
@@ -436,6 +440,9 @@ bool RunPipelineTests(std::string *report) {
   auto framebuffer = device->createFramebuffer(plume::RenderFramebufferDesc(colors, 1));
 
   auto queue = device->createCommandQueue(plume::RenderCommandListType::DIRECT);
+  auto *metal_queue = static_cast<plume::MetalCommandQueue *>(queue.get());
+  metal_queue->setGpuIntervalCapture(true);
+  const double host_before = static_cast<double>(clock_gettime_nsec_np(CLOCK_UPTIME_RAW)) * 1e-9;
   auto list = queue->createCommandList();
   auto fence = device->createCommandFence();
   list->begin();
@@ -488,6 +495,35 @@ bool RunPipelineTests(std::string *report) {
   else
     pass("GPU blit from bindless slot 20000 (push constants at byte 24, point sampler slot 1), 16/16 texels "
          "match, read back with a texture-to-buffer copy");
+
+  // GPU intervals (plume patch 0018): the blit's command buffer reports its GPU start and end on the
+  // host clock, under the list's label; the wait buffer plume commits for the semaphores is not recorded.
+  {
+    metal_queue->waitIdle();
+    const double host_after = static_cast<double>(clock_gettime_nsec_np(CLOCK_UPTIME_RAW)) * 1e-9;
+    std::vector<plume::MetalGpuInterval> intervals;
+    const uint64_t dropped = metal_queue->drainGpuIntervals(intervals);
+    const plume::MetalGpuInterval *work = nullptr;
+    for (const plume::MetalGpuInterval &i : intervals)
+      if (eot::gpu::IsGpuWorkLabel(i.label))
+        work = &i;
+    char buf[192];
+    if (!work || dropped != 0 || intervals.size() != 1) {
+      std::snprintf(buf, sizeof(buf), "GPU intervals: %zu recorded (want the list's only), work buffer %s, %llu dropped",
+                    intervals.size(), work ? "found" : "missing", static_cast<unsigned long long>(dropped));
+      fail(buf);
+    } else if (work->start < host_before - 0.5 || work->end > host_after + 0.5 || work->end < work->start) {
+      std::snprintf(buf, sizeof(buf),
+                    "GPU interval [%.6f, %.6f] is not inside the host clock window [%.6f, %.6f]", work->start,
+                    work->end, host_before, host_after);
+      fail(buf);
+    } else {
+      std::snprintf(buf, sizeof(buf), "GPU intervals: %zu buffers, the list's [%.3f ms] lies on the host clock "
+                    "(inside the %.1f ms the test took); the wait buffer is not recorded", intervals.size(),
+                    (work->end - work->start) * 1e3, (host_after - host_before) * 1e3);
+      pass(buf);
+    }
+  }
 
   // Occlusion queries (plume patch 0016): the same blit into the 4x4 target,
   // its samples counted under scissors of known size.
@@ -644,6 +680,81 @@ bool RunPipelineTests(std::string *report) {
                      : fail("draw after a rect clear ran with the clear's scissor: " + std::to_string(differences) +
                             "/16 texels differ");
   }
+  {
+    // A waiter that sees the fence finds the list's interval recorded (the interval's handler is
+    // registered before the fence's): 200 empty lists, drained right after each fence wait.
+    auto empty = queue->createCommandList();
+    auto empty_fence = device->createCommandFence();
+    std::vector<plume::MetalGpuInterval> got;
+    uint32_t missing = 0;
+    for (int i = 0; i < 200; ++i) {
+      empty->begin();
+      empty->end();
+      const plume::RenderCommandList *el[] = {empty.get()};
+      queue->executeCommandLists(el, 1, nullptr, 0, nullptr, 0, empty_fence.get());
+      queue->waitForCommandFence(empty_fence.get());
+      got.clear();
+      metal_queue->drainGpuIntervals(got);
+      uint32_t lists = 0;
+      for (const plume::MetalGpuInterval &g : got)
+        lists += eot::gpu::IsGpuWorkLabel(g.label);
+      missing += lists != 1;
+    }
+    metal_queue->waitIdle();
+    missing == 0 ? pass("the list's GPU interval is recorded before its fence is seen (200 of 200 lists)")
+                 : fail("the list's GPU interval was not there when the fence was seen: " + std::to_string(missing) + " of 200");
+  }
+  return ok;
+}
+
+// The GPU busy arithmetic (src/gpu/gpu_busy.h): union of overlapping intervals, clipping to the
+// window, what is carried over, and which buffer labels count.
+bool RunBusyMathTests(std::string *report) {
+  using eot::gpu::BusyInterval;
+  bool ok = true;
+  auto check = [&](const char *what, double got, double want) {
+    const bool good = std::fabs(got - want) < 1e-9;
+    ok = ok && good;
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "  %s %s: %.6f (want %.6f)\n", good ? "ok  " : "FAIL", what, got, want);
+    *report += buf;
+  };
+  {
+    std::vector<BusyInterval> v = {{0.0, 1.0}, {2.0, 3.0}};
+    check("disjoint intervals add", eot::gpu::UnionBusySeconds(v, 0.0, 10.0), 2.0);
+  }
+  {
+    // Out of order, overlapping and nested: [0,4] covers [1,2]; [3,6] extends it; [5,6] is inside.
+    std::vector<BusyInterval> v = {{3.0, 6.0}, {1.0, 2.0}, {0.0, 4.0}, {5.0, 6.0}};
+    check("overlapping buffers count once", eot::gpu::UnionBusySeconds(v, 0.0, 10.0), 6.0);
+  }
+  {
+    std::vector<BusyInterval> v = {{0.0, 3.0}, {5.0, 9.0}};
+    check("clipped to the window", eot::gpu::UnionBusySeconds(v, 2.0, 6.0), 2.0);
+  }
+  {
+    std::vector<BusyInterval> v = {{0.0, 1.0}, {8.0, 9.0}};
+    check("outside the window adds nothing", eot::gpu::UnionBusySeconds(v, 2.0, 6.0), 0.0);
+  }
+  {
+    std::vector<BusyInterval> v;
+    check("no intervals", eot::gpu::UnionBusySeconds(v, 0.0, 1.0), 0.0);
+  }
+  {
+    // One buffer straddling two windows is counted once overall: 1 s in the first, 2 s in the next.
+    std::vector<BusyInterval> carry = {{4.0, 8.0}, {0.5, 1.5}};
+    const double first = eot::gpu::UnionBusySeconds(carry, 0.0, 5.0);
+    eot::gpu::DropIntervalsEndingBy(carry, 5.0);
+    const double second = eot::gpu::UnionBusySeconds(carry, 5.0, 7.0);
+    check("straddling buffer, first window ([0.5,1.5] and [4,5])", first, 2.0);
+    check("straddling buffer, second window", second, 2.0);
+    check("straddling buffer, kept for the next window (the finished one is dropped)", double(carry.size()), 1.0);
+  }
+  const bool labels = eot::gpu::IsGpuWorkLabel("RT64 Command List") && !eot::gpu::IsGpuWorkLabel("Wait Command Buffer") &&
+                      !eot::gpu::IsGpuWorkLabel("GPU Done Marker") && !eot::gpu::IsGpuWorkLabel("Queue Idle Marker") &&
+                      !eot::gpu::IsGpuWorkLabel("Acquire Drawable Command Buffer") && !eot::gpu::IsGpuWorkLabel("");
+  ok = ok && labels;
+  *report += std::string("  ") + (labels ? "ok  " : "FAIL") + " only the frame lists' label counts as GPU work\n";
   return ok;
 }
 
@@ -730,8 +841,11 @@ int main(int argc, char **argv) {
   std::printf("Pipelines through plume (main layout from main_layout.h):\n");
   const bool pipelines_ok = RunPipelineTests(&report);
   std::printf("%s", report.c_str());
+  std::string busy_report;
+  const bool busy_ok = RunBusyMathTests(&busy_report);
+  std::printf("GPU busy arithmetic (gpu_busy.h):\n%s", busy_report.c_str());
 
-  const bool ok = g_failures.empty() && pipelines_ok && total > 0;
+  const bool ok = g_failures.empty() && pipelines_ok && busy_ok && total > 0;
   std::printf("%s\n", ok ? "PASS" : "FAIL");
   return ok ? 0 : 1;
 }

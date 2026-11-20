@@ -85,7 +85,7 @@ WALK_KEYS = ["LY+&RX+:2500:50", "LY+:1500:50", "LY+&RX-:3000:50", "LY+:1200:50",
 
 RE_TIME = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+)\]")
 RE_PERF = re.compile(r"\[perf\] \d+ frames, [\d.]+ ms/frame wall \(p50 ([\d.]+).*? draw [\d.]+ \((\d+) draws"
-                     r".*?gpu (?:([\d.]+) ms/frame|n/a)")  # n/a: no GPU timing (Metal backend)
+                     r".*?gpu (?:busy )?(?:([\d.]+) ms/frame|n/a)")  # Metal: "gpu busy X ms/frame"; n/a: no GPU figure
 RE_POPS = re.compile(r"\[pops\] ([\d.]+) per second .*queries: ([\d.]+) flickers/s, (\d+)% zero of (\d+)/s")
 RE_EXPO = re.compile(r"\[writeback\] (0x[0-9a-f]+): min (\S+) max (\S+) avg (\S+)")
 RE_HERO = re.compile(r"\[writeback\] hero .*average rgba \(([\d.]+), ([\d.]+), ([\d.]+), ([\d.]+)\)")

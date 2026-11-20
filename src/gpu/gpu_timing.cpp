@@ -22,6 +22,10 @@
 #else
 #include <plume_vulkan.h>
 #endif
+#if defined(FABLE2_METAL_BACKEND)
+#include <time.h>
+#include <plume_metal.h>
+#endif
 
 #if defined(EOT_D3D12)
 #include <windows.h>
@@ -32,6 +36,8 @@
 #include "core/logging.h"
 #include "gpu/backend.h"
 #include "gpu/device.h"
+#include "gpu/gpu_busy.h"
+#include "gpu/render_thread.h"
 #include "gpu/settings.h"
 
 #include <rex/cvar.h>
@@ -39,6 +45,9 @@ REXCVAR_DECLARE(bool, fable2_diag_pass_timing);
 REXCVAR_DECLARE(bool, fable2_diag_pass_gpu);
 REXCVAR_DEFINE_BOOL(fable2_gpu_timing, true, "Fable2",
                     "Native renderer: per-frame GPU timing by category (timestamps between draws of different kinds)");
+REXCVAR_DEFINE_BOOL(fable2_gpu_busy, true, "Fable2",
+                    "Native renderer, Metal: the [perf] gpu figure is the time the GPU was busy a frame (the "
+                    "union of the command buffers' GPU start/end times; no timestamps, nothing is split)");
 REXCVAR_DEFINE_INT32(fable2_gpu_timing_every, 8, "Fable2",
                      "Native renderer: GPU timing on one frame in N (each timestamp is a GPU counter sample of its "
                      "own on Apple GPUs, ~180 a frame; the [perf] GPU figures average the timed frames)");
@@ -65,6 +74,84 @@ bool g_supported = true;
 bool g_open = false;
 
 std::string g_diag_tag;
+
+#if defined(FABLE2_METAL_BACKEND)
+// Metal GPU busy time. plume's queue records every committed command buffer's GPU start and end
+// (MetalCommandQueue::drainGpuIntervals). Each poll (once a frame) takes the union of the
+// intervals of the buffers that do GPU work and adds its length, clipped to the time since the
+// last poll, to perf.gpu_ms, and the Presents since then to perf.gpu_frames: the [perf] line and
+// the live stats then read it like the Vulkan timestamps' figure. The window ends kBusyLag seconds before now: a buffer's
+// completion handler runs a little after the GPU finished it, and an interval that was not
+// delivered yet when its time passed would be lost; one that reaches past the window's end is
+// kept and counted in the next.
+constexpr double kBusyLag = 0.1;
+
+struct MetalBusy {
+  bool enabled = false;
+  bool started = false;
+  double window_start = 0.0;
+  u64 presented = 0;
+  std::vector<BusyInterval> carry;
+  std::vector<plume::MetalGpuInterval> drained;
+  u64 dropped = 0;
+};
+MetalBusy g_busy;
+
+double HostSeconds() { return static_cast<double>(clock_gettime_nsec_np(CLOCK_UPTIME_RAW)) * 1e-9; }
+
+plume::MetalCommandQueue *MetalQueue(VideoState &s) {
+  return static_cast<plume::MetalCommandQueue *>(s.queue.get());
+}
+
+// Follows fable2_gpu_busy (turned on or off at run time): the queue records intervals only while it is on.
+void GpuBusySync(VideoState &s) {
+  const bool want = REXCVAR_GET(fable2_gpu_busy);
+  if (want == g_busy.enabled || !s.queue)
+    return;
+  MetalQueue(s)->setGpuIntervalCapture(want);
+  g_busy.enabled = want;
+  g_busy.started = false;
+  g_busy.carry.clear();
+  if (!want) {
+    g_busy.drained.clear();
+    MetalQueue(s)->drainGpuIntervals(g_busy.drained);
+    g_busy.drained.clear();
+  }
+}
+
+// The frames of the window are the Presents since the last poll (a poll is not a frame: a resize
+// collects every slot, a stall is one poll over many frames), so the figure is busy time per
+// presented frame.
+void GpuBusyPoll(VideoState &s) {
+  GpuBusySync(s);
+  if (!g_busy.enabled)
+    return;
+  g_busy.drained.clear();
+  const u64 dropped = MetalQueue(s)->drainGpuIntervals(g_busy.drained);
+  if (dropped && g_busy.dropped == 0)
+    EOT_WARN("[gpu-timing] {} command buffer intervals dropped (ring full); the gpu busy figure is low", dropped);
+  g_busy.dropped += dropped;
+  for (const plume::MetalGpuInterval &i : g_busy.drained)
+    if (IsGpuWorkLabel(i.label))
+      g_busy.carry.push_back({i.start, i.end});
+  const double hi = HostSeconds() - kBusyLag;
+  const u64 presented = UploadRingFramesPresented();
+  if (!g_busy.started) {
+    g_busy.started = true;
+    g_busy.window_start = hi;
+    g_busy.presented = presented;
+    g_busy.carry.clear();
+    return;
+  }
+  if (hi <= g_busy.window_start)
+    return;
+  s.perf.gpu_ms += UnionBusySeconds(g_busy.carry, g_busy.window_start, hi) * 1e3;
+  s.perf.gpu_frames += static_cast<u32>(presented - g_busy.presented);
+  DropIntervalsEndingBy(g_busy.carry, hi);
+  g_busy.window_start = hi;
+  g_busy.presented = presented;
+}
+#endif
 
 void WriteMark(SlotTiming &st, plume::RenderCommandList *cmd, u32 closing) {
   if (st.used >= kQueryCount)
@@ -157,10 +244,13 @@ bool DiagFrameNow(const VideoState &s);
 void GpuTimingFrameBegin(VideoState &s, plume::RenderCommandList *cmd, u32 slot) {
   if (!g_supported || !s.device || !cmd)
     return;
-  // Metal: GpuTimingCollect reads the timestamps with vkGetQueryPoolResults;
-  // plume's Metal query pools are not wired up here yet.
+  // Metal: a timestamp ends the encoder on Apple GPUs and orders it after all earlier GPU work, so
+  // the category timestamps below would split every pass and serialize the GPU. The figure is the
+  // GPU busy time (GpuBusyPoll) instead.
   if (UseMetal()) {
-    g_supported = false;
+#if defined(FABLE2_METAL_BACKEND)
+    GpuBusySync(s);
+#endif
     return;
   }
   static u64 frames = 0;
@@ -257,6 +347,12 @@ void GpuTimingFrameEnd(plume::RenderCommandList *cmd) {
 }
 
 void GpuTimingCollect(VideoState &s, u32 slot) {
+#if defined(FABLE2_METAL_BACKEND)
+  if (UseMetal()) {
+    GpuBusyPoll(s);
+    return;
+  }
+#endif
   if (!g_supported)
     return;
   auto &st = g_slots[slot];
@@ -409,6 +505,13 @@ void GpuTimingCollect(VideoState &s, u32 slot) {
 }
 
 std::string GpuTimingSummary(const PerfCounters &p) {
+#if defined(FABLE2_METAL_BACKEND)
+  if (UseMetal()) {
+    if (!g_busy.enabled || p.gpu_frames == 0)
+      return "n/a";
+    return std::format("busy {:.2f} ms/frame", p.gpu_ms / static_cast<f64>(p.gpu_frames));
+  }
+#endif
   if (!g_supported)
     return "n/a";
   if (p.gpu_frames == 0)

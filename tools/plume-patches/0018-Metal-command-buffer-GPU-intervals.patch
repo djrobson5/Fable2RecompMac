@@ -1,0 +1,237 @@
+From 75f6f3dd7b2d196818278d22ec6dab048c3f865b Mon Sep 17 00:00:00 2001
+From: djrobson5 <256682087+djrobson5@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 12:14:36 -0800
+Subject: [PATCH 18/19] Metal: command buffer GPU intervals
+
+The queue's completed handler (trackInFlight) can record the GPUStartTime and
+GPUEndTime of each command list it commits, under the list's label, into a
+bounded ring that a caller drains (setGpuIntervalCapture, drainGpuIntervals),
+off by default. It reports how long the GPU was busy without a timestamp: on
+Apple GPUs a timestamp query ends the encoder and waits for all earlier work.
+
+The label is the list's debugLabel (a string literal, default unchanged),
+passed to trackInFlight when the buffer is committed, so the handler does no
+Foundation work; the wait, acquire and present buffers pass none and are not
+recorded. A list that only carries a fence can be given its own label, so the
+caller can leave it out. The handler runs before endInFlight, so waitIdle still
+covers it, and it is registered before the signal-fence handler of the last
+list, so a waiter that sees the fence finds the interval recorded. Buffers
+that failed or have no times are skipped. The list's NSString label is made
+once, not at every begin().
+---
+ plume_metal.cpp | 76 +++++++++++++++++++++++++++++++++++++++++++++----
+ plume_metal.h   | 42 ++++++++++++++++++++++++++-
+ 2 files changed, 111 insertions(+), 7 deletions(-)
+
+diff --git a/plume_metal.cpp b/plume_metal.cpp
+index e1e7c23..e1c9365 100644
+--- a/plume_metal.cpp
++++ b/plume_metal.cpp
+@@ -16,6 +16,7 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <cstring>
+ #include <mutex>
+ 
+ #include "plume_metal.h"
+@@ -2473,6 +2474,10 @@ namespace plume {
+         }
+ 
+         timestampQueryFence->release();
++
++        if (debugLabelString != nullptr) {
++            debugLabelString->release();
++        }
+     }
+ 
+     void MetalCommandList::begin() {
+@@ -2482,7 +2487,16 @@ namespace plume {
+         startedEncoding = false;
+         mtl = queue->mtl->commandBufferWithUnretainedReferences();
+         mtl->retain();
+-        mtl->setLabel(MTLSTR("RT64 Command List"));
++        if (debugLabelCached != debugLabel) {
++            if (debugLabelString != nullptr) {
++                debugLabelString->release();
++            }
++
++            debugLabelString = NS::String::string(debugLabel, NS::UTF8StringEncoding)->retain();
++            debugLabelCached = debugLabel;
++        }
++
++        mtl->setLabel(debugLabelString);
+ 
+         visibilityPool = nullptr;
+         encoderVisibilityPool = nullptr;
+@@ -4189,7 +4203,7 @@ namespace plume {
+             const MetalCommandList *interfaceCommandList = static_cast<const MetalCommandList *>(commandLists[i]);
+             MetalCommandList *mutableCommandList = const_cast<MetalCommandList*>(interfaceCommandList);
+             mutableCommandList->mtl->enqueue();
+-            trackInFlight(mutableCommandList->mtl);
++            trackInFlight(mutableCommandList->mtl, mutableCommandList->debugLabel);
+             mutableCommandList->commit();
+         }
+ 
+@@ -4197,6 +4211,11 @@ namespace plume {
+         const MetalCommandList *interfaceCommandList = static_cast<const MetalCommandList *>(commandLists[commandListCount - 1]);
+         interfaceCommandList->mtl->enqueue();
+ 
++        // Tracked before the fence's handler is added: handlers run in the order they were added, so
++        // the interval is recorded by the time a waiter sees the fence.
++        MetalCommandList *mutableCommandList = const_cast<MetalCommandList*>(interfaceCommandList);
++        trackInFlight(mutableCommandList->mtl, mutableCommandList->debugLabel);
++
+         if (signalFence != nullptr) {
+             interfaceCommandList->mtl->addCompletedHandler([signalFence](MTL::CommandBuffer* cmdBuffer) {
+                 dispatch_semaphore_signal(static_cast<MetalCommandFence *>(signalFence)->semaphore);
+@@ -4208,8 +4227,6 @@ namespace plume {
+             interfaceCommandList->mtl->encodeSignalEvent(interfaceSemaphore->mtl, interfaceSemaphore->mtlEventValue);
+         }
+ 
+-        MetalCommandList *mutableCommandList = const_cast<MetalCommandList*>(interfaceCommandList);
+-        trackInFlight(mutableCommandList->mtl);
+         mutableCommandList->commit();
+     }
+ 
+@@ -4226,13 +4243,60 @@ namespace plume {
+         inFlightCondVar.notify_all();
+     }
+ 
+-    void MetalCommandQueue::trackInFlight(MTL::CommandBuffer *commandBuffer) {
++    void MetalCommandQueue::trackInFlight(MTL::CommandBuffer *commandBuffer, const char *intervalLabel) {
+         beginInFlight();
+-        commandBuffer->addCompletedHandler([this](MTL::CommandBuffer *) {
++        commandBuffer->addCompletedHandler([this, intervalLabel](MTL::CommandBuffer *completed) {
++            if (intervalLabel != nullptr) {
++                recordGpuInterval(completed, intervalLabel);
++            }
++
+             endInFlight();
+         });
+     }
+ 
++    void MetalCommandQueue::setGpuIntervalCapture(const bool enabled) {
++        gpuIntervalCapture.store(enabled, std::memory_order_relaxed);
++    }
++
++    uint64_t MetalCommandQueue::drainGpuIntervals(std::vector<MetalGpuInterval> &out) {
++        std::lock_guard lock(gpuIntervalMutex);
++        out.insert(out.end(), gpuIntervals.begin(), gpuIntervals.end());
++        gpuIntervals.clear();
++        const uint64_t dropped = gpuIntervalsDropped;
++        gpuIntervalsDropped = 0;
++        return dropped;
++    }
++
++    void MetalCommandQueue::recordGpuInterval(MTL::CommandBuffer *commandBuffer, const char *label) {
++        if (!gpuIntervalCapture.load(std::memory_order_relaxed)) {
++            return;
++        }
++
++        // A buffer that failed or never ran has no meaningful times (0).
++        if (commandBuffer->status() != MTL::CommandBufferStatusCompleted) {
++            return;
++        }
++
++        const double start = commandBuffer->GPUStartTime();
++        const double end = commandBuffer->GPUEndTime();
++        if (start <= 0.0 || end <= 0.0 || end < start) {
++            return;
++        }
++
++        MetalGpuInterval interval;
++        interval.start = start;
++        interval.end = end;
++        std::strncpy(interval.label, label, sizeof(interval.label) - 1);
++
++        std::lock_guard lock(gpuIntervalMutex);
++        if (gpuIntervals.size() >= MAX_GPU_INTERVALS) {
++            gpuIntervalsDropped++;
++            return;
++        }
++
++        gpuIntervals.push_back(interval);
++    }
++
+     bool MetalCommandQueue::waitIdle(const uint32_t timeoutMs) {
+         std::unique_lock lock(inFlightMutex);
+         const bool idle = inFlightCondVar.wait_for(lock, std::chrono::milliseconds(timeoutMs), [this] {
+diff --git a/plume_metal.h b/plume_metal.h
+index 8816e88..3e76e0d 100644
+--- a/plume_metal.h
++++ b/plume_metal.h
+@@ -7,10 +7,13 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <condition_variable>
++#include <cstdint>
+ #include <mutex>
+ #include <set>
+ #include <unordered_set>
++#include <vector>
+ 
+ #include "plume_render_interface.h"
+ #include "plume_apple.h"
+@@ -360,6 +363,13 @@ namespace plume {
+         }
+     }
+ 
++    // One committed command buffer's time on the GPU.
++    struct MetalGpuInterval {
++        double start = 0.0;
++        double end = 0.0;
++        char label[40] = {};
++    };
++
+     struct MetalCommandList : RenderCommandList {
+         union ClearValue {
+             RenderColor color;
+@@ -511,6 +521,14 @@ namespace plume {
+ 
+         MTL::Fence *timestampQueryFence = nullptr;
+ 
++        // The command buffer's label (a string literal: it must outlive the list). The queue's GPU
++        // interval capture reports it, so a caller can tell lists that do GPU work from lists that
++        // only carry a fence.
++        const char *debugLabel = "RT64 Command List";
++        // The NSString of debugLabel, made again only when debugLabel points elsewhere.
++        const char *debugLabelCached = nullptr;
++        NS::String *debugLabelString = nullptr;
++
+         // Occlusion queries. visibilityPool's buffer is the visibility result buffer of every render
+         // encoder begun from now on (encoderVisibilityPool: the one of the active encoder). One query
+         // counts at a time (Vulkan also allows one active occlusion query); it counts in every encoder
+@@ -635,7 +653,29 @@ namespace plume {
+         uint32_t inFlightBuffers = 0;
+         void beginInFlight();
+         void endInFlight();
+-        void trackInFlight(MTL::CommandBuffer *commandBuffer);
++        // intervalLabel: a string literal (it must outlive the buffer) to record the buffer's GPU
++        // interval under, or null for a buffer that is not recorded (see below).
++        void trackInFlight(MTL::CommandBuffer *commandBuffer, const char *intervalLabel = nullptr);
++
++        // GPU intervals of the command lists the queue commits (not the wait, acquire and present
++        // buffers plume commits itself). While the capture is on, the completed handler of such a
++        // buffer records when the GPU started and finished it (GPUStartTime / GPUEndTime, seconds on
++        // the host's mach_absolute_time clock, the one of CACurrentMediaTime) and the list's
++        // debugLabel (known when the buffer is committed: the handler does no Foundation work).
++        // drainGpuIntervals moves what was recorded to the caller. The ring holds MAX_GPU_INTERVALS
++        // entries; later ones are dropped (and counted) until the next drain. The handler runs
++        // before endInFlight and, for the buffer that signals a fence, before the fence's handler
++        // (registered later): a waiter that saw the fence finds the interval recorded. waitIdle
++        // covers the handler.
++        static constexpr size_t MAX_GPU_INTERVALS = 16384;
++        std::atomic<bool> gpuIntervalCapture{false};
++        std::mutex gpuIntervalMutex;
++        std::vector<MetalGpuInterval> gpuIntervals;
++        uint64_t gpuIntervalsDropped = 0;
++        void setGpuIntervalCapture(bool enabled);
++        // Appends the recorded intervals to out and returns how many were dropped since the last drain.
++        uint64_t drainGpuIntervals(std::vector<MetalGpuInterval> &out);
++        void recordGpuInterval(MTL::CommandBuffer *commandBuffer, const char *label);
+         // Waits until nothing is in flight; false after timeoutMs (a buffer stuck on a semaphore).
+         bool waitIdle(uint32_t timeoutMs = 5000);
+ 

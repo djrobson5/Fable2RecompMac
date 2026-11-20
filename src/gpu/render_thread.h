@@ -35,6 +35,7 @@ bool UploadRingInit();
 constexpr u32 kUploadRingSlots = 2;
 void UploadRingNextCapturedFrame();  // game's thread, at its Present
 void UploadRingFramePresented();     // render thread, PresentLocked
+u64 UploadRingFramesPresented();     // how many Presents the render thread has processed
 void UploadRingFrameReleased();      // render thread, PresentLocked: its guest reads are over
 void UploadRingSlotSubmitted(u32 command_slot);
 void UploadRingSlotFinished(u32 command_slot);

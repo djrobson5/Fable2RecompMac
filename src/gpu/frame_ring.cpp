@@ -227,6 +227,18 @@ void MaybeSubmitChunkLocked(VideoState &s) {
 
 namespace {
 
+// Metal: names a list that only carries a fence (it records nothing), so the GPU busy figure
+// (gpu_timing.cpp) leaves its command buffer out; a name is a string literal.
+void NameFenceList(plume::RenderCommandList *list, const char *name) {
+#if defined(FABLE2_METAL_BACKEND)
+  if (UseMetal() && list)
+    static_cast<plume::MetalCommandList *>(list)->debugLabel = name;
+#else
+  (void)list;
+  (void)name;
+#endif
+}
+
 VkFence TailFence(VideoState &s) {
 #if defined(EOT_D3D12)
   return nullptr;
@@ -309,8 +321,10 @@ void SubmitQueueMarkerLocked(VideoState &s) {
     // at least one list); the queue runs command buffers in commit order.
     if (!s.tail_fence)
       s.tail_fence = s.device->createCommandFence();
-    if (!s.tail_list)
+    if (!s.tail_list) {
       s.tail_list = s.queue->createCommandList();
+      NameFenceList(s.tail_list.get(), "Queue Idle Marker");
+    }
     if (!s.tail_fence || !s.tail_list)
       return;
     s.tail_list->begin();
@@ -721,6 +735,7 @@ REXCVAR_DEFINE_BOOL(fable2_gpu_done_wait_replay, false, "Fable2",
                     "render thread has read the previous frame's guest data (safety switch; ~0.6 ms slower)");
 
 void UploadRingFramePresented() { g_frames_presented.fetch_add(1, std::memory_order_acq_rel); }
+u64 UploadRingFramesPresented() { return g_frames_presented.load(std::memory_order_acquire); }
 
 // Presents whose guest-memory reads are over (the front buffer, announced
 // texture preloads): the render thread is done with that frame's guest data.
@@ -935,6 +950,7 @@ void SubmitDoneMarkerLocked(VideoState &s) {
     for (u32 i = 0; i < kDoneMarkers; ++i) {
       m.fence[i] = s.device->createCommandFence();
       m.list[i] = s.queue->createCommandList();
+      NameFenceList(m.list[i].get(), "GPU Done Marker");
       if (!m.fence[i] || !m.list[i]) {
         EOT_WARN("[upload-ring] GPU-done markers: no fence or command list; staying with Present-time publishing");
         m.failed.store(true, std::memory_order_release);
