@@ -20,6 +20,7 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -47,6 +48,9 @@ REXCVAR_DEFINE_INT32(fable2_query_hold, 2, "Fable2",
                      "Native renderer: occlusion queries report the largest of their last N host counts (1-4)");
 REXCVAR_DEFINE_BOOL(fable2_query_skip_forced, true, "Fable2",
                     "Native renderer: no host occlusion query for tests reported fully visible anyway");
+REXCVAR_DEFINE_INT32(fable2_query_log, 0, "Fable2",
+                     "Debug: every 120th frame slot read back, log its first N host occlusion query counts "
+                     "(to compare backends on the same view)");
 
 namespace eot::gpu {
 
@@ -237,6 +241,18 @@ void QueriesSlotRecycledLocked(VideoState &s, u32 slot_index) {
     if (slot.pool->getRawResults(0, slot.used, raw.data())) {
       const float k = RenderScaleFactor();
       const double scale = k > 0.0f ? 1.0 / (double(k) * double(k)) : 1.0;
+      static u32 log_tick = 0;
+      if (const i32 n_log = REXCVAR_GET(fable2_query_log); n_log > 0 && ++log_tick % 120 == 0) {
+        std::string line;
+        u64 sum = 0, zero = 0;
+        for (const Entry &e : slot.done) {
+          sum += raw[e.index];
+          zero += raw[e.index] == 0;
+        }
+        for (size_t i = 0; i < slot.done.size() && i < static_cast<size_t>(n_log); ++i)
+          line += fmt::format(" {:x}={}", slot.done[i].va, raw[slot.done[i].index]);
+        EOT_INFO("[qlog] {} queries, host sum {}, {} zero:{}", slot.done.size(), sum, zero, line);
+      }
       std::lock_guard lock(q.mutex);
       for (const Entry &e : slot.done) {
         // Host samples at the render scale, rounded; any visible sample is at

@@ -1348,10 +1348,9 @@ bool Video::CreateHostDevice(rex::ui::Window *window) {
   }
   s.backend_info = DescribeBackend(s.device.get());
   if (UseMetal())
-    EOT_WARN("[metal] the Metal backend is work in progress. Not on Metal yet: occlusion queries (they "
-             "report not ready), GPU timing, Vulkan's lazy clears and persistent render pass (plume patches "
-             "0006/0007; plume's Metal backend has its own clear load actions), a shader cache (shaders are "
-             "converted to MSL and compiled when first used)");
+    EOT_WARN("[metal] the Metal backend is work in progress. Not on Metal yet: GPU timing, Vulkan's lazy "
+             "clears and persistent render pass (plume patches 0006/0007; plume's Metal backend has its own "
+             "clear load actions), a shader cache (shaders are converted to MSL and compiled when first used)");
 
   s.queue = s.device->createCommandQueue(plume::RenderCommandListType::DIRECT);
   for (u32 i = 0; i < kNumFrames; ++i) {
