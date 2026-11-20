@@ -73,6 +73,9 @@ REXCVAR_DEFINE_BOOL(fable2_diag_morph, false, "Fable2",
 REXCVAR_DEFINE_BOOL(fable2_pool_spare, true, "Fable2", "Native renderer: geometry cache pools make their next chunk ahead on a background thread");
 REXCVAR_DEFINE_BOOL(fable2_pull_mirrors, true, "Fable2", "Native renderer: vertex-pulled stream buffers come from the mirror cache instead of a copy per draw");
 REXCVAR_DEFINE_BOOL(fable2_debug_skip_256_draws, false, "Fable2", "Debug: skip colour draws into 256-pixel-wide targets (cost test)");
+REXCVAR_DEFINE_BOOL(fable2_pull_slice_quads, true, "Fable2",
+                    "Native renderer: the sprite quads' pulled ring (vs 724905f3c03c00b8) copies only the elements a draw "
+                    "reads (needs fable2_pull_slices)");
 REXCVAR_DEFINE_BOOL(fable2_pull_slices, true, "Fable2",
                     "Native renderer: pulled buffers are copied only where a draw reads them, for vertex shaders "
                     "whose element index is a known function of the vertex index (the occlusion query boxes)");
@@ -1042,9 +1045,47 @@ extern u64 pk_vs_hash_for_diag;
 // The occlusion query boxes (vs 8f1c881c15849337): element = (vertex + 0.5) /
 // trunc(c48.x), 8 dwords each, from a 64 KB buffer the game rewrites between
 // its ~380 draws a frame; each draw reads one box.
-bool PulledSlice(DeviceView dev, const GuestShader &vs, u32 slot, u32 dwords, u32 vtx_lo, u32 vtx_hi,
-                 u32 *first_dword, u32 *count_dwords) {
-  if (!REXCVAR_GET(fable2_pull_slices) || vs.hash != 0x8f1c881c15849337ull || slot != 93 || vtx_hi < vtx_lo)
+// The particle/sprite quads (vs 724905f3c03c00b8, ~23 draws a frame in
+// Bowerstone): element = floor(vertex * 0.25) (the literal is in the shader:
+// one element per quad), stride and offset from the draw's pull sites. Each
+// draw's fetch constant points at its own quads inside a ring the game fills
+// as it goes, with the size running to the ring's end (74-517 KB copied per
+// draw for ~48 bytes read).
+constexpr u64 kQuadElementVs = 0x724905f3c03c00b8ull;
+bool QuadElementSlice(const PullSiteEntry (&sites)[kPullSites], u32 slot, u32 dwords, u32 vtx_lo, u32 vtx_hi,
+                      u32 *first_dword, u32 *count_dwords) {
+  u32 stride = 0;
+  i32 off_lo = 0, off_hi = 0;
+  bool any = false;
+  for (const PullSiteEntry &site : sites) {
+    if (!(site.slot & 0x80000000u) || (site.slot & 0x7F) != slot)
+      continue;
+    if (any && site.strideDwords != stride)
+      return false;  // one element layout per slot only
+    stride = site.strideDwords;
+    off_lo = any ? std::min(off_lo, site.offsetDwords) : site.offsetDwords;
+    off_hi = any ? std::max(off_hi, site.offsetDwords) : site.offsetDwords;
+    any = true;
+  }
+  if (!any || !stride)
+    return false;
+  const i64 e0 = vtx_lo / 4, e1 = vtx_hi / 4;  // floor(v * 0.25) for v >= 0
+  const i64 from = std::max<i64>(0, e0 * stride + off_lo);
+  const i64 to = std::min<i64>(dwords, e1 * stride + off_hi + 4);  // + the widest element (4 dwords)
+  if (from >= to)
+    return false;
+  *first_dword = static_cast<u32>(from);
+  *count_dwords = static_cast<u32>(to - from);
+  return true;
+}
+
+bool PulledSlice(DeviceView dev, const GuestShader &vs, const PullSiteEntry (&sites)[kPullSites], u32 slot,
+                 u32 dwords, u32 vtx_lo, u32 vtx_hi, u32 *first_dword, u32 *count_dwords) {
+  if (!REXCVAR_GET(fable2_pull_slices) || vtx_hi < vtx_lo)
+    return false;
+  if (vs.hash == kQuadElementVs && slot == 95 && REXCVAR_GET(fable2_pull_slice_quads))
+    return QuadElementSlice(sites, slot, dwords, vtx_lo, vtx_hi, first_dword, count_dwords);
+  if (vs.hash != 0x8f1c881c15849337ull || slot != 93)
     return false;
   const u32 raw = dev.U32(dev::kVsFloatConstants + 48 * 16);
   float k;
@@ -1143,7 +1184,7 @@ bool UploadVertexPullTable(DeviceView dev, const GuestShader &vs, const std::vec
     // shader then skips the per-dword swap (skinning reads ~48 dwords a vertex).
     const bool preswap = REXCVAR_GET(fable2_pull_preswap) && (d1 & 3) == 2;
     u32 slice_first = 0, slice_count = 0;
-    if (PulledSlice(dev, vs, slot, dwords, vtx_lo, vtx_hi, &slice_first, &slice_count)) {
+    if (PulledSlice(dev, vs, sites, slot, dwords, vtx_lo, vtx_hi, &slice_first, &slice_count)) {
       // The whole buffer's room, only the slice copied: the shader's
       // addressing stays as it is and reads nothing else.
       if (!UploadAllocate(u64(dwords) * 4, 16, &data))
@@ -3287,6 +3328,22 @@ bool CaptureDraw(VideoState &s, u32 device_va, u32 prim, GeometryPlan &geom,
     if (!geom.indexed && !geom.rectList && geom.vertexCount) {  // the vertices this draw reads
       vtx_lo = geom.startVertex;
       vtx_hi = geom.startVertex + geom.vertexCount - 1;
+    }
+    if (geom.indexed && vs->hash == kQuadElementVs && geom.baseVertex == 0 && !geom.indices.empty() &&
+        REXCVAR_GET(fable2_pull_slices) && REXCVAR_GET(fable2_pull_slice_quads)) {
+      // The guest's vertex index is the index value here (no base vertex);
+      // reset indices (0xFFFF / 0xFFFFFFFF) are not vertices.
+      u32 lo = ~0u, hi = 0;
+      for (const u32 i : geom.indices) {
+        if (i == 0xFFFFu || i == 0xFFFFFFFFu)
+          continue;
+        lo = std::min(lo, i);
+        hi = std::max(hi, i);
+      }
+      if (lo <= hi) {
+        vtx_lo = lo;
+        vtx_hi = hi;
+      }
     }
     if (const std::string &want = REXCVAR_GET(fable2_diag_pull_vs);
         !want.empty() && std::format("{:016x}", vs->hash).starts_with(want)) {
