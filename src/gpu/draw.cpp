@@ -90,6 +90,10 @@ REXCVAR_DEFINE_INT32(fable2_dump_shadow_maps, 0, "Fable2", "Debug: every N frame
 REXCVAR_DEFINE_BOOL(fable2_debug_7e3_no_alpha, false, "Fable2", "Debug: no alpha writes to k_2_10_10_10_FLOAT targets");
 REXCVAR_DEFINE_BOOL(fable2_diag_7e3, false, "Fable2", "Diagnostic: blend use of k_2_10_10_10_FLOAT targets' alpha");
 REXCVAR_DEFINE_BOOL(fable2_diag_pull, false, "Fable2", "Diagnostic: log how much vertex-pulling data repeats or changes");
+REXCVAR_DEFINE_STRING(fable2_diag_pull_vs, "", "Fable2",
+                      "Diagnostic: log 40 draws of the vertex shader whose hash starts with this ([pull-draw])");
+REXCVAR_DEFINE_BOOL(fable2_diag_pull_by_shader, false, "Fable2",
+                    "Diagnostic: whole-buffer vertex-pull copies by vertex shader and fetch slot ([pull-vs], every 600 frames)");
 REXCVAR_DEFINE_BOOL(fable2_diag_interp, false, "Fable2", "Diagnostic: log interpolants written by vertex shaders vs read by pixel shaders");
 REXCVAR_DEFINE_BOOL(fable2_debug_no_alpha_test, false, "Fable2", "Debug: alpha test always passes");
 // Fable 2's vertex shaders read their atmospheric scattering tables (and the
@@ -1161,6 +1165,33 @@ bool UploadVertexPullTable(DeviceView dev, const GuestShader &vs, const std::vec
       return false;
     }
     state().perf.pull_bytes += u64(dwords) * 4;
+    if (REXCVAR_GET(fable2_diag_pull_by_shader)) {
+      // Which vertex shaders and fetch slots the whole-buffer copies come from.
+      struct Use {
+        u64 bytes = 0, draws = 0;
+        u32 dwords = 0;
+      };
+      static std::unordered_map<u64, Use> uses;
+      static u64 frame0 = ~0ull;
+      const u64 now = state().guest_frames;
+      if (frame0 == ~0ull)
+        frame0 = now;
+      Use &u = uses[(vs.hash & ~0xFFull) | slot];
+      u.bytes += u64(dwords) * 4;
+      u.draws++;
+      u.dwords = dwords;
+      if (now - frame0 >= 600) {
+        std::vector<std::pair<u64, Use>> v(uses.begin(), uses.end());
+        std::sort(v.begin(), v.end(), [](auto &a, auto &b) { return a.second.bytes > b.second.bytes; });
+        const u64 frames = now - frame0;
+        for (size_t i = 0; i < std::min<size_t>(v.size(), 12); ++i)
+          EOT_INFO("[pull-vs] {:.0f} KB/frame {:.1f} draws/frame: vs {:014x}.. slot {} last {} dwords",
+                   double(v[i].second.bytes) / frames / 1024, double(v[i].second.draws) / frames,
+                   v[i].first >> 8, v[i].first & 0xFF, v[i].second.dwords);
+        uses.clear();
+        frame0 = now;
+      }
+    }
     if (REXCVAR_GET(fable2_diag_pull)) {
       // Repeats of the same buffer within a frame, and whether its bytes
       // changed since its previous copy (this frame or an earlier one).
@@ -3256,6 +3287,26 @@ bool CaptureDraw(VideoState &s, u32 device_va, u32 prim, GeometryPlan &geom,
     if (!geom.indexed && !geom.rectList && geom.vertexCount) {  // the vertices this draw reads
       vtx_lo = geom.startVertex;
       vtx_hi = geom.startVertex + geom.vertexCount - 1;
+    }
+    if (const std::string &want = REXCVAR_GET(fable2_diag_pull_vs);
+        !want.empty() && std::format("{:016x}", vs->hash).starts_with(want)) {
+      // Which part of each pulled buffer this draw can read (slicing candidates).
+      static u32 logged = 0;
+      if (logged < 40) {
+        ++logged;
+        std::string line;
+        for (const u8 slot : pulled_slots) {
+          if (slot >= 96)
+            continue;
+          const u32 off = dev::kFetchConstants + 8u * slot;
+          line += std::format(" | slot {} va {:#x} dwords {} endian {}", slot, dev.U32(off) & ~3u,
+                              (dev.U32(off + 4) >> 2) & 0xFFFFFF, dev.U32(off + 4) & 3);
+        }
+        EOT_INFO("[pull-draw] vs {:016x} frame {} {} start {} count {} base {} idx {} lo {} hi {}{}", vs->hash,
+                 s.guest_frames, geom.indexed ? "indexed" : "vertices", geom.startVertex, geom.vertexCount,
+                 geom.baseVertex, geom.indices.size(), geom.cached ? geom.cached->lo : 0u,
+                 geom.cached ? geom.cached->hi : 0u, line);
+      }
     }
     if (!UploadVertexPullTable(dev, *vs, pulled_slots, &pk.vertex_pull_table,
                                up_stream ? geom.stream0OverrideVa : 0u,
