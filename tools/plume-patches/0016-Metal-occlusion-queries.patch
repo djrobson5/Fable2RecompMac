@@ -1,0 +1,395 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: djrobson5 <djrobson5@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 01:00:00 -0800
+Subject: [PATCH] Metal: occlusion queries
+
+Implements patch 0005's interface on Metal: createOcclusionQueryPool,
+beginQuery/endQuery and getRawResults.
+
+A pool is a shared visibility result buffer cut into 8-byte segments.
+Metal counts per render encoder, so a query gets a segment in every
+encoder it spans (plume ends encoders on barriers and framebuffer
+changes) and getRawResults sums them. The pool's buffer is the
+visibility result buffer of every render encoder begun after
+resetQueryPool or beginQuery; a query begun in an encoder without it
+ends that encoder. Counting mode (sample counts, as Vulkan's precise
+queries). Quad clears pause counting (Vulkan's clears are not counted).
+Segment 0 belongs to no query: an encoder writes its count to the
+current offset when it ends, also with counting off (offset 0), and that
+zeroed the first query's count in the self-test.
+Results are available once the last command buffer that counted into
+the pool completed. resetQueryPool zeroes the segments on the CPU, so
+the pool's earlier command buffers must have completed (it waits for
+them otherwise). One query counts at a time, as in Vulkan.
+---
+--- a/plume_metal.cpp
++++ b/plume_metal.cpp
+@@ -2293,12 +2293,28 @@
+ 
+     // MetalQueryPool
+ 
+-    MetalQueryPool::MetalQueryPool(MetalDevice *device, uint32_t queryCount) {
++    MetalQueryPool::MetalQueryPool(MetalDevice *device, uint32_t queryCount, bool occlusion) {
+         assert(device != nullptr);
+         assert(queryCount > 0);
+ 
+         MetalAutoreleasePool releasePool;
+         this->device = device;
++        this->occlusion = occlusion;
++
++        if (occlusion) {
++            // Two segments per query, at most 64 KB: offsets stay below the smallest visibility query
++            // offset limit of Metal's feature set tables.
++            constexpr uint32_t MaxSegments = 65536 / sizeof(uint64_t);
++            segmentCapacity = std::min(queryCount * 2, MaxSegments);
++            visibilityBuffer = device->mtl->newBuffer(segmentCapacity * sizeof(uint64_t), MTL::ResourceStorageModeShared);
++            visibilityBuffer->setLabel(MTLSTR("Occlusion Query Visibility Buffer"));
++            std::memset(visibilityBuffer->contents(), 0, segmentCapacity * sizeof(uint64_t));
++            segmentQuery.reserve(segmentCapacity);
++            segmentQuery.push_back(UINT32_MAX);
++            segmentCount = 1;
++            results.resize(queryCount, 0);
++            return;
++        }
+ 
+         MTL::CounterSampleBufferDescriptor *sampleBufferDesc = MTL::CounterSampleBufferDescriptor::alloc()->init();
+         sampleBufferDesc->setCounterSet(device->timestampCounterSet);
+@@ -2312,11 +2328,26 @@
+ 
+     MetalQueryPool::~MetalQueryPool() {
+         MetalAutoreleasePool releasePool;
+-        sampleBuffer->release();
++        if (sampleBuffer != nullptr) {
++            sampleBuffer->release();
++        }
++
++        if (visibilityBuffer != nullptr) {
++            visibilityBuffer->release();
++        }
++
++        if (lastCommandBuffer != nullptr) {
++            lastCommandBuffer->release();
++        }
+     }
+ 
+     void MetalQueryPool::queryResults() {
+         MetalAutoreleasePool releasePool;
++        if (occlusion) {
++            getRawResults(0, uint32_t(results.size()), results.data());
++            return;
++        }
++
+         const NS::Data* data = sampleBuffer->resolveCounterRange(NS::Range(0, results.size()));
+         std::memcpy(results.data(), data->mutableBytes(), results.size() * sizeof(uint64_t));
+     }
+@@ -2329,6 +2360,53 @@
+         return uint32_t(results.size());
+     }
+ 
++    bool MetalQueryPool::getRawResults(uint32_t first, uint32_t count, uint64_t *out) {
++        if (!occlusion) {
++            return false;
++        }
++
++        if (lastCommandBuffer != nullptr) {
++            const MTL::CommandBufferStatus status = lastCommandBuffer->status();
++            if (status != MTL::CommandBufferStatusCompleted) {
++                return false;
++            }
++        }
++
++        std::fill(out, out + count, uint64_t(0));
++        const uint64_t *data = static_cast<const uint64_t *>(visibilityBuffer->contents());
++        for (uint32_t i = 0; i < segmentCount; i++) {
++            const uint32_t query = segmentQuery[i];
++            if ((query >= first) && (query - first < count)) {
++                out[query - first] += data[i];
++            }
++        }
++
++        return true;
++    }
++
++    uint32_t MetalQueryPool::allocateSegment(uint32_t queryIndex, MTL::CommandBuffer *commandBuffer) {
++        if (segmentCount >= segmentCapacity) {
++            return UINT32_MAX;
++        }
++
++        usedBy(commandBuffer);
++        segmentQuery.push_back(queryIndex);
++        return (segmentCount++) * uint32_t(sizeof(uint64_t));
++    }
++
++    void MetalQueryPool::usedBy(MTL::CommandBuffer *commandBuffer) {
++        if (commandBuffer == lastCommandBuffer) {
++            return;
++        }
++
++        commandBuffer->retain();
++        if (lastCommandBuffer != nullptr) {
++            lastCommandBuffer->release();
++        }
++
++        lastCommandBuffer = commandBuffer;
++    }
++
+     // MetalCommandList
+ 
+     MetalCommandList::MetalCommandList(const MetalCommandQueue *queue) {
+@@ -2365,6 +2443,11 @@
+         mtl->retain();
+         mtl->setLabel(MTLSTR("RT64 Command List"));
+ 
++        visibilityPool = nullptr;
++        encoderVisibilityPool = nullptr;
++        activeQueryPool = nullptr;
++        activeQueryCounting = false;
++
+         // Reset fence waits and updates for new command list.
+         fenceSlots.updateDirtyBits = ~0;
+         for (uint32_t dstStage = 0; dstStage < MetalBarrierStage::COUNT; dstStage++) {
+@@ -2986,7 +3069,9 @@
+         }
+         activeRenderEncoder->setFragmentBytes(clearColors, alignUp(sizeof(simd::float4) * rectCount), 0);
+ 
++        setQueryCountingPaused(true);
+         activeRenderEncoder->drawPrimitives(MTL::PrimitiveTypeTriangle, 0.0, 6 * rectCount);
++        setQueryCountingPaused(false);
+ 
+         activeRenderEncoder->popDebugGroup();
+ 
+@@ -3085,7 +3170,9 @@
+             }
+             activeRenderEncoder->setFragmentBytes(clearDepths, alignUp(sizeof(float) * rectCount), 0);
+ 
++            setQueryCountingPaused(true);
+             activeRenderEncoder->drawPrimitives(MTL::PrimitiveTypeTriangle, 0.0, 6 * rectCount);
++            setQueryCountingPaused(false);
+ 
+             activeRenderEncoder->popDebugGroup();
+ 
+@@ -3368,7 +3455,111 @@
+ 
+     void MetalCommandList::resetQueryPool(const RenderQueryPool *queryPool, uint32_t queryFirstIndex, uint32_t queryCount) {
+         assert(queryPool != nullptr);
+-        // No-op
++        MetalQueryPool *pool = const_cast<MetalQueryPool *>(static_cast<const MetalQueryPool *>(queryPool));
++        if (!pool->occlusion) {
++            return;
++        }
++
++        // The segments are reset on the CPU when the reset is recorded: the pool's earlier command
++        // buffers must have completed (a caller that reuses a pool per frame in flight waited for its
++        // fence already; anything else waits here).
++        MetalAutoreleasePool releasePool;
++        if (pool->lastCommandBuffer != nullptr) {
++            if (pool->lastCommandBuffer->status() < MTL::CommandBufferStatusCommitted) {
++                // Recorded but not submitted (this command list): no CPU reset possible before it runs.
++                assert(false && "resetQueryPool of an occlusion pool used in a command buffer not submitted yet");
++            }
++            else {
++                pool->lastCommandBuffer->waitUntilCompleted();
++            }
++
++            pool->lastCommandBuffer->release();
++            pool->lastCommandBuffer = nullptr;
++        }
++
++        uint64_t *data = static_cast<uint64_t *>(pool->visibilityBuffer->contents());
++        if ((queryFirstIndex == 0) && (queryCount >= pool->results.size())) {
++            std::memset(data, 0, pool->segmentCount * sizeof(uint64_t));
++            pool->segmentQuery.resize(1);
++            pool->segmentCount = 1;
++        }
++        else {
++            // Segments of the reset queries stay allocated, belonging to no query.
++            for (uint32_t i = 0; i < pool->segmentCount; i++) {
++                const uint32_t query = pool->segmentQuery[i];
++                if ((query >= queryFirstIndex) && (query - queryFirstIndex < queryCount)) {
++                    pool->segmentQuery[i] = UINT32_MAX;
++                    data[i] = 0;
++                }
++            }
++        }
++
++        visibilityPool = pool;
++    }
++
++    // Occlusion queries: precise sample counts (Counting mode), as Vulkan with occlusionQueryPrecise.
++    void MetalCommandList::beginQuery(const RenderQueryPool *queryPool, uint32_t queryIndex) {
++        assert(queryPool != nullptr);
++        MetalQueryPool *pool = const_cast<MetalQueryPool *>(static_cast<const MetalQueryPool *>(queryPool));
++        assert(pool->occlusion);
++        if (activeQueryPool != nullptr) {
++            // One occlusion query at a time (as in Vulkan): a nested begin is ignored.
++            return;
++        }
++
++        visibilityPool = pool;
++        activeQueryPool = pool;
++        activeQueryIndex = queryIndex;
++        activeQueryCounting = false;
++        if (activeRenderEncoder != nullptr) {
++            if (encoderVisibilityPool == pool) {
++                startQueryCounting();
++            }
++            else {
++                // The active encoder has another (or no) visibility result buffer: the next one gets this pool's.
++                endActiveRenderEncoder();
++            }
++        }
++    }
++
++    void MetalCommandList::endQuery(const RenderQueryPool *queryPool, uint32_t queryIndex) {
++        assert(queryPool != nullptr);
++        if ((activeQueryPool != static_cast<const MetalQueryPool *>(queryPool)) || (activeQueryIndex != queryIndex)) {
++            return;
++        }
++
++        if ((activeRenderEncoder != nullptr) && activeQueryCounting) {
++            activeRenderEncoder->setVisibilityResultMode(MTL::VisibilityResultModeDisabled, 0);
++        }
++
++        activeQueryPool = nullptr;
++        activeQueryCounting = false;
++    }
++
++    // The active query counts in the active render encoder, in a new segment.
++    void MetalCommandList::startQueryCounting() {
++        assert(activeRenderEncoder != nullptr);
++        assert(activeQueryPool != nullptr);
++        const uint32_t offset = activeQueryPool->allocateSegment(activeQueryIndex, mtl);
++        if (offset == UINT32_MAX) {
++            return;
++        }
++
++        activeRenderEncoder->setVisibilityResultMode(MTL::VisibilityResultModeCounting, offset);
++        activeQueryCounting = true;
++    }
++
++    // Clears drawn as quads are not counted (Vulkan's clears are not).
++    void MetalCommandList::setQueryCountingPaused(bool paused) {
++        if (paused) {
++            if (activeQueryCounting) {
++                activeRenderEncoder->setVisibilityResultMode(MTL::VisibilityResultModeDisabled, 0);
++                activeQueryCounting = false;
++            }
++        }
++        else if ((activeQueryPool != nullptr) && (activeQueryPool == encoderVisibilityPool) && (activeRenderEncoder != nullptr)) {
++            startQueryCounting();
++        }
+     }
+ 
+     void MetalCommandList::writeTimestamp(const RenderQueryPool *queryPool, uint32_t queryIndex) {
+@@ -3546,9 +3737,20 @@
+                 renderDescriptor->setSamplePositions(targetFramebuffer->samplePositions, targetFramebuffer->sampleCount);
+             }
+ 
++            encoderVisibilityPool = visibilityPool;
++            if (visibilityPool != nullptr) {
++                renderDescriptor->setVisibilityResultBuffer(visibilityPool->visibilityBuffer);
++            }
++
+             activeRenderEncoder = mtl->renderCommandEncoder(renderDescriptor);
+             activeRenderEncoder->setLabel(MTLSTR("Graphics Render Encoder"));
+ 
++            // A query open across encoders counts on in this one (a segment of its own).
++            activeQueryCounting = false;
++            if ((activeQueryPool != nullptr) && (activeQueryPool == encoderVisibilityPool)) {
++                startQueryCounting();
++            }
++
+             barrierWait(MetalBarrierStage::GRAPHICS, activeRenderEncoder);
+ 
+             activeRenderEncoder->retain();
+@@ -3729,6 +3931,8 @@
+             activeRenderEncoder->endEncoding();
+             activeRenderEncoder->release();
+             activeRenderEncoder = nullptr;
++            encoderVisibilityPool = nullptr;
++            activeQueryCounting = false;
+             currentEncoderDescriptorSets.clear();
+ 
+             // Mark all state as needing rebind for next encoder
+@@ -4163,6 +4367,10 @@
+ 
+     std::unique_ptr<RenderQueryPool> MetalDevice::createQueryPool(uint32_t queryCount) {
+         return std::make_unique<MetalQueryPool>(this, queryCount);
++    }
++
++    std::unique_ptr<RenderQueryPool> MetalDevice::createOcclusionQueryPool(uint32_t queryCount) {
++        return std::make_unique<MetalQueryPool>(this, queryCount, true);
+     }
+ 
+     void MetalDevice::setBottomLevelASBuildInfo(RenderBottomLevelASBuildInfo &buildInfo, const RenderBottomLevelASMesh *meshes, uint32_t meshCount, bool preferFastBuild, bool preferFastTrace) {
+--- a/plume_metal.h
++++ b/plume_metal.h
+@@ -303,11 +303,30 @@
+         MTL::CounterSampleBuffer *sampleBuffer = nullptr;
+         std::vector<uint64_t> results;
+ 
+-        MetalQueryPool(MetalDevice *device, uint32_t queryCount);
++        // Occlusion pools: a visibility result buffer cut into 8-byte segments. Metal counts a query's
++        // samples per render encoder (one offset per encoder pass, written at the end of the pass), so
++        // a query gets a new segment in every encoder it spans and its count is the sum of them.
++        bool occlusion = false;
++        MTL::Buffer *visibilityBuffer = nullptr;
++        uint32_t segmentCapacity = 0;
++        uint32_t segmentCount = 0;
++        // Per segment: the query it belongs to. Segment 0 belongs to none: Disabled mode's offset (an
++        // encoder writes a count to its current offset at its end, also when not counting).
++        std::vector<uint32_t> segmentQuery;
++        // The last command buffer that counted into the pool (retained): results are available once it
++        // completed (one queue, so every earlier one has too).
++        MTL::CommandBuffer *lastCommandBuffer = nullptr;
++
++        MetalQueryPool(MetalDevice *device, uint32_t queryCount, bool occlusion = false);
+         virtual ~MetalQueryPool() override;
+         virtual void queryResults() override;
+         virtual const uint64_t *getResults() const override;
+         virtual uint32_t getCount() const override;
++        bool getRawResults(uint32_t first, uint32_t count, uint64_t *out) override;
++        // A new segment for query queryIndex counting in commandBuffer; returns its byte offset, or
++        // UINT32_MAX when the pool has no segments left (the query stops counting).
++        uint32_t allocateSegment(uint32_t queryIndex, MTL::CommandBuffer *commandBuffer);
++        void usedBy(MTL::CommandBuffer *commandBuffer);
+     };
+ 
+     enum MetalBarrierStage {
+@@ -464,6 +483,19 @@
+         MetalDescriptorSet* computeDescriptorSets[MAX_DESCRIPTOR_SET_BINDINGS] = {};
+ 
+         MTL::Fence *timestampQueryFence = nullptr;
++
++        // Occlusion queries. visibilityPool's buffer is the visibility result buffer of every render
++        // encoder begun from now on (encoderVisibilityPool: the one of the active encoder). One query
++        // counts at a time (Vulkan also allows one active occlusion query); it counts in every encoder
++        // between beginQuery and endQuery, each in a segment of its own.
++        MetalQueryPool *visibilityPool = nullptr;
++        MetalQueryPool *encoderVisibilityPool = nullptr;
++        MetalQueryPool *activeQueryPool = nullptr;
++        uint32_t activeQueryIndex = 0;
++        // The active query's mode is set on the active render encoder.
++        bool activeQueryCounting = false;
++        void startQueryCounting();
++        void setQueryCountingPaused(bool paused);
+ 
+         std::unordered_set<MetalDescriptorSet*> currentEncoderDescriptorSets;
+         void bindEncoderResources(MTL::CommandEncoder* encoder, bool isCompute);
+@@ -514,6 +546,8 @@
+         void discardTexture(const RenderTexture* texture) override;
+         void resetQueryPool(const RenderQueryPool *queryPool, uint32_t queryFirstIndex, uint32_t queryCount) override;
+         void writeTimestamp(const RenderQueryPool *queryPool, uint32_t queryIndex) override;
++        void beginQuery(const RenderQueryPool *queryPool, uint32_t queryIndex) override;
++        void endQuery(const RenderQueryPool *queryPool, uint32_t queryIndex) override;
+         void endOtherEncoders(EncoderType type);
+         void checkActiveComputeEncoder();
+         void endActiveComputeEncoder();
+@@ -785,6 +819,7 @@
+         std::unique_ptr<RenderCommandSemaphore> createCommandSemaphore() override;
+         std::unique_ptr<RenderFramebuffer> createFramebuffer(const RenderFramebufferDesc &desc) override;
+         std::unique_ptr<RenderQueryPool> createQueryPool(uint32_t queryCount) override;
++        std::unique_ptr<RenderQueryPool> createOcclusionQueryPool(uint32_t queryCount) override;
+         void setBottomLevelASBuildInfo(RenderBottomLevelASBuildInfo &buildInfo, const RenderBottomLevelASMesh *meshes, uint32_t meshCount, bool preferFastBuild, bool preferFastTrace) override;
+         void setTopLevelASBuildInfo(RenderTopLevelASBuildInfo &buildInfo, const RenderTopLevelASInstance *instances, uint32_t instanceCount, bool preferFastBuild, bool preferFastTrace) override;
+         void setShaderBindingTableInfo(RenderShaderBindingTableInfo &tableInfo, const RenderShaderBindingGroups &groups, const RenderPipeline *pipeline, RenderDescriptorSet **descriptorSets, uint32_t descriptorSetCount) override;

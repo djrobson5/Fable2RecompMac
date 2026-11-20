@@ -488,6 +488,90 @@ bool RunPipelineTests(std::string *report) {
   else
     pass("GPU blit from bindless slot 20000 (push constants at byte 24, point sampler slot 1), 16/16 texels "
          "match, read back with a texture-to-buffer copy");
+
+  // Occlusion queries (plume patch 0016): the same blit into the 4x4 target,
+  // its samples counted under scissors of known size.
+  auto queries = device->createOcclusionQueryPool(8);
+  if (!queries) {
+    fail("createOcclusionQueryPool returned no pool");
+    return false;
+  }
+  auto draw_rect = [&](uint32_t w, uint32_t h) {
+    const plume::RenderRect r(0, 0, int32_t(w), int32_t(h));
+    list->setScissors(&r, 1);
+    list->drawInstanced(3, 1, 0, 0);
+  };
+  auto bind_blit = [&]() {
+    list->setGraphicsPipelineLayout(layout.get());
+    list->setPipeline(blit_rgba8.get());
+    list->setGraphicsDescriptorSet(tex_set.get(), 0);
+    list->setGraphicsDescriptorSet(tex_set.get(), 1);
+    list->setGraphicsDescriptorSet(tex_set.get(), 2);
+    list->setGraphicsDescriptorSet(sampler_set.get(), 3);
+    list->setGraphicsDescriptorSet(tex_set.get(), 4);
+    list->setViewports(&vp, 1);
+    list->setGraphicsPushConstants(0, &pc, kCopyPushConstantByteOffset, sizeof(pc));
+  };
+  list->begin();
+  list->resetQueryPool(queries.get(), 0, 8);
+  list->barriers(plume::RenderBarrierStage::GRAPHICS,
+                 plume::RenderTextureBarrier(target.get(), plume::RenderTextureLayout::COLOR_WRITE));
+  // 0: a query begun before the framebuffer is bound (the encoder starts later).
+  list->beginQuery(queries.get(), 0);
+  list->setFramebuffer(framebuffer.get());
+  bind_blit();
+  draw_rect(4, 4);
+  list->endQuery(queries.get(), 0);
+  // 1: inside the running encoder.
+  list->beginQuery(queries.get(), 1);
+  draw_rect(2, 2);
+  list->endQuery(queries.get(), 1);
+  // 2: empty.
+  list->beginQuery(queries.get(), 2);
+  list->endQuery(queries.get(), 2);
+  // 3: across a framebuffer rebind with a full clear (a new encoder), plus a
+  // quad clear inside the query that must not count: 4 + 2.
+  list->beginQuery(queries.get(), 3);
+  draw_rect(2, 2);
+  list->setFramebuffer(framebuffer.get());
+  list->clearColor(0, plume::RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
+  bind_blit();
+  const plume::RenderRect clear_rect(0, 0, 3, 3);
+  list->clearColor(0, plume::RenderColor(0.0f, 0.0f, 0.0f, 1.0f), &clear_rect, 1);
+  bind_blit();
+  draw_rect(2, 1);
+  list->endQuery(queries.get(), 3);
+  // 4: draws outside any query are not counted; then a draw after a barrier
+  // (another encoder) inside one: 3x1 = 3.
+  draw_rect(4, 4);
+  list->beginQuery(queries.get(), 4);
+  list->barriers(plume::RenderBarrierStage::GRAPHICS,
+                 plume::RenderTextureBarrier(target.get(), plume::RenderTextureLayout::COLOR_WRITE));
+  bind_blit();
+  draw_rect(3, 1);
+  list->endQuery(queries.get(), 4);
+  list->setFramebuffer(nullptr);
+  list->end();
+  uint64_t counts[8] = {};
+  const bool early = queries->getRawResults(0, 8, counts);
+  queue->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, fence.get());
+  queue->waitForCommandFence(fence.get());
+  early ? fail("occlusion query results reported available before the command buffer ran")
+        : pass("occlusion query results not available before the command buffer ran");
+  if (!queries->getRawResults(0, 8, counts)) {
+    fail("occlusion query results not available after the fence");
+  } else {
+    const uint64_t want[5] = {16, 4, 0, 6, 3};
+    std::string got;
+    bool match = true;
+    for (uint32_t i = 0; i < 5; ++i) {
+      got += (i ? " " : "") + std::to_string(counts[i]);
+      match = match && counts[i] == want[i];
+    }
+    match ? pass("occlusion query sample counts " + got + " (lazy encoder, 2x2, empty, across encoders "
+                 "without the quad clear, after a barrier)")
+          : fail("occlusion query sample counts " + got + ", want 16 4 0 6 3");
+  }
   return ok;
 }
 
