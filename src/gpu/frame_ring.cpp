@@ -33,6 +33,12 @@
 REXCVAR_DEFINE_INT32(fable2_chunk_submit_draws, 600, "Fable2",
                      "Native renderer: submit the frame so far at the first resolve after this many draws "
                      "(up to 4 times a frame; 0 = one submit at Present)");
+REXCVAR_DEFINE_BOOL(fable2_metal_keep_pass_on_barrier, false, "Fable2",
+                    "Native renderer, Metal: a barrier that does not concern the open render pass (no attachment, "
+                    "no buffer, nothing the pass wrote) leaves the pass open instead of ending it, which stored "
+                    "and reloaded the whole multisampled colour and depth (live; the [barriers] line every 300 "
+                    "frames counts both kinds)");
+
 REXCVAR_DEFINE_BOOL(fable2_destroy_when_queue_idle, true, "Fable2",
                     "Native renderer: destroy retired textures and buffers only while MoltenVK's "
                     "submit thread is idle (async submits lost the device otherwise)");
@@ -91,11 +97,44 @@ void BindListStateLocked(VideoState &s) {
 }
 }
 
+#if defined(FABLE2_METAL_BACKEND)
+namespace {
+
+// Metal: forwards fable2_metal_keep_pass_on_barrier to plume and logs how the barriers that came while a
+// render pass was open went, every 300 frames.
+void MetalBarrierSwitchAndStats(VideoState &s) {
+  static_cast<plume::MetalDevice *>(s.device.get())
+      ->keepPassOnBarrier.store(REXCVAR_GET(fable2_metal_keep_pass_on_barrier), std::memory_order_relaxed);
+  static u64 next_log = 0;
+  if (s.guest_frames < next_log)
+    return;
+  next_log = s.guest_frames + 300;
+  auto &st = plume::g_metalBarrierStats;
+  const u64 kept = st.kept.exchange(0), none = st.noRenderPass.exchange(0), off = st.switchOff.exchange(0),
+            buffer = st.bufferBarrier.exchange(0), attachment = st.attachment.exchange(0),
+            pooled = st.pooledTexture.exchange(0), writable = st.writableTextures.exchange(0),
+            clear = st.pendingClear.exchange(0);
+  const u64 ended = off + buffer + attachment + pooled + writable + clear;
+  if (kept + ended + none)
+    EOT_INFO("[barriers] since the last line (300 frames; switch {}): {} barriers kept the render pass open, {} ended "
+             "it (switch off {}, buffer {}, attachment {}, pooled texture {}, writable layout {}, pending clear {}), "
+             "{} came with no render pass open",
+             REXCVAR_GET(fable2_metal_keep_pass_on_barrier) ? "on" : "off", kept, ended, off, buffer, attachment, pooled,
+             writable, clear, none);
+}
+
+}
+#endif
+
 void BeginCommandList(VideoState &s) {
   if (s.command_list_open)
     return;
   if (s.shutting_down.load(std::memory_order_acquire) || !s.pipeline_layout)
     return;
+#if defined(FABLE2_METAL_BACKEND)
+  if (UseMetal())
+    MetalBarrierSwitchAndStats(s);
+#endif
   const u32 cur = s.frame.load(std::memory_order_relaxed);
   s.command_list = s.command_lists[cur].get();
   s.command_list->begin();

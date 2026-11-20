@@ -17,6 +17,7 @@
 // Usage: fable2_metal_selftest [shader_runtime dir] [--dump <dir>] [--errors N]
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cmath>
@@ -751,12 +752,230 @@ bool RunPipelineTests(std::string *report) {
     }
   }
   {
+    // A barrier that does not concern the open render pass leaves it open (plume patch 0020,
+    // MetalDevice::keepPassOnBarrier). A 1024x1024 texture T is written by a blit encoder, a render pass
+    // begins (its start waits for nothing of the blit), draws without T, takes a barrier on T, and draws
+    // sampling T into the target, which is read back: byte for byte the same with the switch on (the
+    // pass stays open, waits for the blit's fence at the barrier) and off (the barrier ends the pass), for
+    // two patterns of T, 40 times each. Also: a barrier that includes an attachment, one with a buffer
+    // and one with a full clear pending must still end the pass (counted by reason).
+    constexpr uint32_t kBig = 1024, kSlotT = 20001;
+    plume::RenderTextureDesc big_desc = td;
+    big_desc.width = big_desc.height = kBig;
+    big_desc.flags = plume::RenderTextureFlag::NONE;
+    auto big = device->createTexture(big_desc);
+    std::unique_ptr<plume::RenderBuffer> big_upload[2];
+    for (int k = 0; k < 2; ++k) {
+      big_upload[k] = device->createBuffer(plume::RenderBufferDesc::UploadBuffer(kBig * kBig * 4));
+      if (big_upload[k]) {
+        uint32_t *w = static_cast<uint32_t *>(big_upload[k]->map());
+        for (uint32_t i = 0; i < kBig * kBig; ++i)
+          w[i] = 0xFF000000u | ((i * (k ? 7919u : 104729u)) & 0xFFFFFFu);
+        big_upload[k]->unmap();
+      }
+    }
+    auto side_buffer = device->createBuffer(plume::RenderBufferDesc::DefaultBuffer(256, plume::RenderBufferFlag::VERTEX));
+    if (!big || !big_upload[0] || !big_upload[1] || !side_buffer) {
+      fail("barrier keeps the pass: test resources");
+    } else {
+      plume::RenderTextureViewDesc big_vd;
+      big_vd.format = td.format;
+      big_vd.dimension = plume::RenderTextureViewDimension::TEXTURE_2D;
+      big_vd.mipLevels = 1;
+      auto big_view = big->createTextureView(big_vd);
+      tex_set->setTexture(kSlotT, big.get(), plume::RenderTextureLayout::SHADER_READ, big_view.get());
+      plume::MetalDevice *metal_device = static_cast<plume::MetalDevice *>(device.get());
+      auto &stats = plume::g_metalBarrierStats;
+      enum Variant { Plain, WithAttachment, WithBuffer, WithPendingClear, WithGeneral };
+      auto run = [&](bool keep, Variant variant, int pattern) {
+        metal_device->keepPassOnBarrier.store(keep);
+        const plume::RenderRect full_rect(0, 0, kSize, kSize);
+        list->begin();
+        list->barriers(plume::RenderBarrierStage::GRAPHICS, plume::RenderTextureBarrier(target.get(), plume::RenderTextureLayout::COLOR_WRITE));
+        list->barriers(plume::RenderBarrierStage::COPY, plume::RenderTextureBarrier(big.get(), plume::RenderTextureLayout::COPY_DEST));
+        list->copyTextureRegion(plume::RenderTextureCopyLocation::Subresource(big.get()),
+                                plume::RenderTextureCopyLocation::PlacedFootprint(big_upload[pattern].get(), td.format, kBig, kBig, 1, kBig));
+        list->setFramebuffer(framebuffer.get());
+        auto draw_sampling = [&](uint32_t slot) {
+          CopyPushConstants p = pc;
+          p.resourceDescriptorIndex = slot;
+          list->setGraphicsPipelineLayout(layout.get());
+          list->setPipeline(blit_rgba8.get());
+          list->setGraphicsDescriptorSet(tex_set.get(), 0);
+          list->setGraphicsDescriptorSet(tex_set.get(), 1);
+          list->setGraphicsDescriptorSet(tex_set.get(), 2);
+          list->setGraphicsDescriptorSet(sampler_set.get(), 3);
+          list->setGraphicsDescriptorSet(tex_set.get(), 4);
+          list->setViewports(&vp, 1);
+          list->setScissors(&full_rect, 1);
+          list->setGraphicsPushConstants(0, &p, kCopyPushConstantByteOffset, sizeof(p));
+          list->drawInstanced(3, 1, 0, 0);
+        };
+        draw_sampling(kSlot);
+        if (variant == WithPendingClear)
+          list->clearColor(0, plume::RenderColor(0.0f, 1.0f, 0.0f, 1.0f));
+        const plume::RenderTextureBarrier textures[2] = {
+            plume::RenderTextureBarrier(big.get(), variant == WithGeneral ? plume::RenderTextureLayout::GENERAL : plume::RenderTextureLayout::SHADER_READ),
+            plume::RenderTextureBarrier(target.get(), plume::RenderTextureLayout::COLOR_WRITE)};
+        const plume::RenderBufferBarrier buffers[1] = {plume::RenderBufferBarrier(side_buffer.get(), plume::RenderBufferAccess::WRITE)};
+        list->barriers(plume::RenderBarrierStage::GRAPHICS, variant == WithBuffer ? buffers : nullptr, variant == WithBuffer ? 1 : 0,
+                       textures, variant == WithAttachment ? 2 : 1);
+        draw_sampling(kSlotT);
+        list->setFramebuffer(nullptr);
+        list->barriers(plume::RenderBarrierStage::COPY, plume::RenderTextureBarrier(target.get(), plume::RenderTextureLayout::COPY_SOURCE));
+        list->copyTextureRegion(plume::RenderTextureCopyLocation::PlacedFootprint(readback.get(), td.format, kSize, kSize, 1, kSize),
+                                plume::RenderTextureCopyLocation::Subresource(target.get()));
+        list->end();
+        queue->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, fence.get());
+        queue->waitForCommandFence(fence.get());
+        std::vector<uint32_t> pixels(kSize * kSize);
+        std::memcpy(pixels.data(), readback->map(), sizeof(texels));
+        readback->unmap();
+        return pixels;
+      };
+      auto snapshot = [&]() {
+        return std::array<uint64_t, 8>{stats.kept.load(), stats.noRenderPass.load(), stats.switchOff.load(), stats.bufferBarrier.load(),
+                                       stats.attachment.load(), stats.pooledTexture.load(), stats.writableTextures.load(), stats.pendingClear.load()};
+      };
+      const bool layout_flag = !static_cast<plume::MetalPipelineLayout *>(layout.get())->writesTextures;
+      layout_flag ? pass("barrier keeps the pass: the main pipeline layout has no writable texture range, so a pass drawing with it writes only its attachments")
+                  : fail("barrier keeps the pass: the main layout reports writable textures");
+      {
+        plume::RenderDescriptorRange rw_range;
+        rw_range.type = plume::RenderDescriptorRangeType::READ_WRITE_TEXTURE;
+        rw_range.count = 1;
+        rw_range.binding = 0;
+        plume::RenderDescriptorSetDesc rw_set(&rw_range, 1);
+        plume::RenderPipelineLayoutDesc rw_desc;
+        rw_desc.descriptorSetDescs = &rw_set;
+        rw_desc.descriptorSetDescsCount = 1;
+        auto rw_layout = device->createPipelineLayout(rw_desc);
+        rw_layout && static_cast<plume::MetalPipelineLayout *>(rw_layout.get())->writesTextures
+            ? pass("barrier keeps the pass: a layout with a read-write texture range reports writable textures (the pass is not kept)")
+            : fail("barrier keeps the pass: a layout with a read-write texture range does not report writable textures");
+      }
+      std::vector<uint32_t> reference[2];
+      for (int k = 0; k < 2; ++k)
+        reference[k] = run(false, Plain, k);
+      bool distinct = reference[0] != reference[1];
+      uint32_t mismatches = 0;
+      const auto before = snapshot();
+      for (int i = 0; i < 80; ++i)
+        mismatches += run(true, Plain, i & 1) != reference[i & 1];
+      const auto after = snapshot();
+      const uint64_t kept = after[0] - before[0];
+      distinct && mismatches == 0 && kept == 80
+          ? pass("barrier keeps the pass: with the switch on, 80 runs (2 patterns of T) read back byte for byte what the ended-pass runs did; " +
+                 std::to_string(kept) + " barriers kept the pass")
+          : fail("barrier keeps the pass: " + std::to_string(mismatches) + " of 80 runs differ from the reference, " + std::to_string(kept) +
+                 " kept, patterns " + (distinct ? "distinct" : "equal"));
+      const auto before_off = snapshot();
+      uint32_t off_mismatches = 0;
+      for (int i = 0; i < 10; ++i)
+        off_mismatches += run(false, Plain, i & 1) != reference[i & 1];
+      const auto after_off = snapshot();
+      off_mismatches == 0 && after_off[0] == before_off[0] && after_off[2] - before_off[2] == 10
+          ? pass("barrier keeps the pass: with the switch off nothing is kept (10 barriers ended the pass, results unchanged)")
+          : fail("barrier keeps the pass: switch off kept " + std::to_string(after_off[0] - before_off[0]) + ", " + std::to_string(off_mismatches) + " differ");
+      struct Case { Variant v; const char *name; size_t counter; };
+      const Case cases[] = {{WithAttachment, "an attachment in the barrier", 4}, {WithBuffer, "a buffer barrier", 3}, {WithPendingClear, "a pending full clear", 7},
+                           {WithGeneral, "a texture moved to the general (storage) layout", 6}};
+      for (const Case &c : cases) {
+        const auto b = snapshot();
+        const auto ref = run(false, c.v, 0);
+        const auto got = run(true, c.v, 0);
+        const auto a = snapshot();
+        got == ref && a[0] == b[0] && a[c.counter] - b[c.counter] == 1
+            ? pass(std::string("barrier keeps the pass: ") + c.name + " still ends the pass (counted), same texels with the switch on")
+            : fail(std::string("barrier keeps the pass: ") + c.name + ": kept " + std::to_string(a[0] - b[0]) + ", reason counter " +
+                   std::to_string(a[c.counter] - b[c.counter]) + (got == ref ? "" : ", texels differ"));
+      }
+      // The other direction: a barrier that moves T to be written (the pass only reads it, through the
+      // bindless table, so plume cannot tell) keeps the pass open, yet the blit that overwrites T after the
+      // pass must wait for the whole pass, not just for the part before the barrier. 150 draws sample T
+      // into a 1024x1024 target (identity copy), then the barrier, then the pass ends and T is overwritten.
+      auto target_big = device->createTexture(plume::RenderTextureDesc::ColorTarget(kBig, kBig, td.format));
+      auto readback_big = device->createBuffer(plume::RenderBufferDesc::ReadbackBuffer(kBig * kBig * 4));
+      if (!target_big || !readback_big) {
+        fail("barrier keeps the pass: test resources (write after read)");
+      } else {
+        const plume::RenderTexture *big_colors[1] = {target_big.get()};
+        auto big_fb = device->createFramebuffer(plume::RenderFramebufferDesc(big_colors, 1));
+        const plume::RenderViewport big_vp(0.0f, 0.0f, float(kBig), float(kBig), 0.0f, 1.0f);
+        const plume::RenderRect big_rect(0, 0, kBig, kBig);
+        auto write_after_read = [&](bool keep) {
+          metal_device->keepPassOnBarrier.store(keep);
+          // T holds pattern 0 (written and waited for here).
+          list->begin();
+          list->barriers(plume::RenderBarrierStage::COPY, plume::RenderTextureBarrier(big.get(), plume::RenderTextureLayout::COPY_DEST));
+          list->copyTextureRegion(plume::RenderTextureCopyLocation::Subresource(big.get()),
+                                  plume::RenderTextureCopyLocation::PlacedFootprint(big_upload[0].get(), td.format, kBig, kBig, 1, kBig));
+          list->end();
+          queue->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, fence.get());
+          queue->waitForCommandFence(fence.get());
+          list->begin();
+          list->barriers(plume::RenderBarrierStage::GRAPHICS, plume::RenderTextureBarrier(big.get(), plume::RenderTextureLayout::SHADER_READ));
+          list->barriers(plume::RenderBarrierStage::GRAPHICS, plume::RenderTextureBarrier(target_big.get(), plume::RenderTextureLayout::COLOR_WRITE));
+          list->setFramebuffer(big_fb.get());
+          CopyPushConstants p = pc;
+          p.resourceDescriptorIndex = kSlotT;
+          list->setGraphicsPipelineLayout(layout.get());
+          list->setPipeline(blit_rgba8.get());
+          list->setGraphicsDescriptorSet(tex_set.get(), 0);
+          list->setGraphicsDescriptorSet(tex_set.get(), 1);
+          list->setGraphicsDescriptorSet(tex_set.get(), 2);
+          list->setGraphicsDescriptorSet(sampler_set.get(), 3);
+          list->setGraphicsDescriptorSet(tex_set.get(), 4);
+          list->setViewports(&big_vp, 1);
+          list->setScissors(&big_rect, 1);
+          list->setGraphicsPushConstants(0, &p, kCopyPushConstantByteOffset, sizeof(p));
+          for (int d = 0; d < 150; ++d)
+            list->drawInstanced(3, 1, 0, 0);
+          // T is written next: the barrier (kept open or not) makes later work wait for this pass.
+          list->barriers(plume::RenderBarrierStage::COPY, plume::RenderTextureBarrier(big.get(), plume::RenderTextureLayout::COPY_DEST));
+          list->setFramebuffer(nullptr);
+          list->copyTextureRegion(plume::RenderTextureCopyLocation::Subresource(big.get()),
+                                  plume::RenderTextureCopyLocation::PlacedFootprint(big_upload[1].get(), td.format, kBig, kBig, 1, kBig));
+          list->barriers(plume::RenderBarrierStage::COPY, plume::RenderTextureBarrier(target_big.get(), plume::RenderTextureLayout::COPY_SOURCE));
+          list->copyTextureRegion(plume::RenderTextureCopyLocation::PlacedFootprint(readback_big.get(), td.format, kBig, kBig, 1, kBig),
+                                  plume::RenderTextureCopyLocation::Subresource(target_big.get()));
+          list->end();
+          queue->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, fence.get());
+          queue->waitForCommandFence(fence.get());
+          std::vector<uint32_t> pixels(kBig * kBig);
+          std::memcpy(pixels.data(), readback_big->map(), pixels.size() * 4);
+          readback_big->unmap();
+          return pixels;
+        };
+        const uint64_t kept_before = stats.kept.load();
+        const auto off_pixels = write_after_read(false);
+        const auto on_pixels = write_after_read(true);
+        const uint64_t kept_now = stats.kept.load() - kept_before;
+        const uint32_t *want = static_cast<const uint32_t *>(big_upload[0]->map());
+        uint32_t bad_off = 0, bad_on = 0;
+        for (uint32_t i = 0; i < kBig * kBig; ++i) {
+          bad_off += off_pixels[i] != want[i];
+          bad_on += on_pixels[i] != want[i];
+        }
+        big_upload[0]->unmap();
+        bad_off == 0 && bad_on == 0 && kept_now == 1
+            ? pass("barrier keeps the pass: a texture the pass only reads is overwritten after it: the blit waited for the whole pass (1M texels intact, switch on and off; " +
+                   std::to_string(kept_now) + " barrier kept the pass)")
+            : fail("barrier keeps the pass: write after read: " + std::to_string(bad_off) + " texels wrong with the switch off, " + std::to_string(bad_on) +
+                   " with it on, " + std::to_string(kept_now) + " kept");
+      }
+      metal_device->keepPassOnBarrier.store(false);
+    }
+  }
+  {
     // A waiter that sees the fence finds the list's interval recorded (the interval's handler is
     // registered before the fence's): 200 empty lists, drained right after each fence wait.
     auto empty = queue->createCommandList();
     auto empty_fence = device->createCommandFence();
     std::vector<plume::MetalGpuInterval> got;
     uint32_t missing = 0;
+    metal_queue->waitIdle();
+    metal_queue->drainGpuIntervals(got);  // the earlier tests' lists
     for (int i = 0; i < 200; ++i) {
       empty->begin();
       empty->end();

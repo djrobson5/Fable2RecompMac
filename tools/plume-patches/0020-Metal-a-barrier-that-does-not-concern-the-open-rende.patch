@@ -1,0 +1,300 @@
+From e5ad82c7776a01850d1fbadefa848c7d46c37a76 Mon Sep 17 00:00:00 2001
+From: djrobson5 <256682087+djrobson5@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 13:31:57 -0800
+Subject: [PATCH 20/21] Metal: a barrier that does not concern the open render
+ pass leaves it open
+
+barriers() ended the active encoder on every barrier, so a barrier on
+textures a big pass has nothing to do with (the game moves two 64x64 textures
+in the middle of its scene pass) stored the whole multisampled colour and depth
+and loaded them again in a second pass.
+
+With MetalDevice::keepPassOnBarrier on, the pass stays open when it is a
+render pass and nothing in the barrier can have been written by it: no buffer
+(memexport writes buffers from vertex shaders), no attachment of the pass, no
+texture placed in a pool (its memory may alias an attachment), no draw with a
+pipeline layout that has a read-write texture range (the main layout has none,
+so only attachments are written), no texture moved to a layout the pass could
+write it in (general, unknown), and no full clear pending. The reason a
+barrier ended the pass is counted (g_metalBarrierStats).
+
+The ordering stays that of ending the pass at the barrier: the pass waits at
+the barrier for the fences the barrier's source stages updated so far (the
+draws after it read what earlier encoders wrote; Metal holds a render
+encoder's fence waits for the encoder, which only orders it after work that is
+already encoded), and the barrier is applied for the encoders after the pass
+when the pass ends, so they wait for the fence the pass updates: a texture the
+barrier moves to be written is not overwritten while the pass still samples it
+through the bindless table. Applying the barrier at once would let them
+overtake the pass. A fence is not waited for and updated by one encoder, so a
+pass that waits for the graphics fence ends by updating the next one.
+
+The barrier's textures are looked at through the common base class (a swap
+chain drawable goes through barriers() too), and a draw without a pipeline
+layout is tolerated.
+---
+ plume_metal.cpp | 123 +++++++++++++++++++++++++++++++++++++++++++++++-
+ plume_metal.h   |  33 +++++++++++++
+ 2 files changed, 155 insertions(+), 1 deletion(-)
+
+diff --git a/plume_metal.cpp b/plume_metal.cpp
+index 3f9599d..7ec47ad 100644
+--- a/plume_metal.cpp
++++ b/plume_metal.cpp
+@@ -2656,6 +2656,8 @@ namespace plume {
+ 
+         MetalAutoreleasePool releasePool;
+         startedEncoding = false;
++        pendingBarrierSrc = 0;
++        pendingBarrierDst = 0;
+         mtl = queue->mtl->commandBufferWithUnretainedReferences();
+         mtl->retain();
+         if (debugLabelCached != debugLabel) {
+@@ -2837,13 +2839,114 @@ namespace plume {
+             // interfaceTexture->layout = textureBarrier.layout;
+         }
+ 
+-        // End passes on all barriers to finish work and update the appropriate barrier fences.
++        // A barrier that does not concern the open render pass leaves it open (the stores and reloads of
++        // splitting a big pass are costly). Otherwise end passes on all barriers to finish work and update
++        // the appropriate barrier fences.
++        if (canKeepPassForBarrier(bufferBarriers, bufferBarriersCount, textureBarriers, textureBarriersCount)) {
++            keepPassForBarrier(srcStageMask, destStageMask);
++            return;
++        }
++
+         endOtherEncoders(EncoderType::None);
+         handlePendingClears();
+ 
+         setBarrier(srcStageMask, destStageMask);
+     }
+ 
++    // Whether a barrier can leave the open render encoder open, and counts why not (g_metalBarrierStats).
++    //
++    // A barrier orders the work before it that wrote the resources against the work after it that uses
++    // them: the encoders before it have ended, and the stage fences (update at an encoder's end, wait at the
++    // start of the encoders after the barrier) carry the order. The open render encoder can stay open if it
++    // wrote none of the barrier's resources: its attachments are the only textures it writes unless a draw
++    // used a layout with writable textures, and buffers (memexport) it may write cannot be told apart. What
++    // it only reads is covered by keepPassForBarrier (later work waits for the pass too).
++    bool MetalCommandList::canKeepPassForBarrier(const RenderBufferBarrier *bufferBarriers, const uint32_t bufferBarriersCount, const RenderTextureBarrier *textureBarriers, const uint32_t textureBarriersCount) {
++        if (activeRenderEncoder == nullptr || activeType != EncoderType::Render) {
++            g_metalBarrierStats.noRenderPass++;
++            return false;
++        }
++
++        if (!device->keepPassOnBarrier.load(std::memory_order_relaxed)) {
++            g_metalBarrierStats.switchOff++;
++            return false;
++        }
++
++        if (bufferBarriersCount != 0) {
++            g_metalBarrierStats.bufferBarrier++;
++            return false;
++        }
++
++        if (pendingClears.active) {
++            g_metalBarrierStats.pendingClear++;
++            return false;
++        }
++
++        if (encoderMayWriteTextures) {
++            g_metalBarrierStats.writableTextures++;
++            return false;
++        }
++
++        for (uint32_t i = 0; i < textureBarriersCount; i++) {
++            // Any texture of the barrier (a drawable of the swap chain too), through the common base.
++            const ExtendedRenderTexture *texture = static_cast<const ExtendedRenderTexture *>(textureBarriers[i].texture);
++            if (texture->isPooled()) {
++                g_metalBarrierStats.pooledTexture++;
++                return false;
++            }
++
++            // A layout the draws after the barrier may write the texture in (storage access), or an unknown
++            // one: encoderMayWriteTextures only covers the draws before the barrier.
++            if (textureBarriers[i].layout == RenderTextureLayout::GENERAL || textureBarriers[i].layout == RenderTextureLayout::UNKNOWN) {
++                g_metalBarrierStats.writableTextures++;
++                return false;
++            }
++
++            bool attachment = (targetFramebuffer != nullptr) && (texture == targetFramebuffer->depthAttachment.texture);
++            for (uint32_t j = 0; targetFramebuffer != nullptr && !attachment && j < targetFramebuffer->colorAttachments.size(); j++) {
++                attachment = texture == targetFramebuffer->colorAttachments[j].texture;
++            }
++
++            if (attachment) {
++                g_metalBarrierStats.attachment++;
++                return false;
++            }
++        }
++
++        g_metalBarrierStats.kept++;
++        return true;
++    }
++
++    // The barrier as setBarrier would apply it with the pass ended just before it, without ending the pass:
++    //  - the pass waits for the fences the barrier's source stages updated so far, where the barrier's
++    //    destination includes graphics (the draws after the barrier read what earlier encoders wrote; the
++    //    draws before it do not care). A render encoder's fence waits hold back the stages it names for the
++    //    encoder; that only orders the pass after work that is already encoded.
++    //  - the barrier is applied for the encoders after the pass when it ends (endActiveRenderEncoder), so they
++    //    wait for the fence the pass itself updates: whatever the pass read or wrote before the barrier is
++    //    ordered before what they do (a texture the barrier moves to be written must not be written while
++    //    the pass still samples it through the bindless table).
++    //  - a fence cannot be waited for and updated in one encoder: when the pass waits for the graphics
++    //    fence its end must update the next one (the dirty bit).
++    void MetalCommandList::keepPassForBarrier(const uint64_t sourceStageMask, const uint64_t destStageMask) {
++        if (destStageMask & (1 << MetalBarrierStage::GRAPHICS)) {
++            constexpr uint32_t beforeStages = MTL::RenderStageVertex | MTL::RenderStageFragment;
++            for (int i = 0; i < MetalBarrierStage::COUNT; ++i) {
++                if ((sourceStageMask & (1 << i)) == 0 || fenceSlots.update[i] < 0) {
++                    continue;
++                }
++
++                activeRenderEncoder->waitForFence(fences[i][fenceSlots.update[i]], beforeStages);
++                if (i == MetalBarrierStage::GRAPHICS) {
++                    fenceSlots.updateDirtyBits |= 1 << MetalBarrierStage::GRAPHICS;
++                }
++            }
++        }
++
++        pendingBarrierSrc |= sourceStageMask;
++        pendingBarrierDst |= destStageMask;
++    }
++
+     static uint64_t toStageMask(RenderBarrierStages stages) {
+         uint64_t mask = 0;
+ 
+@@ -2908,6 +3011,7 @@ namespace plume {
+ 
+         MetalAutoreleasePool releasePool;
+         checkActiveRenderEncoder();
++        encoderMayWriteTextures |= activeGraphicsPipelineLayout != nullptr && activeGraphicsPipelineLayout->writesTextures;
+         checkForUpdatesInGraphicsState();
+ 
+         activeRenderEncoder->drawPrimitives(activeRenderState->primitiveType, startVertexLocation, vertexCountPerInstance, instanceCount, startInstanceLocation);
+@@ -2918,6 +3022,7 @@ namespace plume {
+ 
+         MetalAutoreleasePool releasePool;
+         checkActiveRenderEncoder();
++        encoderMayWriteTextures |= activeGraphicsPipelineLayout != nullptr && activeGraphicsPipelineLayout->writesTextures;
+         checkForUpdatesInGraphicsState();
+ 
+         activeRenderEncoder->drawIndexedPrimitives(currentPrimitiveType, indexCountPerInstance, currentIndexType, indexBuffer, indexBufferOffset + (startIndexLocation * indexTypeSize), instanceCount, baseVertexLocation, startInstanceLocation);
+@@ -4062,6 +4167,7 @@ namespace plume {
+ 
+             activeRenderEncoder = mtl->renderCommandEncoder(renderDescriptor);
+             activeRenderEncoder->setLabel(MTLSTR("Graphics Render Encoder"));
++            encoderMayWriteTextures = false;
+ 
+             // A query open across encoders counts on in this one (a segment of its own).
+             activeQueryCounting = false;
+@@ -4249,6 +4355,13 @@ namespace plume {
+             activeRenderEncoder->endEncoding();
+             activeRenderEncoder->release();
+             activeRenderEncoder = nullptr;
++
++            // The barriers that kept this pass open take effect for the encoders after it.
++            if (pendingBarrierSrc != 0 || pendingBarrierDst != 0) {
++                setBarrier(pendingBarrierSrc, pendingBarrierDst);
++                pendingBarrierSrc = 0;
++                pendingBarrierDst = 0;
++            }
+             encoderVisibilityPool = nullptr;
+             activeQueryCounting = false;
+             currentEncoderDescriptorSets.clear();
+@@ -4552,6 +4665,14 @@ namespace plume {
+ 
+         this->setLayoutCount = desc.descriptorSetDescsCount;
+ 
++        for (uint32_t i = 0; i < desc.descriptorSetDescsCount; i++) {
++            for (uint32_t j = 0; j < desc.descriptorSetDescs[i].descriptorRangesCount; j++) {
++                if (desc.descriptorSetDescs[i].descriptorRanges[j].type == RenderDescriptorRangeType::READ_WRITE_TEXTURE) {
++                    writesTextures = true;
++                }
++            }
++        }
++
+         for (uint32_t i = 0; i < desc.rootDescriptorDescsCount; i++) {
+             const RenderRootDescriptorDesc &root = desc.rootDescriptorDescs[i];
+             if ((root.registerSpace < setLayoutCount) || (root.registerSpace >= MAX_DESCRIPTOR_SET_BINDINGS) || (root.shaderRegister >= MetalCommandList::MAX_ROOT_DESCRIPTOR_BINDINGS)) {
+diff --git a/plume_metal.h b/plume_metal.h
+index 1039849..b136e9b 100644
+--- a/plume_metal.h
++++ b/plume_metal.h
+@@ -213,6 +213,8 @@ namespace plume {
+         RenderTextureDesc desc;
+         RenderBarrierStages barrierStages = RenderBarrierStage::NONE;
+         virtual MTL::Texture* getTexture() const = 0;
++        // Placed in a pool (its memory may alias that of another texture).
++        virtual bool isPooled() const { return false; }
+     };
+ 
+     struct MetalDescriptorSet : RenderDescriptorSet {
+@@ -426,6 +428,20 @@ namespace plume {
+         void resolve(std::vector<Span> &out, uint32_t *invalid, uint32_t *rejected);
+     };
+ 
++    // Barriers that arrive while a render pass is open (Fable 2): how many kept the pass and, of those that
++    // ended it, why. Counted by the command lists; the renderer logs and resets them.
++    struct MetalBarrierStats {
++        std::atomic<uint64_t> kept{0};
++        std::atomic<uint64_t> noRenderPass{0};      // no render encoder was open (a compute or blit encoder, or none)
++        std::atomic<uint64_t> switchOff{0};         // MetalDevice::keepPassOnBarrier is off
++        std::atomic<uint64_t> bufferBarrier{0};     // the barrier has a buffer (memexport writes buffers from the pass)
++        std::atomic<uint64_t> attachment{0};        // a texture of the barrier is an attachment of the pass
++        std::atomic<uint64_t> pooledTexture{0};     // a texture is placed in a pool (its memory may alias an attachment's)
++        std::atomic<uint64_t> writableTextures{0};  // the pass drew with a layout that can write textures
++        std::atomic<uint64_t> pendingClear{0};      // a full clear is pending on the pass
++    };
++    inline MetalBarrierStats g_metalBarrierStats;
++
+     // One committed command buffer's time on the GPU.
+     struct MetalGpuInterval {
+         double start = 0.0;
+@@ -588,6 +604,15 @@ namespace plume {
+         // interval capture reports it, so a caller can tell lists that do GPU work from lists that
+         // only carry a fence.
+         const char *debugLabel = "RT64 Command List";
++
++        // Barriers that keep the open render pass (see barriers()): the stage masks of the ones kept since
++        // the pass began, applied when it ends; and whether the pass drew with a layout that can write
++        // textures (then it is not known what it wrote).
++        uint64_t pendingBarrierSrc = 0;
++        uint64_t pendingBarrierDst = 0;
++        bool encoderMayWriteTextures = false;
++        bool canKeepPassForBarrier(const RenderBufferBarrier *bufferBarriers, uint32_t bufferBarriersCount, const RenderTextureBarrier *textureBarriers, uint32_t textureBarriersCount);
++        void keepPassForBarrier(uint64_t sourceStageMask, uint64_t destStageMask);
+         // The NSString of debugLabel, made again only when debugLabel points elsewhere.
+         const char *debugLabelCached = nullptr;
+         NS::String *debugLabelString = nullptr;
+@@ -809,6 +834,7 @@ namespace plume {
+         std::unique_ptr<RenderTextureView> createTextureView(const RenderTextureViewDesc &desc) const override;
+         void setName(const std::string &name) override;
+         MTL::Texture* getTexture() const override { return mtl; }
++        bool isPooled() const override { return pool != nullptr; }
+     };
+ 
+     struct MetalTextureView : RenderTextureView {
+@@ -915,6 +941,9 @@ namespace plume {
+         std::vector<RenderPushConstantRange> pushConstantRanges;
+         std::vector<RootDescriptor> rootDescriptors;
+         uint32_t setLayoutCount = 0;
++        // Some descriptor range can be written as a texture (a draw with this layout may write a texture
++        // that is not an attachment).
++        bool writesTextures = false;
+ 
+         MetalPipelineLayout(MetalDevice *device, const RenderPipelineLayoutDesc &desc);
+         ~MetalPipelineLayout() override;
+@@ -941,6 +970,10 @@ namespace plume {
+         MTL::DepthStencilState *clearStencilState;
+         MTL::DepthStencilState *clearDepthStencilState;
+ 
++        // Fable 2: a barrier that does not concern the open render pass leaves the pass open (see
++        // MetalCommandList::barriers). Off: every barrier ends it. May be changed at any time.
++        std::atomic<bool> keepPassOnBarrier{false};
++
+         std::mutex clearPipelineStateMutex;
+         std::unordered_map<uint64_t, MTL::RenderPipelineState *> clearRenderPipelineStates;
+ 
