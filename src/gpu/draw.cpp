@@ -67,6 +67,9 @@ REXCVAR_DEFINE_INT32(fable2_debug_null_slots, 0, "Fable2",
                      "Native renderer diagnostic: bitmask of texture slots left unbound");
 REXCVAR_DEFINE_BOOL(fable2_debug_depth_always, false, "Fable2", "Debug: depth test always passes");
 REXCVAR_DEFINE_BOOL(fable2_debug_cull_none, false, "Fable2", "Debug: no face culling");
+REXCVAR_DEFINE_BOOL(fable2_capture_used_headers, true, "Fable2",
+                    "Native renderer: at capture, read the texture headers only of the slots the draw's shaders "
+                    "fetch from (replay binds no others)");
 REXCVAR_DEFINE_BOOL(fable2_diag_late_reads, false, "Fable2",
                     "Diagnostic: count replay-time reads of guest data the game changed after the draw was "
                     "recorded (textures unlocked later, vertex stream endianness) ([late])");
@@ -948,7 +951,7 @@ struct PullSiteEntry {
 static_assert(sizeof(PullSiteEntry) == 16);
 constexpr u32 kPullSites = 16;
 
-void BindPullSites(DeviceView dev, const GuestShader &vs, PullSiteEntry (&sites)[kPullSites]) {
+void BindPullSitesUncached(DeviceView dev, const GuestShader &vs, PullSiteEntry (&sites)[kPullSites]) {
   std::memset(sites, 0, sizeof(sites));
   if (!vs.entry)
     return;
@@ -1005,6 +1008,85 @@ void BindPullSites(DeviceView dev, const GuestShader &vs, PullSiteEntry (&sites)
     if (format && slot <= 95)
       sites[site] = {slot | 0x80000000u, stride, offset,
                      format | (flags << 8) | ((static_cast<u32>(exp_adjust) & 0xFF) << 16)};
+  }
+}
+
+REXCVAR_DEFINE_INT32(fable2_pull_sites_cache, 1, "Fable2",
+                     "Native renderer: remember each vertex shader's pull-site binding per bound microcode copy, "
+                     "declaration and stream strides (1); 2 = compute anyway and log mismatches ([pull-sites])");
+
+// BindPullSites, remembered (fable2_pull_sites_cache). The binding depends on
+// the shader, the bound microcode copy (code address and offset), the
+// declaration and the stream strides; all of those are the key. A new shader
+// registration (shader_generation) clears the cache, since the game reuses
+// freed shader memory. Mode 2 counts keys whose binding came out different.
+void BindPullSites(DeviceView dev, const GuestShader &vs, PullSiteEntry (&sites)[kPullSites]) {
+  const int mode = REXCVAR_GET(fable2_pull_sites_cache);
+  if (mode <= 0 || !vs.entry) {
+    BindPullSitesUncached(dev, vs, sites);
+    return;
+  }
+  struct Key {
+    const GuestShader *vs;
+    const void *entry;
+    u64 generation;
+    u32 code_va, physical_offset, decl_va, decl_count;
+    u32 strides[4];
+    bool operator==(const Key &) const = default;
+  };
+  static_assert(sizeof(Key) == 56);  // no padding: hashed as bytes
+  struct Slot {
+    Key key;
+    bool valid;
+    PullSiteEntry sites[kPullSites];
+  };
+  constexpr u32 kSlots = 256;
+  thread_local std::unique_ptr<Slot[]> cache;
+  thread_local u64 hits = 0, misses = 0, wrong = 0, last_report = 0;
+  if (!cache)
+    cache = std::make_unique<Slot[]>(kSlots);
+  Key key{};
+  key.vs = &vs;
+  key.entry = vs.entry;
+  key.generation = state().shader_generation.load(std::memory_order_acquire);
+  const u32 container = vs.va + obj::kVertexShaderContainer;
+  const u32 shader_offset = mem::load<u32>(container + 0x18);
+  key.physical_offset = mem::load<u32>(container + shader_offset);
+  key.code_va = mem::load<u32>(vs.va + obj::kVertexShaderPhysical);
+  key.decl_va = dev.U32(dev::kVertexDeclaration);
+  key.decl_count = key.decl_va ? mem::load<u32>(key.decl_va + obj::kDeclElementCount) : 0;
+  for (u32 i = 0; i < 4; ++i)
+    key.strides[i] = dev.U32(dev::kStreamStride0 + 4 * i);
+  const u64 h = XXH3_64bits(&key, sizeof(key));
+  Slot &slot = cache[h & (kSlots - 1)];
+  if (slot.valid && slot.key == key) {
+    ++hits;
+    if (mode == 1) {
+      std::memcpy(sites, slot.sites, sizeof(sites));
+      return;
+    }
+    BindPullSitesUncached(dev, vs, sites);
+    if (std::memcmp(sites, slot.sites, sizeof(sites)) != 0) {
+      ++wrong;
+      if (wrong <= 16)
+        EOT_INFO("[pull-sites] binding changed under the same key: vs {:016x} code {:#x}+{:#x} decl {:#x}",
+                 vs.hash, key.code_va, key.physical_offset, key.decl_va);
+      std::memcpy(slot.sites, sites, sizeof(sites));
+    }
+  } else {
+    ++misses;
+    BindPullSitesUncached(dev, vs, sites);
+    slot.key = key;
+    slot.valid = true;
+    std::memcpy(slot.sites, sites, sizeof(sites));
+  }
+  const u64 frame = UploadRingCaptureFrame();
+  if (frame >= last_report + 600) {
+    if (last_report)
+      EOT_INFO("[pull-sites] mode {}: {} hits, {} misses, {} changed under the same key (frames {}..{})", mode, hits,
+               misses, wrong, last_report, frame);
+    last_report = frame;
+    hits = misses = wrong = 0;
   }
 }
 
@@ -1130,26 +1212,39 @@ bool PulledSlice(DeviceView dev, const GuestShader &vs, const PullSiteEntry (&si
   return true;
 }
 
+struct PullTableEntry {
+  u64 address;
+  u32 sizeDwords;
+  u32 endian;
+};
+static_assert(sizeof(PullTableEntry) == 16);
+
 bool UploadVertexPullTable(DeviceView dev, const GuestShader &vs, const std::vector<u8> &pulled_slots,
                            u64 *table_va, u32 stream0_va = 0, u32 stream0_bytes = 0, u32 vtx_lo = 0,
                            u32 vtx_hi = 0) {
-  struct Entry {
-    u64 address;
-    u32 sizeDwords;
-    u32 endian;
-  };
-  static_assert(sizeof(Entry) == 16);
-  Entry table[96 + kPullSites] = {};
+  using Entry = PullTableEntry;
+  static_assert(sizeof(PullSiteEntry) == sizeof(Entry));
+  // The table is built in place in its upload-ring allocation (no stack copy).
+  UploadAlloc alloc;
+  if (!UploadAllocate(sizeof(Entry) * (96 + kPullSites), 16, &alloc))
+    return false;
+  Entry *table = reinterpret_cast<Entry *>(alloc.cpu);
+  std::memset(table, 0, sizeof(Entry) * 96);
   PullSiteEntry sites[kPullSites];
   BindPullSites(dev, vs, sites);
   std::memcpy(&table[96], sites, sizeof(sites));
-  std::vector<u8> slots = pulled_slots;
+  u8 slots[96 + kPullSites];
+  u32 slot_count = 0;
+  for (const u8 slot : pulled_slots)
+    if (slot_count < std::size(slots))
+      slots[slot_count++] = slot;
   for (const PullSiteEntry &site : sites)
-    if ((site.slot & 0x80000000u) &&
-        std::find(slots.begin(), slots.end(), static_cast<u8>(site.slot & 0x7F)) == slots.end())
-      slots.push_back(static_cast<u8>(site.slot & 0x7F));
+    if ((site.slot & 0x80000000u) && slot_count < std::size(slots) &&
+        std::find(slots, slots + slot_count, static_cast<u8>(site.slot & 0x7F)) == slots + slot_count)
+      slots[slot_count++] = static_cast<u8>(site.slot & 0x7F);
   constexpr u32 kMaxDwords = 4u << 20;  // 16 MB
-  for (const u8 slot : slots) {
+  for (u32 si = 0; si < slot_count; ++si) {
+    const u8 slot = slots[si];
     if (slot >= 96)
       continue;
     if (slot == 95 && stream0_va) {  // BeginVertices: stream 0 is the draw's own data
@@ -1298,10 +1393,7 @@ bool UploadVertexPullTable(DeviceView dev, const GuestShader &vs, const std::vec
                dwords > 3 ? w[3] : 0, dwords > 4 ? w[4] : 0, dwords > 5 ? w[5] : 0);
     }
   }
-  UploadAlloc alloc;
-  if (!UploadBytes(table, sizeof(table), 16, &alloc))
-    return false;
-  state().perf.pull_bytes += sizeof(table);
+  state().perf.pull_bytes += sizeof(Entry) * (96 + kPullSites);
   state().perf.pull_draws++;
   *table_va = alloc.gpuVa;
   return true;
@@ -3156,13 +3248,6 @@ bool CaptureDraw(VideoState &s, u32 device_va, u32 prim, GeometryPlan &geom,
       pk.streamEndian |= (*reinterpret_cast<const be_u32 *>(regs + dev::StreamFetchSlotOffset(stream) + 4) & 3u)
                          << (2 * stream);
   }
-  pk.texHeaderMask = 0;
-  for (u32 slot = 0; slot < 16; ++slot) {
-    const u32 tex_va = *reinterpret_cast<const be_u32 *>(regs + dev::kTextureObject0 + 4 * slot);
-    if (tex_va && ReadTextureHeader(tex_va, pk.texHeaders[slot]))
-      pk.texHeaderMask |= 1u << slot;
-  }
-
   // Fable 2: GpuLoadShaders loads shaders without touching the device's
   // pointers (which may still hold an older SetPixelShader's shader); the
   // last of GpuLoadShaders and Set*Shader wins per stage. kGpuOwnedNone marks
@@ -3212,6 +3297,21 @@ bool CaptureDraw(VideoState &s, u32 device_va, u32 prim, GeometryPlan &geom,
   if (ps_va && !ps) {
     Dropped("pixel shader object unreadable", 0x6013);
     return false;
+  }
+  // The texture headers as they are at the draw (replay binds from these).
+  // Replay binds only the slots the shaders fetch from (texture_mask in
+  // ReplayDrawLocked), so with fable2_capture_used_headers the others are
+  // not read: the game leaves textures bound across draws.
+  pk.texHeaderMask = 0;
+  const u32 header_slots = REXCVAR_GET(fable2_capture_used_headers)
+                               ? (vs->textureFetchMask | (ps ? ps->textureFetchMask : 0u)) & 0xFFFFu
+                               : 0xFFFFu;
+  for (u32 slot = 0; slot < 16; ++slot) {
+    if (!(header_slots & (1u << slot)))
+      continue;
+    const u32 tex_va = *reinterpret_cast<const be_u32 *>(regs + dev::kTextureObject0 + 4 * slot);
+    if (tex_va && ReadTextureHeader(tex_va, pk.texHeaders[slot]))
+      pk.texHeaderMask |= 1u << slot;
   }
   // Fable 2: shaders the built-in cache lacks are translated in the background
   // (runtime_shaders.cpp); their draws drop only until the translation lands.
@@ -5756,3 +5856,4 @@ bool DepthPrerunFeeds(const DrawPacket &trigger, const ResolvePacket &r) {
 }
 
 }
+
