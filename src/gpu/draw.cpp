@@ -6,6 +6,7 @@
 #include "gpu/queries.h"
 
 #include <thread>
+#include <deque>
 #include <map>
 #include <unordered_map>
 #include <unordered_set>
@@ -1212,6 +1213,131 @@ bool PulledSlice(DeviceView dev, const GuestShader &vs, const PullSiteEntry (&si
   return true;
 }
 
+// fable2_diag_stability: would a capture worker that reads the draw's guest
+// data a little after the draw see the same bytes? Each capture-time read of
+// vertex streams, pulled buffers, index ranges and texture headers is hashed;
+// the same bytes are hashed again 16 draws later and at the next frame's first
+// draw, and the changes are counted per kind ([stability]).
+REXCVAR_DEFINE_BOOL(fable2_diag_stability, false, "Fable2",
+                    "Diagnostic: count guest data a draw read at capture that changed 16 draws later or by the end "
+                    "of the frame ([stability]; slow)");
+enum StabilityKind : u8 { kStabVertex, kStabPull, kStabIndex, kStabHeader, kStabMorph, kStabUp, kStabKinds };
+namespace {
+constexpr const char *kStabNames[kStabKinds] = {"vertex", "pull", "index", "header", "morph", "up-stream0"};
+constexpr u64 kStabLagDraws = 16;
+struct StabRecord {
+  const u8 *p;
+  u64 bytes, hash, draw;
+  StabilityKind kind;
+};
+struct StabCounts {
+  u64 uses = 0, bytes = 0, changed16 = 0, changed16Bytes = 0, changedFrame = 0, changedFrameBytes = 0;
+};
+struct StabState {
+  u64 draw = 0, frame = ~0ull, frames = 0;
+  std::deque<StabRecord> recent;
+  std::vector<StabRecord> checked;
+  StabCounts c[kStabKinds];
+  u32 logged = 0;
+};
+thread_local StabState t_stab;
+}  // namespace
+
+void DiagStabilityNote(StabilityKind kind, const u8 *p, u64 bytes) {
+  if (!REXCVAR_GET(fable2_diag_stability) || !p || !bytes)
+    return;
+  StabState &st = t_stab;
+  st.recent.push_back({p, bytes, XXH3_64bits(p, bytes), st.draw, kind});
+  st.c[kind].uses++;
+  st.c[kind].bytes += bytes;
+}
+
+REXCVAR_DEFINE_BOOL(fable2_diag_sync_counts, false, "Fable2",
+                    "Diagnostic: per-frame counts of guest locks by kind and of draws a capture worker would keep "
+                    "synchronous ([sync-counts])");
+namespace {
+std::atomic<u64> g_sync_counts[kSyncKinds];
+constexpr const char *kSyncNames[kSyncKinds] = {"lock-vb", "lock-ib", "lock-tex", "lock-other", "draws",
+                                                "memexport", "memexport-indexed", "memexport-cached-hit", "up",
+                                                "rect", "morph", "tess", "pull"};
+}  // namespace
+// Called at the start of each capture: logs the averages every 240 frames.
+void DiagSyncFrame() {
+  if (!REXCVAR_GET(fable2_diag_sync_counts))
+    return;
+  static u64 frame0 = ~0ull;
+  const u64 frame = UploadRingCaptureFrame();
+  if (frame0 == ~0ull) {
+    frame0 = frame;
+    for (auto &c : g_sync_counts)
+      c.store(0, std::memory_order_relaxed);
+    return;
+  }
+  if (frame < frame0 + 240)
+    return;
+  const double n = static_cast<double>(frame - frame0);
+  std::string line;
+  for (u32 k = 0; k < kSyncKinds; ++k)
+    line += std::format(" {} {:.1f}", kSyncNames[k], g_sync_counts[k].exchange(0, std::memory_order_relaxed) / n);
+  EOT_INFO("[sync-counts] per frame over {} frames:{}", frame - frame0, line);
+  frame0 = frame;
+}
+
+// Called at the start of each capture.
+void DiagStabilityDraw() {
+  if (!REXCVAR_GET(fable2_diag_stability))
+    return;
+  StabState &st = t_stab;
+  ++st.draw;
+  auto changed = [&](const StabRecord &r, bool frame_end) {
+    if (XXH3_64bits(r.p, r.bytes) == r.hash)
+      return false;
+    if (st.logged < 24) {
+      ++st.logged;
+      EOT_INFO("[stability] {} changed {}: {} bytes, {} draws after its draw", kStabNames[r.kind],
+               frame_end ? "by the frame's end" : "within 16 draws", r.bytes, st.draw - r.draw);
+    }
+    return true;
+  };
+  while (!st.recent.empty() && st.recent.front().draw + kStabLagDraws <= st.draw) {
+    StabRecord r = st.recent.front();
+    st.recent.pop_front();
+    if (changed(r, false)) {
+      st.c[r.kind].changed16++;
+      st.c[r.kind].changed16Bytes += r.bytes;
+      r.hash = ~0ull;  // changed already: counted at the frame's end too, without hashing again
+    }
+    st.checked.push_back(r);
+  }
+  const u64 frame = UploadRingCaptureFrame();
+  if (frame == st.frame)
+    return;
+  st.frame = frame;
+  // The previous frame's records (the last 16 draws' get the frame-end check only).
+  for (const StabRecord &r : st.checked)
+    if (r.hash == ~0ull || changed(r, true)) {
+      st.c[r.kind].changedFrame++;
+      st.c[r.kind].changedFrameBytes += r.bytes;
+    }
+  st.checked.clear();
+  for (const StabRecord &r : st.recent)
+    if (changed(r, true)) {
+      st.c[r.kind].changedFrame++;
+      st.c[r.kind].changedFrameBytes += r.bytes;
+    }
+  st.recent.clear();
+  if (++st.frames % 240 == 0) {
+    for (u32 k = 0; k < kStabKinds; ++k) {
+      const StabCounts &c = st.c[k];
+      EOT_INFO("[stability] {} over 240 frames: {} uses {} KB; changed within 16 draws {} ({} KB), by the "
+               "frame's end {} ({} KB)",
+               kStabNames[k], c.uses, c.bytes / 1024, c.changed16, c.changed16Bytes / 1024, c.changedFrame,
+               c.changedFrameBytes / 1024);
+      st.c[k] = StabCounts{};
+    }
+  }
+}
+
 struct PullTableEntry {
   u64 address;
   u32 sizeDwords;
@@ -1252,6 +1378,7 @@ bool UploadVertexPullTable(DeviceView dev, const GuestShader &vs, const std::vec
       if (!src)
         continue;
       UploadAlloc data;
+      DiagStabilityNote(kStabPull, src, stream0_bytes & ~3u);
       if (!UploadBytes(src, stream0_bytes & ~3u, 16, &data))
         return false;
       table[slot] = {data.gpuVa, stream0_bytes / 4, 2};
@@ -1288,6 +1415,7 @@ bool UploadVertexPullTable(DeviceView dev, const GuestShader &vs, const std::vec
       // in Bowerstone changed 2 bytes at a time; the sampled key missed it).
       if (st.objectVa && ResourceUnlockSeq(st.objectVa) != 0) {
         const bool preswap = REXCVAR_GET(fable2_pull_preswap) && (d1 & 3) == 2 && !REXCVAR_GET(fable2_diag_pull);
+        DiagStabilityNote(kStabPull, src, u64(dwords) * 4);
         if (const u64 va = PulledBufferAddress(state(), st, u64(dwords) * 4, src, preswap)) {
           table[slot] = {va, dwords, (d1 & 3) | (preswap ? 0x10u : 0u)};
           state().perf.pull_mirrored_bytes += u64(dwords) * 4;
@@ -1301,6 +1429,7 @@ bool UploadVertexPullTable(DeviceView dev, const GuestShader &vs, const std::vec
     const bool preswap = REXCVAR_GET(fable2_pull_preswap) && (d1 & 3) == 2;
     u32 slice_first = 0, slice_count = 0;
     if (PulledSlice(dev, vs, sites, slot, dwords, vtx_lo, vtx_hi, &slice_first, &slice_count)) {
+      DiagStabilityNote(kStabPull, src + u64(slice_first) * 4, u64(slice_count) * 4);
       // The whole buffer's room, only the slice copied: the shader's
       // addressing stays as it is and reads nothing else.
       if (!UploadAllocate(u64(dwords) * 4, 16, &data))
@@ -1314,6 +1443,7 @@ bool UploadVertexPullTable(DeviceView dev, const GuestShader &vs, const std::vec
       table[slot] = {data.gpuVa, dwords, (d1 & 3) | (preswap ? 0x10u : 0u)};
       continue;
     }
+    DiagStabilityNote(kStabPull, src, u64(dwords) * 4);
     if (preswap) {
       if (!UploadAllocate(u64(dwords) * 4, 16, &data))
         return false;
@@ -2081,6 +2211,7 @@ const CachedIndexRange *GetCachedIndexRange(VideoState &s, u32 ib_va, u32 prim, 
   key.prim = prim;
   key.seq = ResourceUnlockSeq(ib_va);
   key.sample = SampleGuestBytes(data_va + static_cast<u32>(range_start), static_cast<u32>(range_bytes));
+  DiagStabilityNote(kStabIndex, mem::at<u8>(data_va + static_cast<u32>(range_start)), range_bytes);
 
   auto &c = index_cache();
   auto it = c.map.find(key);
@@ -3211,6 +3342,8 @@ bool CaptureDraw(VideoState &s, u32 device_va, u32 prim, GeometryPlan &geom,
     acc += 16.0 * static_cast<f64>(t1 - lap_t0) * PerfMsPerTick();
     lap_t0 = t1;
   };
+  DiagStabilityDraw();
+  DiagSyncFrame();
   pk.device_va = device_va;
   pk.prim = prim;
   pk.indexed = geom.indexed;
@@ -3310,8 +3443,10 @@ bool CaptureDraw(VideoState &s, u32 device_va, u32 prim, GeometryPlan &geom,
     if (!(header_slots & (1u << slot)))
       continue;
     const u32 tex_va = *reinterpret_cast<const be_u32 *>(regs + dev::kTextureObject0 + 4 * slot);
-    if (tex_va && ReadTextureHeader(tex_va, pk.texHeaders[slot]))
+    if (tex_va && ReadTextureHeader(tex_va, pk.texHeaders[slot])) {
       pk.texHeaderMask |= 1u << slot;
+      DiagStabilityNote(kStabHeader, mem::at<u8>(tex_va + obj::kTextureFetch), 24);
+    }
   }
   // Fable 2: shaders the built-in cache lacks are translated in the background
   // (runtime_shaders.cpp); their draws drop only until the translation lands.
@@ -3494,6 +3629,8 @@ bool CaptureDraw(VideoState &s, u32 device_va, u32 prim, GeometryPlan &geom,
                  geom.cached ? geom.cached->hi : 0u, line);
       }
     }
+    if (DiagSyncCountsOn())
+      DiagSyncCount(kSyncPull);
     if (!UploadVertexPullTable(dev, *vs, pulled_slots, &pk.vertex_pull_table,
                                up_stream ? geom.stream0OverrideVa : 0u,
                                up_stream ? geom.vertexCount * geom.stream0OverrideStride : 0u, vtx_lo,
@@ -3530,6 +3667,8 @@ bool CaptureDraw(VideoState &s, u32 device_va, u32 prim, GeometryPlan &geom,
     return false;
   }
   pk.layout = layout;
+  if (layout && layout->morphStreams && DiagSyncCountsOn())
+    DiagSyncCount(kSyncMorph);
   lap(s.perf.setup_ms);
   StreamInfo streams[16];
   for (u32 S = 0; S < 16; ++S) {
@@ -3860,6 +3999,7 @@ bool CaptureDraw(VideoState &s, u32 device_va, u32 prim, GeometryPlan &geom,
     const bool morph = (layout->morphStreams >> S) & 1u;
     if (morph && REXCVAR_GET(fable2_diag_morph))
       NoteMorphStream(s, st_info, first, bytes);
+    DiagStabilityNote(morph ? kStabMorph : !st_info.dataVa ? kStabUp : kStabVertex, st_info.data + first, bytes);
     if (const VertexMirror *mirror = morph ? nullptr : GetVertexMirror(s, st_info, first, bytes)) {
       auto &pool = vertex_mirrors().pool;
       const u64 epoch = pool.flushEpoch.load(std::memory_order_acquire);
@@ -5211,10 +5351,28 @@ void ExecuteDraw(u32 device_va, u32 prim, GeometryPlan &geom,
   s.vs_float_constants_stale |= constants.vs;
   s.ps_float_constants_stale |= constants.ps;
   QueryNoteDraw(prim == kPrimRectList);
+  const bool sync_counts = DiagSyncCountsOn();
+  if (sync_counts) {
+    DiagSyncCount(kSyncDraws);
+    if (device_image)
+      DiagSyncCount(kSyncUp);
+    if (prim == kPrimRectList)
+      DiagSyncCount(kSyncRect);
+    if (geom.tessSegments)
+      DiagSyncCount(kSyncTess);
+  }
   if (EmulateMemExportDraw(device_va, geom.indexed && !geom.indices.empty() ? geom.indices.data() : nullptr,
                            static_cast<u32>(geom.indices.size()), geom.startVertex,
-                           geom.indexed ? 0u : geom.vertexCount))
+                           geom.indexed ? 0u : geom.vertexCount)) {
+    if (sync_counts) {
+      DiagSyncCount(kSyncMemExport);
+      if (geom.indexed)
+        DiagSyncCount(kSyncMemExportIndexed);
+      if (geom.indexed && geom.cached)
+        DiagSyncCount(kSyncMemExportCachedHit);
+    }
     return;
+  }
   // Fable 2: point lists are point sprites (weather particles); nothing writes
   // a point size yet and Metal leaves it undefined (screen-filling garbage).
   if (prim == 1) {
@@ -5857,3 +6015,7 @@ bool DepthPrerunFeeds(const DrawPacket &trigger, const ResolvePacket &r) {
 
 }
 
+namespace eot::gpu {
+bool DiagSyncCountsOn() { return REXCVAR_GET(fable2_diag_sync_counts); }
+void DiagSyncCount(DiagSyncKind kind) { g_sync_counts[kind].fetch_add(1, std::memory_order_relaxed); }
+}  // namespace eot::gpu

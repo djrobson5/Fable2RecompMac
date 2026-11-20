@@ -41,6 +41,9 @@
 #define __imp__D3DDevice_CreatePixelShader __imp__sub_82B994B8
 #define D3D_UnlockResource sub_822C2630
 #define __imp__D3D_UnlockResource __imp__sub_822C2630
+// The one shared lock routine (VB, IB, textures): atomic +256 on the lock count.
+#define D3D_LockResource sub_821F6300
+#define __imp__D3D_LockResource __imp__sub_821F6300
 #define eot_D3D_CDevice_BlockOnFence sub_82242668
 #define __imp__eot_D3D_CDevice_BlockOnFence __imp__sub_82242668
 #define eot_D3D_CDevice_BlockOnSecondaryPosition sub_82206400

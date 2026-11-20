@@ -63,6 +63,16 @@ void DrawGuestTessellatedPatches(u32 device_va, u32 first_patch, u32 patch_count
 // CPU (its output is a vertex stream for later draws). True if it was one.
 bool EmulateMemExportDraw(u32 device_va, const u32 *indices, u32 index_count, u32 first, u32 count);
 
+// fable2_diag_sync_counts: per-frame counts of guest locks by kind and of the
+// draw kinds a capture worker would have to keep synchronous ([sync-counts]).
+enum DiagSyncKind : u32 {
+  kSyncLockVb, kSyncLockIb, kSyncLockTexture, kSyncLockOther, kSyncDraws, kSyncMemExport,
+  kSyncMemExportIndexed, kSyncMemExportCachedHit, kSyncUp, kSyncRect, kSyncMorph, kSyncTess, kSyncPull,
+  kSyncKinds
+};
+bool DiagSyncCountsOn();
+void DiagSyncCount(DiagSyncKind kind);
+
 void DrawGuestIndexedPrimitives(u32 device_va, u32 primitive_type, i32 base_vertex,
                                 u32 start_index, u32 index_count,
                                 FloatConstantDirty constants);

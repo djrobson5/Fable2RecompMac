@@ -37,6 +37,19 @@ REX_EXTERN(__imp__XGRegisterPixelShader);
 REX_EXTERN(__imp__D3DDevice_CreateVertexShader);
 REX_EXTERN(__imp__D3DDevice_CreatePixelShader);
 REX_EXTERN(__imp__D3D_UnlockResource);
+REX_EXTERN(__imp__D3D_LockResource);
+
+// Lock (sub_821F6300, the one shared lock routine for VB, IB and textures):
+// r3 = resource (returns the CPU pointer), r5 = 10 VB / 12 IB / 14 texture
+// (passed only to BlockOnFence). Only counted, for fable2_diag_sync_counts.
+extern "C" REX_FUNC(D3D_LockResource) {
+  if (DiagSyncCountsOn()) {
+    const u32 kind = ctx.r5.u32;
+    DiagSyncCount(kind == 10 ? kSyncLockVb : kind == 12 ? kSyncLockIb : kind == 14 ? kSyncLockTexture
+                                                                              : kSyncLockOther);
+  }
+  __imp__D3D_LockResource(ctx, base);
+}
 
 extern "C" REX_FUNC(XGRegisterVertexShader) {
   FlushPendingUpDraw();
