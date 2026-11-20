@@ -85,7 +85,7 @@ WALK_KEYS = ["LY+&RX+:2500:50", "LY+:1500:50", "LY+&RX-:3000:50", "LY+:1200:50",
 
 RE_TIME = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+)\]")
 RE_PERF = re.compile(r"\[perf\] \d+ frames, [\d.]+ ms/frame wall \(p50 ([\d.]+).*? draw [\d.]+ \((\d+) draws"
-                     r".*?gpu ([\d.]+) ms/frame")
+                     r".*?gpu (?:([\d.]+) ms/frame|n/a)")  # n/a: no GPU timing (Metal backend)
 RE_POPS = re.compile(r"\[pops\] ([\d.]+) per second .*queries: ([\d.]+) flickers/s, (\d+)% zero of (\d+)/s")
 RE_EXPO = re.compile(r"\[writeback\] (0x[0-9a-f]+): min (\S+) max (\S+) avg (\S+)")
 RE_HERO = re.compile(r"\[writeback\] hero .*average rgba \(([\d.]+), ([\d.]+), ([\d.]+), ([\d.]+)\)")
@@ -227,7 +227,7 @@ class Run:
         t = self.now()
         for line in self.log.lines():
             if m := RE_PERF.search(line):
-                self.perf.append((t, float(m[1]), int(m[2]), float(m[3])))
+                self.perf.append((t, float(m[1]), int(m[2]), float(m[3]) if m[3] else None))
             elif m := RE_POPS.search(line):
                 self.pops.append((t, float(m[1]), float(m[2]), int(m[3]), int(m[4])))
             elif m := RE_EXPO.search(line):
@@ -335,7 +335,7 @@ class Run:
                                  else None)
         self.windows[name] = {
             "watts": col(1, 1), "gpu_busy": col(2, 0), "cpu_cores": col(3, 2),
-            "frame_ms": med([p[1] for p in perf]), "gpu_ms": med([p[3] for p in perf]),
+            "frame_ms": med([p[1] for p in perf]), "gpu_ms": med([p[3] for p in perf if p[3] is not None]),
             "draws": med([p[2] for p in perf]), "pops_s": mean([p[1] for p in pops]),
             "flickers_s": mean([p[2] for p in pops]), "query_zero_pct": mean([p[3] for p in pops]),
         }
