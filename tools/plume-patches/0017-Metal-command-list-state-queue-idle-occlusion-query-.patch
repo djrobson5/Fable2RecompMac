@@ -1,0 +1,482 @@
+From 93cb6f2937a5688e70440dea93caa08573ce1e0e Mon Sep 17 00:00:00 2001
+From: djrobson5 <djrobson5@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 03:00:00 -0800
+Subject: [PATCH 17/17] Metal: command list state, queue idle, occlusion query
+ losses
+
+Fixes found in a review of the Metal backend.
+
+Quad clears: clearColor / clearDepthStencil with rects restored the
+state cache after drawing, but the encoder held the clear's pipeline,
+depth-stencil state, viewport, scissor, cull and fill mode and zero
+depth bias, so the next draw with the same pipeline skipped setting
+them and ran with the clear's. The cache now records what the encoder
+holds (nothing for what the draw must set again). A stencil quad clear
+also writes its value now: the clear states replace the stencil with the
+reference value, which was never set to the clear's.
+
+Queue idle: the present, acquire and wait command buffers plume commits
+itself wait on the semaphores' events, and the present buffer's
+completed handler uses the swap chain, but nothing waited for them.
+Every command buffer of a MetalCommandQueue is counted until its
+completed handler ran, and MetalCommandQueue::waitIdle (bounded) waits
+for zero, for a resize and a shutdown to call before they destroy
+semaphores or the swap chain.
+
+setGraphicsRootDescriptor ignores (and reports once) an index the
+pipeline layout does not have, instead of reading past the layout's
+root descriptors (a layout without any, FABLE2_CONSTANT_BUFFERS off).
+begin() clears the root descriptor tables of the list's last use.
+
+Occlusion queries: a query that lost samples, because the pool has no
+segment left or because it began inside another query, was read as 0
+samples (occluded). It is marked, reported once, and getRawResults
+returns METAL_QUERY_LOST for it until a reset. attachOcclusionPool lets
+a list that continues a frame take over a pool's visibility result
+buffer without a reset (which would wait for and zero the earlier lists'
+counts), so its first beginQuery does not end the render encoder.
+
+Shaders and pipelines: a library that did not compile (null) or a
+function that did not build is no longer released or labelled.
+---
+ plume_metal.cpp | 143 ++++++++++++++++++++++++++++++++++++++++++------
+ plume_metal.h   |  44 +++++++++++++++
+ 2 files changed, 170 insertions(+), 17 deletions(-)
+
+diff --git a/plume_metal.cpp b/plume_metal.cpp
+index 51b4a7f..e1e7c23 100644
+--- a/plume_metal.cpp
++++ b/plume_metal.cpp
+@@ -15,6 +15,7 @@
+ #include <CoreFoundation/CoreFoundation.h>
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <mutex>
+ 
+ #include "plume_metal.h"
+@@ -1442,7 +1443,10 @@ namespace plume {
+     MetalShader::~MetalShader() {
+         MetalAutoreleasePool releasePool;
+         functionName->release();
+-        library->release();
++        // Null when the library did not build.
++        if (library != nullptr) {
++            library->release();
++        }
+ 
+         if (debugName != nullptr) {
+             debugName->release();
+@@ -1458,10 +1462,16 @@ namespace plume {
+         debugName = NS::String::string(name.c_str(), NS::UTF8StringEncoding);
+         debugName->retain();
+ 
+-        library->setLabel(debugName);
++        if (library != nullptr) {
++            library->setLabel(debugName);
++        }
+     }
+ 
+     MTL::Function* MetalShader::createFunction(const RenderSpecConstant *specConstants, const uint32_t specConstantsCount) const {
++        if (library == nullptr) {
++            return nullptr;
++        }
++
+         MTL::FunctionConstantValues *values = MTL::FunctionConstantValues::alloc()->init();
+         if (specConstants != nullptr) {
+             for (uint32_t i = 0; i < specConstantsCount; i++) {
+@@ -1556,7 +1566,9 @@ namespace plume {
+ 
+         // Release resources
+         descriptor->release();
+-        function->release();
++        if (function != nullptr) {
++            function->release();
++        }
+     }
+ 
+     MetalComputePipeline::~MetalComputePipeline() {
+@@ -1644,7 +1656,9 @@ namespace plume {
+             const MetalShader *pixelShader = static_cast<const MetalShader *>(desc.pixelShader);
+             MTL::Function *fragmentFunction = pixelShader->createFunction(desc.specConstants, desc.specConstantsCount);
+             descriptor->setFragmentFunction(fragmentFunction);
+-            fragmentFunction->release();
++            if (fragmentFunction != nullptr) {
++                fragmentFunction->release();
++            }
+         }
+ 
+         for (uint32_t i = 0; i < desc.renderTargetCount; i++) {
+@@ -1720,7 +1734,9 @@ namespace plume {
+ 
+         // Release resources
+         vertexDescriptor->release();
+-        vertexFunction->release();
++        if (vertexFunction != nullptr) {
++            vertexFunction->release();
++        }
+         descriptor->release();
+         depthStencilDescriptor->release();
+ 
+@@ -2059,6 +2075,8 @@ namespace plume {
+             drawableMtl->present();
+         });
+ 
++        // The handler uses this swap chain: the queue's waitIdle waits for it (endInFlight comes last).
++        commandQueue->beginInFlight();
+         presentBuffer->addCompletedHandler([drawableMtl, presentId, this](MTL::CommandBuffer* cmdBuffer) {
+             currentAvailableDrawableIndex = (currentAvailableDrawableIndex + 1) % MAX_DRAWABLES;
+             drawableMtl->release();
+@@ -2068,6 +2086,7 @@ namespace plume {
+                 lastPresentedId = std::max(lastPresentedId, presentId);
+             }
+             lastPresentedIdCondVar.notify_all();
++            commandQueue->endInFlight();
+         });
+ 
+         presentBuffer->commit();
+@@ -2151,6 +2170,7 @@ namespace plume {
+         const MetalCommandSemaphore *interfaceSemaphore = static_cast<MetalCommandSemaphore *>(signalSemaphore);
+         acquireBuffer->enqueue();
+         acquireBuffer->encodeSignalEvent(interfaceSemaphore->mtl, interfaceSemaphore->mtlEventValue);
++        commandQueue->trackInFlight(acquireBuffer);
+         acquireBuffer->commit();
+ 
+         CA::MetalDrawable *nextDrawable = layer->nextDrawable();
+@@ -2313,6 +2333,7 @@ namespace plume {
+             segmentQuery.push_back(UINT32_MAX);
+             segmentCount = 1;
+             results.resize(queryCount, 0);
++            queryLost.resize(queryCount, 0);
+             return;
+         }
+ 
+@@ -2328,6 +2349,7 @@ namespace plume {
+ 
+     MetalQueryPool::~MetalQueryPool() {
+         MetalAutoreleasePool releasePool;
++
+         if (sampleBuffer != nullptr) {
+             sampleBuffer->release();
+         }
+@@ -2381,9 +2403,28 @@ namespace plume {
+             }
+         }
+ 
++        for (uint32_t i = 0; (i < count) && (first + i < queryLost.size()); i++) {
++            if (queryLost[first + i] != 0) {
++                out[i] = METAL_QUERY_LOST;
++            }
++        }
++
+         return true;
+     }
+ 
++    void MetalQueryPool::markLost(const uint32_t queryIndex, const char *reason) {
++        lostCount++;
++        if (queryIndex < queryLost.size()) {
++            queryLost[queryIndex] = 1;
++        }
++
++        static std::atomic<bool> reported(false);
++        if (!reported.exchange(true)) {
++            fprintf(stderr, "Metal occlusion query %u lost its samples (%s; %u segments of %u used, first report of this process): "
++                "its result is reported as METAL_QUERY_LOST.\n", queryIndex, reason, segmentCount, segmentCapacity);
++        }
++    }
++
+     uint32_t MetalQueryPool::allocateSegment(uint32_t queryIndex, MTL::CommandBuffer *commandBuffer) {
+         if (segmentCount >= segmentCapacity) {
+             return UINT32_MAX;
+@@ -2448,6 +2489,12 @@ namespace plume {
+         activeQueryPool = nullptr;
+         activeQueryCounting = false;
+ 
++        // A reused list binds no root descriptor addresses of its last use.
++        for (RootDescriptorTable &table : renderRootTables) {
++            table = {};
++        }
++        renderRootSpaceMask = 0;
++
+         // Reset fence waits and updates for new command list.
+         fenceSlots.updateDirtyBits = ~0;
+         for (uint32_t dstStage = 0; dstStage < MetalBarrierStage::COUNT; dstStage++) {
+@@ -2840,9 +2887,19 @@ namespace plume {
+ 
+     void MetalCommandList::setGraphicsRootDescriptor(RenderBufferReference bufferReference, uint32_t rootDescriptorIndex) {
+         assert(activeGraphicsPipelineLayout != nullptr);
+-        assert(rootDescriptorIndex < activeGraphicsPipelineLayout->rootDescriptors.size());
+         assert(bufferReference.ref != nullptr);
+ 
++        // A layout without that root descriptor (FABLE2_CONSTANT_BUFFERS off declares none): there is
++        // nothing to bind, and the table below would take stale or foreign data.
++        if ((activeGraphicsPipelineLayout == nullptr) || (rootDescriptorIndex >= activeGraphicsPipelineLayout->rootDescriptors.size())) {
++            static std::atomic<bool> reported(false);
++            if (!reported.exchange(true)) {
++                fprintf(stderr, "setGraphicsRootDescriptor(%u): the pipeline layout has %zu root descriptors; ignored.\n",
++                    rootDescriptorIndex, (activeGraphicsPipelineLayout != nullptr) ? activeGraphicsPipelineLayout->rootDescriptors.size() : size_t(0));
++            }
++            return;
++        }
++
+         const MetalPipelineLayout::RootDescriptor &root = activeGraphicsPipelineLayout->rootDescriptors[rootDescriptorIndex];
+         if ((root.space >= MAX_DESCRIPTOR_SET_BINDINGS) || (root.binding >= MAX_ROOT_DESCRIPTOR_BINDINGS)) {
+             return;
+@@ -3006,9 +3063,6 @@ namespace plume {
+         // For partial clears, do our own quad-based clear
+         checkActiveRenderEncoder();
+ 
+-        // Store state cache
+-        const auto previousCache = stateCache;
+-
+         // Process clears
+         activeRenderEncoder->pushDebugGroup(MTLSTR("ColorClear"));
+ 
+@@ -3075,8 +3129,8 @@ namespace plume {
+ 
+         activeRenderEncoder->popDebugGroup();
+ 
+-        // Restore previous state if we had one
+-        stateCache = previousCache;
++        // The encoder holds the clear's state, not the cached one: the next draw sets its own again.
++        stateCache.afterQuadClear();
+         dirtyGraphicsState.setAll();
+     }
+ 
+@@ -3108,9 +3162,6 @@ namespace plume {
+             // For partial clears, do our own quad-based clear
+             checkActiveRenderEncoder();
+ 
+-            // Store state cache
+-            auto previousCache = stateCache;
+-
+             // Process clears
+             activeRenderEncoder->pushDebugGroup(MTLSTR("DepthClear"));
+ 
+@@ -3139,6 +3190,10 @@ namespace plume {
+             } else {
+                 activeRenderEncoder->setDepthStencilState(device->clearStencilState);
+             }
++            if (clearStencil) {
++                // The clear states replace the stencil value with the reference value.
++                activeRenderEncoder->setStencilReferenceValue(stencilValue);
++            }
+ 
+             setCommonClearState();
+             pipelineDesc->release();
+@@ -3176,8 +3231,8 @@ namespace plume {
+ 
+             activeRenderEncoder->popDebugGroup();
+ 
+-            // Restore previous state if we had one
+-            stateCache = previousCache;
++            // The encoder holds the clear's state, not the cached one: the next draw sets its own again.
++            stateCache.afterQuadClear();
+             dirtyGraphicsState.setAll();
+         }
+     }
+@@ -3482,6 +3537,8 @@ namespace plume {
+             std::memset(data, 0, pool->segmentCount * sizeof(uint64_t));
+             pool->segmentQuery.resize(1);
+             pool->segmentCount = 1;
++            std::fill(pool->queryLost.begin(), pool->queryLost.end(), uint8_t(0));
++            pool->lostCount = 0;
+         }
+         else {
+             // Segments of the reset queries stay allocated, belonging to no query.
+@@ -3492,18 +3549,32 @@ namespace plume {
+                     data[i] = 0;
+                 }
+             }
++
++            for (uint32_t i = queryFirstIndex; (i - queryFirstIndex < queryCount) && (i < pool->queryLost.size()); i++) {
++                pool->queryLost[i] = 0;
++            }
+         }
+ 
+         visibilityPool = pool;
+     }
+ 
++    void MetalCommandList::attachOcclusionPool(const RenderQueryPool *queryPool) {
++        assert(queryPool != nullptr);
++        MetalQueryPool *pool = const_cast<MetalQueryPool *>(static_cast<const MetalQueryPool *>(queryPool));
++        if (pool->occlusion) {
++            visibilityPool = pool;
++        }
++    }
++
+     // Occlusion queries: precise sample counts (Counting mode), as Vulkan with occlusionQueryPrecise.
+     void MetalCommandList::beginQuery(const RenderQueryPool *queryPool, uint32_t queryIndex) {
+         assert(queryPool != nullptr);
+         MetalQueryPool *pool = const_cast<MetalQueryPool *>(static_cast<const MetalQueryPool *>(queryPool));
+         assert(pool->occlusion);
+         if (activeQueryPool != nullptr) {
+-            // One occlusion query at a time (as in Vulkan): a nested begin is ignored.
++            // One occlusion query at a time (as in Vulkan): a nested begin is ignored, and the query
++            // reports as lost rather than as 0 samples.
++            pool->markLost(queryIndex, "begun inside another query");
+             return;
+         }
+ 
+@@ -3542,6 +3613,9 @@ namespace plume {
+         assert(activeQueryPool != nullptr);
+         const uint32_t offset = activeQueryPool->allocateSegment(activeQueryIndex, mtl);
+         if (offset == UINT32_MAX) {
++            // The pool has no segment left: the query stops counting, and reports as lost (its count so
++            // far would read as too few samples, i.e. occluded).
++            activeQueryPool->markLost(activeQueryIndex, "no segment left");
+             return;
+         }
+ 
+@@ -4104,6 +4178,7 @@ namespace plume {
+             cmdBuffer->encodeWait(interfaceSemaphore->mtl, interfaceSemaphore->mtlEventValue++);
+         }
+ 
++        trackInFlight(cmdBuffer);
+         cmdBuffer->commit();
+ 
+         // Commit all command lists except the last one
+@@ -4114,6 +4189,7 @@ namespace plume {
+             const MetalCommandList *interfaceCommandList = static_cast<const MetalCommandList *>(commandLists[i]);
+             MetalCommandList *mutableCommandList = const_cast<MetalCommandList*>(interfaceCommandList);
+             mutableCommandList->mtl->enqueue();
++            trackInFlight(mutableCommandList->mtl);
+             mutableCommandList->commit();
+         }
+ 
+@@ -4133,9 +4209,42 @@ namespace plume {
+         }
+ 
+         MetalCommandList *mutableCommandList = const_cast<MetalCommandList*>(interfaceCommandList);
++        trackInFlight(mutableCommandList->mtl);
+         mutableCommandList->commit();
+     }
+ 
++    void MetalCommandQueue::beginInFlight() {
++        std::lock_guard lock(inFlightMutex);
++        inFlightBuffers++;
++    }
++
++    void MetalCommandQueue::endInFlight() {
++        // Notifies under the lock: a waiter that sees zero can only return after this function has
++        // released it, and nothing here touches the queue afterwards.
++        std::lock_guard lock(inFlightMutex);
++        inFlightBuffers--;
++        inFlightCondVar.notify_all();
++    }
++
++    void MetalCommandQueue::trackInFlight(MTL::CommandBuffer *commandBuffer) {
++        beginInFlight();
++        commandBuffer->addCompletedHandler([this](MTL::CommandBuffer *) {
++            endInFlight();
++        });
++    }
++
++    bool MetalCommandQueue::waitIdle(const uint32_t timeoutMs) {
++        std::unique_lock lock(inFlightMutex);
++        const bool idle = inFlightCondVar.wait_for(lock, std::chrono::milliseconds(timeoutMs), [this] {
++            return inFlightBuffers == 0;
++        });
++        if (!idle) {
++            fprintf(stderr, "MetalCommandQueue::waitIdle: %u command buffers still in flight after %u ms.\n", inFlightBuffers, timeoutMs);
++        }
++
++        return idle;
++    }
++
+     void MetalCommandQueue::waitForCommandFence(RenderCommandFence *fence) {
+         MetalAutoreleasePool releasePool;
+         const MetalCommandFence *metalFence = static_cast<MetalCommandFence *>(fence);
+diff --git a/plume_metal.h b/plume_metal.h
+index e24b05e..8816e88 100644
+--- a/plume_metal.h
++++ b/plume_metal.h
+@@ -7,6 +7,8 @@
+ 
+ #pragma once
+ 
++#include <condition_variable>
++#include <mutex>
+ #include <set>
+ #include <unordered_set>
+ 
+@@ -298,6 +300,9 @@ namespace plume {
+         uint32_t getHeight() const override;
+     };
+ 
++    // What getRawResults reports for an occlusion query that lost samples (more than any real count).
++    static constexpr uint64_t METAL_QUERY_LOST = UINT64_MAX;
++
+     struct MetalQueryPool : RenderQueryPool {
+         MetalDevice *device = nullptr;
+         MTL::CounterSampleBuffer *sampleBuffer = nullptr;
+@@ -316,6 +321,11 @@ namespace plume {
+         // The last command buffer that counted into the pool (retained): results are available once it
+         // completed (one queue, so every earlier one has too).
+         MTL::CommandBuffer *lastCommandBuffer = nullptr;
++        // Queries whose count cannot be trusted: no segment left, or a begin inside another query's.
++        // getRawResults reports them as METAL_QUERY_LOST; a reset clears the mark.
++        std::vector<uint8_t> queryLost;
++        uint32_t lostCount = 0;
++        void markLost(uint32_t queryIndex, const char *reason);
+ 
+         MetalQueryPool(MetalDevice *device, uint32_t queryCount, bool occlusion = false);
+         virtual ~MetalQueryPool() override;
+@@ -433,6 +443,23 @@ namespace plume {
+                 lastScissors.clear();
+                 lastPushConstants.clear();
+             }
++
++            // A quad clear leaves its own pipeline, depth-stencil state, viewport, scissor, cull and
++            // fill mode and zero depth bias on the encoder. Record what the encoder holds now (nothing
++            // for the state it must set again), so the next draw sets its own. The winding, depth clip
++            // mode and push constants are not touched by a clear and stay as cached.
++            void afterQuadClear() {
++                lastPipelineState = nullptr;
++                lastDepthStencilState = nullptr;
++                lastStencilReference = UINT32_MAX;
++                lastCullMode = MTL::CullModeNone;
++                lastFillMode = MTL::TriangleFillModeFill;
++                lastDepthBias = 0.0f;
++                lastDepthBiasClamp = 0.0f;
++                lastSlopeScaledDepthBias = 0.0f;
++                lastViewports.clear();
++                lastScissors.clear();
++            }
+         } stateCache;
+ 
+         MTL::PrimitiveType currentPrimitiveType = MTL::PrimitiveTypeTriangle;
+@@ -545,6 +572,10 @@ namespace plume {
+         void buildTopLevelAS(const RenderAccelerationStructure *dstAccelerationStructure, RenderBufferReference scratchBuffer, RenderBufferReference instancesBuffer, const RenderTopLevelASBuildInfo &buildInfo) override;
+         void discardTexture(const RenderTexture* texture) override;
+         void resetQueryPool(const RenderQueryPool *queryPool, uint32_t queryFirstIndex, uint32_t queryCount) override;
++        // Makes the pool's visibility result buffer that of the render encoders begun from now on, without
++        // resetting the pool: for a command list that continues a frame's earlier ones (a reset would
++        // wait for them and zero their counts), so its first beginQuery does not end the encoder.
++        void attachOcclusionPool(const RenderQueryPool *queryPool);
+         void writeTimestamp(const RenderQueryPool *queryPool, uint32_t queryIndex) override;
+         void beginQuery(const RenderQueryPool *queryPool, uint32_t queryIndex) override;
+         void endQuery(const RenderQueryPool *queryPool, uint32_t queryIndex) override;
+@@ -595,6 +626,19 @@ namespace plume {
+         MTL::CommandQueue *mtl = nullptr;
+         MetalDevice *device = nullptr;
+ 
++        // Every command buffer of the queue is counted until its completed handler has run: the lists
++        // executeCommandLists commits and the buffers plume commits itself (wait, acquire, present).
++        // Those wait on and signal the semaphores' events, and the present buffer's handler uses the
++        // swap chain: neither may be destroyed while one is in flight (waitIdle).
++        std::mutex inFlightMutex;
++        std::condition_variable inFlightCondVar;
++        uint32_t inFlightBuffers = 0;
++        void beginInFlight();
++        void endInFlight();
++        void trackInFlight(MTL::CommandBuffer *commandBuffer);
++        // Waits until nothing is in flight; false after timeoutMs (a buffer stuck on a semaphore).
++        bool waitIdle(uint32_t timeoutMs = 5000);
++
+         MetalCommandQueue(MetalDevice *device, RenderCommandListType type);
+         ~MetalCommandQueue() override;
+         std::unique_ptr<RenderCommandList> createCommandList() override;
+-- 
+2.54.0 (Apple Git-157)
+

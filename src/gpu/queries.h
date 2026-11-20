@@ -11,6 +11,7 @@ struct VideoState;
 
 // Render thread (video lock held).
 void QueriesCommandListBegunLocked(VideoState &s);
+void QueriesChunkListBegunLocked(VideoState &s);
 void QueryBeginLocked(VideoState &s, u32 query_va, u32 generation);
 void QueryEndLocked(VideoState &s, u32 query_va, u32 generation);
 // Render thread: a host occlusion query is open.

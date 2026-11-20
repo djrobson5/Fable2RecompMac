@@ -572,6 +572,78 @@ bool RunPipelineTests(std::string *report) {
                  "without the quad clear, after a barrier)")
           : fail("occlusion query sample counts " + got + ", want 16 4 0 6 3");
   }
+
+  // A quad clear (a rect clear) in a running encoder leaves its own pipeline, viewport and scissor on
+  // the encoder (plume patch 0017). The draw after it, which sets no state because nothing of the
+  // draw's changed, must run with the draw's state again.
+  auto run_target = [&](auto &&record) {
+    list->begin();
+    list->barriers(plume::RenderBarrierStage::GRAPHICS,
+                   plume::RenderTextureBarrier(target.get(), plume::RenderTextureLayout::COLOR_WRITE));
+    list->setFramebuffer(framebuffer.get());
+    record();
+    list->setFramebuffer(nullptr);
+    list->barriers(plume::RenderBarrierStage::COPY,
+                   plume::RenderTextureBarrier(target.get(), plume::RenderTextureLayout::COPY_SOURCE));
+    list->copyTextureRegion(plume::RenderTextureCopyLocation::PlacedFootprint(readback.get(), td.format, kSize, kSize, 1, kSize),
+                            plume::RenderTextureCopyLocation::Subresource(target.get()));
+    list->end();
+    queue->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, fence.get());
+    queue->waitForCommandFence(fence.get());
+    std::vector<uint32_t> pixels(kSize * kSize);
+    std::memcpy(pixels.data(), readback->map(), sizeof(texels));
+    readback->unmap();
+    return pixels;
+  };
+  auto count_differences = [&](const std::vector<uint32_t> &got, const std::vector<uint32_t> &want) {
+    uint32_t differences = 0;
+    for (uint32_t i = 0; i < kSize * kSize; ++i)
+      differences += got[i] != want[i];
+    return differences;
+  };
+  {
+    // A: blit the whole target, rect-clear its top-left quarter green, blit again without setting
+    // any state: the second blit overwrites the clear, the whole target is the source.
+    const plume::RenderRect full(0, 0, kSize, kSize), quarter(0, 0, 2, 2);
+    const auto got = run_target([&]() {
+      list->clearColor(0, plume::RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
+      bind_blit();
+      list->setScissors(&full, 1);
+      list->drawInstanced(3, 1, 0, 0);
+      list->clearColor(0, plume::RenderColor(0.0f, 1.0f, 0.0f, 1.0f), &quarter, 1);
+      list->drawInstanced(3, 1, 0, 0);
+    });
+    const std::vector<uint32_t> want(texels, texels + kSize * kSize);
+    const uint32_t differences = count_differences(got, want);
+    differences == 0 ? pass("draw after a rect clear in the same encoder uses its own pipeline again (16/16 texels)")
+                     : fail("draw after a rect clear ran with the clear's pipeline: " + std::to_string(differences) +
+                            "/16 texels differ from the blit");
+  }
+  {
+    // B: blit under a 2x2 scissor, rect-clear the bottom-right quarter red, blit again without
+    // setting state: the scissor is the draw's again, so the clear survives.
+    const plume::RenderRect quarter(0, 0, 2, 2), bottom_right(2, 2, 4, 4);
+    const auto got = run_target([&]() {
+      list->clearColor(0, plume::RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
+      bind_blit();
+      list->setScissors(&quarter, 1);
+      list->drawInstanced(3, 1, 0, 0);
+      list->clearColor(0, plume::RenderColor(1.0f, 0.0f, 0.0f, 1.0f), &bottom_right, 1);
+      list->drawInstanced(3, 1, 0, 0);
+    });
+    std::vector<uint32_t> want(kSize * kSize, 0xFF000000u);
+    for (uint32_t y = 0; y < kSize; ++y)
+      for (uint32_t x = 0; x < kSize; ++x) {
+        if (x < 2 && y < 2)
+          want[y * kSize + x] = texels[y * kSize + x];
+        else if (x >= 2 && y >= 2)
+          want[y * kSize + x] = 0xFF0000FFu;
+      }
+    const uint32_t differences = count_differences(got, want);
+    differences == 0 ? pass("draw after a rect clear in the same encoder uses its own scissor again (16/16 texels)")
+                     : fail("draw after a rect clear ran with the clear's scissor: " + std::to_string(differences) +
+                            "/16 texels differ");
+  }
   return ok;
 }
 

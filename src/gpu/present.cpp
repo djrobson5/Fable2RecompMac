@@ -24,6 +24,9 @@
 #else
 #include <plume_vulkan.h>
 #endif
+#if defined(FABLE2_METAL_BACKEND)
+#include <plume_metal.h>
+#endif
 
 #include "core/logging.h"
 #include "gpu/queries.h"
@@ -137,9 +140,19 @@ bool HandleResize(VideoState &s) {
   }
 
 #if !defined(EOT_D3D12)
-  // Metal: plume has no queue-idle wait; the fence waits above cover every
-  // command list this renderer submitted, and Metal keeps a drawable being
-  // presented alive across the layer's resize.
+#if defined(FABLE2_METAL_BACKEND)
+  // Metal: the fence waits above cover the render command lists, not the
+  // buffers plume commits itself (wait, acquire, present). Those wait on the
+  // present semaphores (cleared below) and the present buffer's completion
+  // handler uses the swap chain: wait for all of them. Metal keeps a drawable
+  // being presented alive across the layer's resize.
+  if (UseMetal() && !static_cast<plume::MetalCommandQueue *>(s.queue.get())->waitIdle()) {
+    EOT_ERROR("[present] the Metal queue did not go idle before resize; renderer disabled");
+    ReportSwapChainFailure(s, "present queue idle wait");
+    DisableFailedDevice(s);
+    return false;
+  }
+#endif
   if (!UseMetal()) {
   auto *vk_queue = static_cast<plume::VulkanCommandQueue *>(s.queue.get());
   VkResult idle_result = VK_ERROR_DEVICE_LOST;

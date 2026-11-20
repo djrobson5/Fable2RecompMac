@@ -1350,7 +1350,9 @@ bool Video::CreateHostDevice(rex::ui::Window *window) {
   if (UseMetal())
     EOT_WARN("[metal] the Metal backend is work in progress. Not on Metal yet: GPU timing, Vulkan's lazy "
              "clears and persistent render pass (plume patches 0006/0007; plume's Metal backend has its own "
-             "clear load actions), a shader cache (shaders are converted to MSL and compiled when first used)");
+             "clear load actions), a shader cache (shaders are converted to MSL and compiled when first used), "
+             "the temporal AA pass (D3D12 only: it binds its constants as root descriptor 0, which this build's "
+             "layout does not have unless FABLE2_CONSTANT_BUFFERS is on)");
 
   s.queue = s.device->createCommandQueue(plume::RenderCommandListType::DIRECT);
   for (u32 i = 0; i < kNumFrames; ++i) {
@@ -1523,6 +1525,13 @@ void Video::Shutdown() {
         s.command_list_submitted[i] = false;
       }
     }
+#if defined(FABLE2_METAL_BACKEND)
+    // The present, acquire and wait buffers plume commits are not behind a
+    // fence: they wait on the present semaphores and the present buffer's
+    // completion handler uses the swap chain (both destroyed below).
+    if (UseMetal())
+      static_cast<plume::MetalCommandQueue *>(s.queue.get())->waitIdle();
+#endif
   }
   s.swap_framebuffers.clear();
   s.render_semaphores.clear();

@@ -33,6 +33,9 @@
 #if !defined(EOT_D3D12)
 #include <plume_vulkan.h>
 #endif
+#if defined(FABLE2_METAL_BACKEND)
+#include <plume_metal.h>
+#endif
 #include "gpu/trace.h"
 
 REXCVAR_DECLARE(bool, fable2_query_force_visible);
@@ -99,6 +102,9 @@ struct State {
   std::unordered_map<u32, bool> sun;
 };
 
+// getRawResults' count for a host query that lost samples (plume Metal).
+constexpr u64 kHostQueryLost = ~0ull;
+
 // Guest thread: the query between Begin and End, if any.
 std::atomic<u32> g_open_query{0};
 
@@ -115,6 +121,8 @@ bool DiagNow(const VideoState &s) {
 std::atomic<u64> g_issued_begin{0}, g_issued_end{0}, g_host_begin{0}, g_host_end{0},
     g_dropped_open{0}, g_published{0}, g_get_hit{0}, g_get_stale{0}, g_get_miss{0};
 std::atomic<u64> g_query_flicker{0}, g_query_zero{0};
+// Host queries that lost samples (plume Metal: no segment left, a nested begin); not published.
+std::atomic<u64> g_query_lost{0};
 std::atomic<u64> g_sample_sum{0}, g_orig_ready{0}, g_orig_notready{0}, g_nonocc{0};
 
 void MaybeLogStats() {
@@ -125,12 +133,12 @@ void MaybeLogStats() {
   i64 prev = last.load();
   if (now - prev < 5 || !last.compare_exchange_strong(prev, now))
     return;
-  EOT_INFO("[queries] issued b{} e{} host b{} e{} dropped-open {} published {} (sum {}) "
+  EOT_INFO("[queries] issued b{} e{} host b{} e{} dropped-open {} published {} (sum {}) lost {} "
            "get hit {} stale {} miss {} | GetData orig ready {} not-ready {} non-occlusion {}",
            g_issued_begin.load(), g_issued_end.load(), g_host_begin.load(), g_host_end.load(),
-           g_dropped_open.load(), g_published.load(), g_sample_sum.load(), g_get_hit.load(),
-           g_get_stale.load(), g_get_miss.load(), g_orig_ready.load(), g_orig_notready.load(),
-           g_nonocc.load());
+           g_dropped_open.load(), g_published.load(), g_sample_sum.load(), g_query_lost.load(),
+           g_get_hit.load(), g_get_stale.load(), g_get_miss.load(), g_orig_ready.load(),
+           g_orig_notready.load(), g_nonocc.load());
 }
 
 }
@@ -159,6 +167,23 @@ void QueriesCommandListBegunLocked(VideoState &s) {
     s.command_list->resetQueryPool(slot.pool.get(), 0, kQueriesPerSlot);
     slot.needsReset = false;
   }
+}
+
+// A list that continues the frame (a chunk submit). It must not reset the
+// slot's pool, which would zero the earlier lists' counts. On Metal it takes
+// over the pool's visibility result buffer, so that its first query does not
+// end the render pass to attach it (Vulkan has no such state).
+void QueriesChunkListBegunLocked(VideoState &s) {
+#if defined(FABLE2_METAL_BACKEND)
+  auto &q = st();
+  if (!UseMetal() || q.unsupported || !s.command_list)
+    return;
+  Slot &slot = q.slots[s.recording_slot()];
+  if (slot.pool && !slot.needsReset)
+    static_cast<plume::MetalCommandList *>(s.command_list)->attachOcclusionPool(slot.pool.get());
+#else
+  (void)s;
+#endif
 }
 
 void QueryBeginLocked(VideoState &s, u32 query_va, u32 generation) {
@@ -246,6 +271,8 @@ void QueriesSlotRecycledLocked(VideoState &s, u32 slot_index) {
         std::string line;
         u64 sum = 0, zero = 0;
         for (const Entry &e : slot.done) {
+          if (raw[e.index] == kHostQueryLost)
+            continue;
           sum += raw[e.index];
           zero += raw[e.index] == 0;
         }
@@ -255,6 +282,13 @@ void QueriesSlotRecycledLocked(VideoState &s, u32 slot_index) {
       }
       std::lock_guard lock(q.mutex);
       for (const Entry &e : slot.done) {
+        // A host query that lost samples counted too few, which would read as
+        // occluded: leave it unpublished, so GetData answers as for a query
+        // without a count yet (fully visible, or the earlier use's count).
+        if (raw[e.index] == kHostQueryLost) {
+          ++g_query_lost;
+          continue;
+        }
         // Host samples at the render scale, rounded; any visible sample is at
         // least 1 (rounding a sliver to 0 hid distant buildings).
         const u64 n = raw[e.index] ? std::max<u64>(1, static_cast<u64>(double(raw[e.index]) * scale + 0.5)) : 0;

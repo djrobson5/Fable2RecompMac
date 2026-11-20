@@ -212,6 +212,7 @@ void MaybeSubmitChunkLocked(VideoState &s) {
   }
   s.command_list = s.command_lists[cur].get();
   s.command_list->begin();
+  QueriesChunkListBegunLocked(s);
   BindListStateLocked(s);
   s.command_list_open = true;
   s.list_draws = 0;
