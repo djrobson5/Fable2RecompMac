@@ -33,6 +33,10 @@ REXCVAR_DEFINE_BOOL(fable2_full_height_1120, true, "Fable2",
                     "Native renderer: give 1120-wide tiled surfaces the full 720 lines");
 REXCVAR_DEFINE_BOOL(fable2_guest_msaa, true, "Fable2",
                     "Native renderer: multisample the frame-sized surfaces the game multisamples (at launch)");
+REXCVAR_DEFINE_BOOL(fable2_debug_skip_hw_resolve, false, "Fable2",
+                    "Debug: skip the MSAA host->single resolves (cost test; the picture is wrong while on)");
+REXCVAR_DEFINE_BOOL(fable2_diag_hw_resolve, false, "Fable2",
+                    "Diagnostics: log each MSAA host->single resolve (surface, samples, trigger) for a few frames");
 
 namespace eot::gpu {
 
@@ -624,8 +628,23 @@ void NoteHandoffRegret(const VideoState &s, GuestSurface &surf) {
     m->handoffRegretMask |= 1u << surf.handoffMirrorOrdinal;
 }
 
-bool ResolveHostToSingle(VideoState &s, GuestSurface &surf) {
+bool ResolveHostToSingle(VideoState &s, GuestSurface &surf, const char *why) {
   auto *cmd = s.command_list;
+  if (REXCVAR_GET(fable2_diag_hw_resolve)) {
+    // Three frames' worth every ~10 s: which surface, how many samples, what asked for it.
+    static u64 window_start = 0;
+    if (s.guest_frames >= window_start + 1200)
+      window_start = s.guest_frames;
+    if (s.guest_frames < window_start + 3)
+      EOT_INFO("[hw-resolve] frame {} va {:#x} {}x{} (alloc {}x{}) samples {} fmt {} {} host draws {} single draws {} ({})",
+               s.guest_frames, surf.va, surf.width, surf.height, surf.allocWidth, surf.allocHeight,
+               surf.host.sampleCount, surf.colorFormat, surf.isDepth ? "depth" : "colour", surf.hostDraws,
+               surf.singleDraws, why);
+  }
+  if (REXCVAR_GET(fable2_debug_skip_hw_resolve)) {
+    surf.single.needsClear = false;
+    return true;
+  }
   GpuTimingMark(s, cmd, kGpuCatResolveHw);
   LogTransfer(s, surf, "resolve host->single");
   NoteHandoffRegret(s, surf);
@@ -964,7 +983,7 @@ HostTexture *SurfaceImageForDraw(VideoState &s, GuestSurface &surf, u32 samples,
     return nullptr;
   if (!surf.contentInSingle && !surf.imagesAgree && surf.content == GuestSurface::Content::Drawn &&
       surf.host.valid()) {
-    if (!ResolveHostToSingle(s, surf))
+    if (!ResolveHostToSingle(s, surf, "1x draw into it"))
       return nullptr;
     surf.imagesAgree = true;
   }
@@ -1013,7 +1032,7 @@ HostTexture *SurfaceColorSingle(VideoState &s, GuestSurface &surf) {
   if (!EnsureSurfaceSingle(s, surf))
     return nullptr;
   if (!surf.imagesAgree && surf.content == GuestSurface::Content::Drawn) {
-    if (!ResolveHostToSingle(s, surf))
+    if (!ResolveHostToSingle(s, surf, "read as a texture or resolve source"))
       return nullptr;
     surf.imagesAgree = true;
   }
