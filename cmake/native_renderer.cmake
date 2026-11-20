@@ -131,6 +131,44 @@ endif()
 if(FABLE2_GPU_LABELS)
     target_compile_definitions(Fable2 PRIVATE FABLE2_GPU_LABELS)
 endif()
+# Native Metal backend (fable2_gpu_backend=metal; Vulkan through MoltenVK stays
+# the default): SPIR-V converted to MSL in-process by SPIRV-Cross, built from
+# source (cmake/spirv_cross.cmake), and an offline self-test of every shader.
+option(FABLE2_METAL_BACKEND "Build the native Metal backend (fable2_gpu_backend=metal)" ON)
+if(APPLE AND FABLE2_METAL_BACKEND)
+    include("${CMAKE_CURRENT_LIST_DIR}/spirv_cross.cmake")
+    target_sources(Fable2 PRIVATE src/gpu/shaders/msl_convert.cpp)
+    target_link_libraries(Fable2 PRIVATE spirv-cross-msl)
+    target_compile_definitions(Fable2 PRIVATE FABLE2_METAL_BACKEND)
+    # plume_metal.h (the Metal paths cast to plume's Metal types) needs metal-cpp.
+    target_include_directories(Fable2 PRIVATE "${FABLE2_PLUME_DIR}/contrib/metal-cpp")
+
+    # No window, no game: converts and compiles every host and guest shader and
+    # runs the blit through plume (tools/metal_selftest).
+    set(_fable2_selftest_shaders "")
+    foreach(shader IN ITEMS copy_vs imgui_vs blit_ps copy_depth_ps imgui_ps taa_ps
+            velocity_resolve_2x_ps velocity_resolve_4x_ps velocity_resolve_8x_ps
+            resolve_msaa_color_2x_ps resolve_msaa_color_4x_ps resolve_msaa_color_8x_ps
+            resolve_msaa_depth_2x_ps resolve_msaa_depth_4x_ps resolve_msaa_depth_8x_ps
+            derive_depth_stencil_2x_ps derive_depth_stencil_4x_ps derive_depth_stencil_8x_ps)
+        list(APPEND _fable2_selftest_shaders "${REEOT_GEN_DIR}/shaders/${shader}.hlsl.spirv.h")
+    endforeach()
+    add_executable(fable2_metal_selftest
+        tools/metal_selftest/metal_shader_selftest.cpp
+        src/gpu/shaders/msl_convert.cpp
+        "${FABLE2_THIRDPARTY}/XenosRecomp/thirdparty/smol-v/source/smolv.cpp"
+        ${_fable2_selftest_shaders})
+    target_include_directories(fable2_metal_selftest PRIVATE
+        src
+        "${REEOT_GEN_DIR}"
+        "${FABLE2_PLUME_DIR}/contrib/metal-cpp"
+        "${FABLE2_THIRDPARTY}/XenosRecomp/thirdparty/smol-v/source")
+    target_link_libraries(fable2_metal_selftest PRIVATE
+        plume spirv-cross-msl fable2_shader_cache libzstd_static
+        "-framework Metal" "-framework QuartzCore" "-framework Foundation" "-framework CoreFoundation"
+        "-framework Cocoa" "-framework IOSurface" "-framework IOKit")
+endif()
+
 # Runtime shader translation (src/gpu/shaders/runtime_shaders.cpp): the
 # translator and shader header this build used.
 target_compile_definitions(Fable2 PRIVATE

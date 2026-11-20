@@ -909,9 +909,7 @@ bool BuildPipelineLayout(VideoState &s) {
   layout_builder.begin(false, true);
 
   plume::RenderDescriptorSetBuilder tex_set_builder;
-  tex_set_builder.begin();
-  tex_set_builder.addTexture(0, kBindlessTextureCount);
-  tex_set_builder.end(true, kBindlessTextureCount);
+  DescribeTextureHeapSet(tex_set_builder);
 
   s.texture_descriptor_set = tex_set_builder.create(s.device.get());
   if (!s.texture_descriptor_set) {
@@ -924,14 +922,8 @@ bool BuildPipelineLayout(VideoState &s) {
   if (!BuildNullTextureDescriptors(s))
     return false;
 
-  layout_builder.addDescriptorSet(tex_set_builder);
-  layout_builder.addDescriptorSet(tex_set_builder);
-  layout_builder.addDescriptorSet(tex_set_builder);
-
   plume::RenderDescriptorSetBuilder sampler_set_builder;
-  sampler_set_builder.begin();
-  sampler_set_builder.addSampler(0, kBindlessSamplerCount);
-  sampler_set_builder.end(true, kBindlessSamplerCount);
+  DescribeSamplerHeapSet(sampler_set_builder);
   s.sampler_descriptor_set = sampler_set_builder.create(s.device.get());
   if (!s.sampler_descriptor_set) {
     EOT_ERROR("createDescriptorSet for the bindless sampler heap failed");
@@ -961,8 +953,7 @@ bool BuildPipelineLayout(VideoState &s) {
   for (u32 i = 0; i < kReservedSamplerCount; ++i)
     s.sampler_descriptor_used[i] = true;
 
-  layout_builder.addDescriptorSet(sampler_set_builder);
-  layout_builder.addDescriptorSet(tex_set_builder);
+  DescribeMainLayoutSets(layout_builder, tex_set_builder, sampler_set_builder);
 
 #if defined(EOT_D3D12)
   layout_builder.addRootDescriptor(0, 4, plume::RenderRootDescriptorType::CONSTANT_BUFFER);
@@ -974,14 +965,14 @@ bool BuildPipelineLayout(VideoState &s) {
                                  plume::RenderShaderStageFlag::VERTEX |
                                      plume::RenderShaderStageFlag::PIXEL);
 #else
-  layout_builder.addPushConstant(0, 4, kCopyPushConstantByteOffset + sizeof(CopyPushConstants),
-                                 plume::RenderShaderStageFlag::VERTEX |
-                                     plume::RenderShaderStageFlag::PIXEL);
+  static_assert(kMainLayoutPushConstantBytes == kCopyPushConstantByteOffset + sizeof(CopyPushConstants));
+  // With FABLE2_CONSTANT_BUFFERS the guest shaders' vertex, pixel and shared
+  // constants (XE_CONSTANT_BUFFERS) are uniform buffers in set 5, pushed per
+  // draw (root descriptors 0..2).
 #if defined(FABLE2_CONSTANT_BUFFERS)
-  // The guest shaders' vertex, pixel and shared constants (XE_CONSTANT_BUFFERS):
-  // uniform buffers in set 5, pushed per draw (root descriptors 0..2).
-  for (u32 r = 0; r < 3; ++r)
-    layout_builder.addRootDescriptor(r, 5, plume::RenderRootDescriptorType::CONSTANT_BUFFER);
+  DescribeMainLayoutPushConstants(layout_builder, true);
+#else
+  DescribeMainLayoutPushConstants(layout_builder, false);
 #endif
 #endif
 

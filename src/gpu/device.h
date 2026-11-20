@@ -21,6 +21,7 @@
 #include <plume_render_interface.h>
 
 #include "core/cpu.h"
+#include "gpu/main_layout.h"
 #include "gpu/resources.h"
 
 namespace rex::ui {
@@ -31,8 +32,6 @@ namespace eot::gpu {
 
 constexpr u32 kNumFrames = 2;
 
-constexpr u32 kBindlessTextureCount = 32768;
-constexpr u32 kBindlessSamplerCount = 512;
 
 constexpr u32 kSamplerLinearClamp = 0;
 constexpr u32 kSamplerPointClamp = 1;

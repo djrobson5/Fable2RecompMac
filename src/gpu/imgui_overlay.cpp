@@ -136,14 +136,10 @@ bool OverlayDrawer::EnsureResources(VideoState &s) {
   plume::RenderPipelineLayoutBuilder layout_builder;
   layout_builder.begin(false, true);
   plume::RenderDescriptorSetBuilder texture_set;
-  texture_set.begin();
-  texture_set.addTexture(0, kBindlessTextureCount);
-  texture_set.end(true, kBindlessTextureCount);
+  DescribeTextureHeapSet(texture_set);
   layout_builder.addDescriptorSet(texture_set);
   plume::RenderDescriptorSetBuilder sampler_set;
-  sampler_set.begin();
-  sampler_set.addSampler(0, kBindlessSamplerCount);
-  sampler_set.end(true, kBindlessSamplerCount);
+  DescribeSamplerHeapSet(sampler_set);
   layout_builder.addDescriptorSet(sampler_set);
   layout_builder.addPushConstant(0, 2, sizeof(Ortho), plume::RenderShaderStageFlag::VERTEX);
 #if defined(EOT_D3D12)
