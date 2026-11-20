@@ -1,7 +1,7 @@
-From 4e23a3488397d4b406692192ba7fce9c385f38c9 Mon Sep 17 00:00:00 2001
+From 958bbc023cfdc3d1b60db724ecec7229b7f08d3b Mon Sep 17 00:00:00 2001
 From: djrobson5 <djrobson5@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 21:58:47 -0800
-Subject: [PATCH 11/14] Metal: texture-to-buffer copies
+Subject: [PATCH 11/17] Metal: texture-to-buffer copies
 
 copyTextureRegion copied buffer to texture and texture to texture; a
 PLACED_FOOTPRINT destination with a SUBRESOURCE source (a readback) hit

@@ -1,7 +1,7 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 69db9580011802f567f2d2181db1e25a64df4c6e Mon Sep 17 00:00:00 2001
 From: djrobson5 <djrobson5@users.noreply.github.com>
 Date: Fri, 20 Nov 2026 01:00:00 -0800
-Subject: [PATCH] Metal: occlusion queries
+Subject: [PATCH 16/17] Metal: occlusion queries
 
 Implements patch 0005's interface on Metal: createOcclusionQueryPool,
 beginQuery/endQuery and getRawResults.
@@ -22,9 +22,15 @@ the pool completed. resetQueryPool zeroes the segments on the CPU, so
 the pool's earlier command buffers must have completed (it waits for
 them otherwise). One query counts at a time, as in Vulkan.
 ---
+ plume_metal.cpp | 214 +++++++++++++++++++++++++++++++++++++++++++++++-
+ plume_metal.h   |  37 ++++++++-
+ 2 files changed, 247 insertions(+), 4 deletions(-)
+
+diff --git a/plume_metal.cpp b/plume_metal.cpp
+index 49d6aea..51b4a7f 100644
 --- a/plume_metal.cpp
 +++ b/plume_metal.cpp
-@@ -2293,12 +2293,28 @@
+@@ -2293,12 +2293,28 @@ namespace plume {
  
      // MetalQueryPool
  
@@ -54,7 +60,7 @@ them otherwise). One query counts at a time, as in Vulkan.
  
          MTL::CounterSampleBufferDescriptor *sampleBufferDesc = MTL::CounterSampleBufferDescriptor::alloc()->init();
          sampleBufferDesc->setCounterSet(device->timestampCounterSet);
-@@ -2312,11 +2328,26 @@
+@@ -2312,11 +2328,26 @@ namespace plume {
  
      MetalQueryPool::~MetalQueryPool() {
          MetalAutoreleasePool releasePool;
@@ -82,7 +88,7 @@ them otherwise). One query counts at a time, as in Vulkan.
          const NS::Data* data = sampleBuffer->resolveCounterRange(NS::Range(0, results.size()));
          std::memcpy(results.data(), data->mutableBytes(), results.size() * sizeof(uint64_t));
      }
-@@ -2329,6 +2360,53 @@
+@@ -2329,6 +2360,53 @@ namespace plume {
          return uint32_t(results.size());
      }
  
@@ -136,7 +142,7 @@ them otherwise). One query counts at a time, as in Vulkan.
      // MetalCommandList
  
      MetalCommandList::MetalCommandList(const MetalCommandQueue *queue) {
-@@ -2365,6 +2443,11 @@
+@@ -2365,6 +2443,11 @@ namespace plume {
          mtl->retain();
          mtl->setLabel(MTLSTR("RT64 Command List"));
  
@@ -148,7 +154,7 @@ them otherwise). One query counts at a time, as in Vulkan.
          // Reset fence waits and updates for new command list.
          fenceSlots.updateDirtyBits = ~0;
          for (uint32_t dstStage = 0; dstStage < MetalBarrierStage::COUNT; dstStage++) {
-@@ -2986,7 +3069,9 @@
+@@ -2986,7 +3069,9 @@ namespace plume {
          }
          activeRenderEncoder->setFragmentBytes(clearColors, alignUp(sizeof(simd::float4) * rectCount), 0);
  
@@ -158,7 +164,7 @@ them otherwise). One query counts at a time, as in Vulkan.
  
          activeRenderEncoder->popDebugGroup();
  
-@@ -3085,7 +3170,9 @@
+@@ -3085,7 +3170,9 @@ namespace plume {
              }
              activeRenderEncoder->setFragmentBytes(clearDepths, alignUp(sizeof(float) * rectCount), 0);
  
@@ -168,7 +174,7 @@ them otherwise). One query counts at a time, as in Vulkan.
  
              activeRenderEncoder->popDebugGroup();
  
-@@ -3368,7 +3455,111 @@
+@@ -3368,7 +3455,111 @@ namespace plume {
  
      void MetalCommandList::resetQueryPool(const RenderQueryPool *queryPool, uint32_t queryFirstIndex, uint32_t queryCount) {
          assert(queryPool != nullptr);
@@ -281,7 +287,7 @@ them otherwise). One query counts at a time, as in Vulkan.
      }
  
      void MetalCommandList::writeTimestamp(const RenderQueryPool *queryPool, uint32_t queryIndex) {
-@@ -3546,9 +3737,20 @@
+@@ -3546,9 +3737,20 @@ namespace plume {
                  renderDescriptor->setSamplePositions(targetFramebuffer->samplePositions, targetFramebuffer->sampleCount);
              }
  
@@ -302,7 +308,7 @@ them otherwise). One query counts at a time, as in Vulkan.
              barrierWait(MetalBarrierStage::GRAPHICS, activeRenderEncoder);
  
              activeRenderEncoder->retain();
-@@ -3729,6 +3931,8 @@
+@@ -3729,6 +3931,8 @@ namespace plume {
              activeRenderEncoder->endEncoding();
              activeRenderEncoder->release();
              activeRenderEncoder = nullptr;
@@ -311,20 +317,22 @@ them otherwise). One query counts at a time, as in Vulkan.
              currentEncoderDescriptorSets.clear();
  
              // Mark all state as needing rebind for next encoder
-@@ -4163,6 +4367,10 @@
- 
-     std::unique_ptr<RenderQueryPool> MetalDevice::createQueryPool(uint32_t queryCount) {
+@@ -4165,6 +4369,10 @@ namespace plume {
          return std::make_unique<MetalQueryPool>(this, queryCount);
-+    }
-+
-+    std::unique_ptr<RenderQueryPool> MetalDevice::createOcclusionQueryPool(uint32_t queryCount) {
-+        return std::make_unique<MetalQueryPool>(this, queryCount, true);
      }
  
++    std::unique_ptr<RenderQueryPool> MetalDevice::createOcclusionQueryPool(uint32_t queryCount) {
++        return std::make_unique<MetalQueryPool>(this, queryCount, true);
++    }
++
      void MetalDevice::setBottomLevelASBuildInfo(RenderBottomLevelASBuildInfo &buildInfo, const RenderBottomLevelASMesh *meshes, uint32_t meshCount, bool preferFastBuild, bool preferFastTrace) {
+         // TODO: Unimplemented (Raytracing).
+     }
+diff --git a/plume_metal.h b/plume_metal.h
+index d98c809..e24b05e 100644
 --- a/plume_metal.h
 +++ b/plume_metal.h
-@@ -303,11 +303,30 @@
+@@ -303,11 +303,30 @@ namespace plume {
          MTL::CounterSampleBuffer *sampleBuffer = nullptr;
          std::vector<uint64_t> results;
  
@@ -356,11 +364,10 @@ them otherwise). One query counts at a time, as in Vulkan.
      };
  
      enum MetalBarrierStage {
-@@ -464,6 +483,19 @@
-         MetalDescriptorSet* computeDescriptorSets[MAX_DESCRIPTOR_SET_BINDINGS] = {};
+@@ -465,6 +484,19 @@ namespace plume {
  
          MTL::Fence *timestampQueryFence = nullptr;
-+
+ 
 +        // Occlusion queries. visibilityPool's buffer is the visibility result buffer of every render
 +        // encoder begun from now on (encoderVisibilityPool: the one of the active encoder). One query
 +        // counts at a time (Vulkan also allows one active occlusion query); it counts in every encoder
@@ -373,10 +380,11 @@ them otherwise). One query counts at a time, as in Vulkan.
 +        bool activeQueryCounting = false;
 +        void startQueryCounting();
 +        void setQueryCountingPaused(bool paused);
- 
++
          std::unordered_set<MetalDescriptorSet*> currentEncoderDescriptorSets;
          void bindEncoderResources(MTL::CommandEncoder* encoder, bool isCompute);
-@@ -514,6 +546,8 @@
+ 
+@@ -514,6 +546,8 @@ namespace plume {
          void discardTexture(const RenderTexture* texture) override;
          void resetQueryPool(const RenderQueryPool *queryPool, uint32_t queryFirstIndex, uint32_t queryCount) override;
          void writeTimestamp(const RenderQueryPool *queryPool, uint32_t queryIndex) override;
@@ -385,7 +393,7 @@ them otherwise). One query counts at a time, as in Vulkan.
          void endOtherEncoders(EncoderType type);
          void checkActiveComputeEncoder();
          void endActiveComputeEncoder();
-@@ -785,6 +819,7 @@
+@@ -785,6 +819,7 @@ namespace plume {
          std::unique_ptr<RenderCommandSemaphore> createCommandSemaphore() override;
          std::unique_ptr<RenderFramebuffer> createFramebuffer(const RenderFramebufferDesc &desc) override;
          std::unique_ptr<RenderQueryPool> createQueryPool(uint32_t queryCount) override;
@@ -393,3 +401,6 @@ them otherwise). One query counts at a time, as in Vulkan.
          void setBottomLevelASBuildInfo(RenderBottomLevelASBuildInfo &buildInfo, const RenderBottomLevelASMesh *meshes, uint32_t meshCount, bool preferFastBuild, bool preferFastTrace) override;
          void setTopLevelASBuildInfo(RenderTopLevelASBuildInfo &buildInfo, const RenderTopLevelASInstance *instances, uint32_t instanceCount, bool preferFastBuild, bool preferFastTrace) override;
          void setShaderBindingTableInfo(RenderShaderBindingTableInfo &tableInfo, const RenderShaderBindingGroups &groups, const RenderPipeline *pipeline, RenderDescriptorSet **descriptorSets, uint32_t descriptorSetCount) override;
+-- 
+2.54.0 (Apple Git-157)
+

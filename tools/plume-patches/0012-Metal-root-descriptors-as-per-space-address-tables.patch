@@ -1,7 +1,7 @@
-From 444c0987cf12a1118ed88492a41cf16323c66b51 Mon Sep 17 00:00:00 2001
+From b39f2c5f2ce3de6e6694ba67d6f0cddb11723e78 Mon Sep 17 00:00:00 2001
 From: djrobson5 <djrobson5@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 21:59:40 -0800
-Subject: [PATCH 12/14] Metal: root descriptors as per-space address tables
+Subject: [PATCH 12/17] Metal: root descriptors as per-space address tables
 
 setGraphicsRootDescriptor asserted on Metal. A root descriptor (register
 b, space s) is now entry b of set s's argument buffer: SPIRV-Cross lays out

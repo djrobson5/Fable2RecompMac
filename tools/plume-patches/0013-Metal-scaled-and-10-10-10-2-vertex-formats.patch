@@ -1,7 +1,7 @@
-From 48a8571b797f59b6ad86e10765472c88c0bef54e Mon Sep 17 00:00:00 2001
+From d8bbd07337103af4a294dc1ce48fbe7b7a56d398 Mon Sep 17 00:00:00 2001
 From: djrobson5 <djrobson5@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 21:59:53 -0800
-Subject: [PATCH 13/14] Metal: scaled and 10:10:10:2 vertex formats
+Subject: [PATCH 13/17] Metal: scaled and 10:10:10:2 vertex formats
 
 The Metal side of 0001: the USCALED/SSCALED formats map to Metal's
 unnormalized integer vertex formats (Metal converts them to float for a

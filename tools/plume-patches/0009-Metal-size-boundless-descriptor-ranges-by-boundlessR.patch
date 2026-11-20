@@ -1,7 +1,7 @@
-From cc5968637e608e4488861d34414e6caa197c50ef Mon Sep 17 00:00:00 2001
+From 387df519162373badc9c943a6960421c2b2b4ad8 Mon Sep 17 00:00:00 2001
 From: djrobson5 <djrobson5@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 21:58:00 -0800
-Subject: [PATCH 09/14] Metal: size boundless descriptor ranges by
+Subject: [PATCH 09/17] Metal: size boundless descriptor ranges by
  boundlessRangeSize
 
 The argument encoder of a boundless range had capabilities.maxTextureSize

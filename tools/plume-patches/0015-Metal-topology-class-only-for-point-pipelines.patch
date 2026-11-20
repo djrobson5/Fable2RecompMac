@@ -1,7 +1,7 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 0ccb75b1e82e2ae63c188233c009a4722022d165 Mon Sep 17 00:00:00 2001
 From: djrobson5 <djrobson5@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 22:40:00 -0800
-Subject: [PATCH] Metal: topology class only for point pipelines
+Subject: [PATCH 15/17] Metal: topology class only for point pipelines
 
 Translated vertex shaders write a point size for every topology, and
 Metal refused all 359 guest pipelines of the first launch with "Vertex
@@ -9,9 +9,14 @@ shader writes point size but inputPrimitiveTopology is
 MTLPrimitiveTopologyClassTriangle". Line and triangle pipelines now leave
 the class Unspecified (it only matters for layered rendering).
 ---
+ plume_metal.cpp | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/plume_metal.cpp b/plume_metal.cpp
+index bfaa7f3..49d6aea 100644
 --- a/plume_metal.cpp
 +++ b/plume_metal.cpp
-@@ -1582,7 +1582,13 @@
+@@ -1582,7 +1582,13 @@ namespace plume {
  
          MetalAutoreleasePool releasePool;
          MTL::RenderPipelineDescriptor *descriptor = MTL::RenderPipelineDescriptor::alloc()->init();
@@ -26,3 +31,6 @@ the class Unspecified (it only matters for layered rendering).
          descriptor->setRasterSampleCount(desc.multisampling.sampleCount);
          descriptor->setAlphaToCoverageEnabled(desc.alphaToCoverageEnabled);
          descriptor->setDepthAttachmentPixelFormat(mapPixelFormat(desc.depthTargetFormat));
+-- 
+2.54.0 (Apple Git-157)
+

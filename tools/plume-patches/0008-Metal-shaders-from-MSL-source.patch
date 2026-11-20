@@ -1,7 +1,7 @@
-From 5201181796556ef2d69e95747ab0ce60f6b6f522 Mon Sep 17 00:00:00 2001
+From fe5cfbed54bfa42b385ce4abbc8480e23f29d39a Mon Sep 17 00:00:00 2001
 From: djrobson5 <djrobson5@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 21:57:49 -0800
-Subject: [PATCH 08/14] Metal: shaders from MSL source
+Subject: [PATCH 08/17] Metal: shaders from MSL source
 
 RenderShaderFormat::METAL took only a metallib. Data that does not start
 with the metallib magic ("MTLB") is now MSL source, compiled with

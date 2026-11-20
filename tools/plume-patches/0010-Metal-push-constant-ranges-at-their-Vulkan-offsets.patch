@@ -1,7 +1,7 @@
-From 22b1408bc284a31dd1296d63aa2837aa75a08efc Mon Sep 17 00:00:00 2001
+From dda66ba93961ba9d542e550229acbb28d1c5a2b7 Mon Sep 17 00:00:00 2001
 From: djrobson5 <djrobson5@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 21:58:20 -0800
-Subject: [PATCH 10/14] Metal: push constant ranges at their Vulkan offsets
+Subject: [PATCH 10/17] Metal: push constant ranges at their Vulkan offsets
 
 A push constant range was copied to the start of its Metal buffer, while
 SPIR-V converted with SPIRV-Cross reads members at their absolute push

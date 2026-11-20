@@ -1,7 +1,7 @@
-From 198a5f408ead0b234a2e1676a36f6b394929ddf1 Mon Sep 17 00:00:00 2001
+From e88374bf488c1267feb2f1ee66234d00d6322840 Mon Sep 17 00:00:00 2001
 From: djrobson5 <djrobson5@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 22:18:46 -0800
-Subject: [PATCH 14/14] Metal: framebuffer size from the attachment view's mip
+Subject: [PATCH 14/17] Metal: framebuffer size from the attachment view's mip
  level
 
 The Metal side of 0004: a framebuffer whose attachment is a view of mip
