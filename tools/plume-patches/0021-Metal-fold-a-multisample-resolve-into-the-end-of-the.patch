@@ -1,0 +1,272 @@
+From 2ed3228b65879f22dfa65ac252f2eaa8cb6808b3 Mon Sep 17 00:00:00 2001
+From: djrobson5 <256682087+djrobson5@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 13:19:06 -0800
+Subject: [PATCH 21/21] Metal: fold a multisample resolve into the end of the
+ render pass
+
+setColorResolveTarget(i, texture) names the single-sample texture that colour
+attachment i of the current framebuffer resolves into (cleared by the next
+setFramebuffer). A render encoder begun for that framebuffer sets it as the
+attachment's resolve texture with StoreAndMultisampleResolve, so the pass
+resolves as it ends and stores the multisampled texture as before. The pairing
+is checked (same size and pixel format, single-sample, a render target, the
+attachment a whole texture rather than a view) and ignored when it does not fit.
+
+resolveTextureAtPassEnd(dst, src) ends the active render pass when src is its
+colour attachment with dst as its resolve target and no full clear is pending
+(the barrier that follows would clear src before the separate resolve pass runs
+it); it returns true and the caller skips resolveTexture, which would have
+opened a pass that loads the whole multisampled texture again. Otherwise it
+returns false and changes nothing (lastFoldRefusal says why).
+
+The store action cannot be left Unknown and chosen when the encoder ends: with
+a resolve texture set, Metal's validation requires a resolve action. Both calls
+are no-ops in the other backends (virtual defaults in RenderCommandList).
+
+g_metalResolvePassEnds counts the render passes that ended resolving into a
+resolve target, so the renderer can tell how many resolves a frame its
+framebuffers' passes make. A barrier on a pass's resolve target ends the pass
+(keep-open barriers treat it as an attachment).
+
+Changing the resolve target of the framebuffer (setColorResolveTarget) ends the
+active pass if it resolves into a different texture, so a pass never resolves
+into a texture the caller no longer names. releaseResolveTarget(texture) is for
+a texture about to be handed over or destroyed: it ends the pass that resolves
+into it and forgets it as the framebuffer's target, so a pass reopened on the
+same framebuffer does not write it.
+---
+ plume_metal.cpp          | 104 +++++++++++++++++++++++++++++++++++++++
+ plume_metal.h            |  17 +++++++
+ plume_render_interface.h |  20 ++++++++
+ 3 files changed, 141 insertions(+)
+
+diff --git a/plume_metal.cpp b/plume_metal.cpp
+index 7ec47ad..02bb019 100644
+--- a/plume_metal.cpp
++++ b/plume_metal.cpp
+@@ -2658,6 +2658,7 @@ namespace plume {
+         startedEncoding = false;
+         pendingBarrierSrc = 0;
+         pendingBarrierDst = 0;
++        std::fill(std::begin(colorResolveTargets), std::end(colorResolveTargets), nullptr);
+         mtl = queue->mtl->commandBufferWithUnretainedReferences();
+         mtl->retain();
+         if (debugLabelCached != debugLabel) {
+@@ -2702,6 +2703,7 @@ namespace plume {
+         endActiveComputeEncoder();
+ 
+         targetFramebuffer = nullptr;
++        std::fill(std::begin(colorResolveTargets), std::end(colorResolveTargets), nullptr);
+ 
+         for (uint32_t i = 0; i < MAX_VERTEX_BUFFER_BINDINGS; i++) {
+             vertexBuffers[i] = nullptr;
+@@ -2907,6 +2909,11 @@ namespace plume {
+                 attachment = texture == targetFramebuffer->colorAttachments[j].texture;
+             }
+ 
++            // The resolve targets of a pass (setColorResolveTarget) are written when it ends: attachments too.
++            for (uint32_t j = 0; !attachment && j < MAX_RESOLVE_TARGETS; j++) {
++                attachment = (encoderResolveMask & (1U << j)) != 0 && texture == encoderResolveTargets[j];
++            }
++
+             if (attachment) {
+                 g_metalBarrierStats.attachment++;
+                 return false;
+@@ -3282,6 +3289,7 @@ namespace plume {
+         endActiveRenderEncoder();
+         handlePendingClears();
+         activeType = EncoderType::Render;
++        std::fill(std::begin(colorResolveTargets), std::end(colorResolveTargets), nullptr);
+ 
+         if (framebuffer != nullptr) {
+             const MetalFramebuffer *interfaceFramebuffer = static_cast<const MetalFramebuffer*>(framebuffer);
+@@ -3718,6 +3726,75 @@ namespace plume {
+         encoder->endEncoding();
+     }
+ 
++    void MetalCommandList::setColorResolveTarget(const uint32_t attachmentIndex, const RenderTexture *resolveTexture) {
++        if (attachmentIndex >= MAX_RESOLVE_TARGETS) {
++            return;
++        }
++
++        const MetalTexture *target = static_cast<const MetalTexture *>(resolveTexture);
++        // The active pass resolves into another texture than the one now named (or none): it must not go on
++        // and write that one at its end. (A pass that has no target and now gets one just goes on: it is
++        // not resolved at its end, and the caller's resolve takes the separate pass.)
++        if (activeRenderEncoder != nullptr && (encoderResolveMask & (1U << attachmentIndex)) != 0 && encoderResolveTargets[attachmentIndex] != target) {
++            MetalAutoreleasePool releasePool;
++            endActiveRenderEncoder();
++        }
++
++        colorResolveTargets[attachmentIndex] = target;
++    }
++
++    bool MetalCommandList::releaseResolveTarget(const RenderTexture *texture) {
++        bool released = false;
++        if (activeRenderEncoder != nullptr) {
++            for (uint32_t i = 0; i < MAX_RESOLVE_TARGETS; i++) {
++                if ((encoderResolveMask & (1U << i)) != 0 && encoderResolveTargets[i] == texture) {
++                    MetalAutoreleasePool releasePool;
++                    endActiveRenderEncoder();
++                    released = true;
++                    break;
++                }
++            }
++        }
++
++        for (uint32_t i = 0; i < MAX_RESOLVE_TARGETS; i++) {
++            if (colorResolveTargets[i] == texture) {
++                colorResolveTargets[i] = nullptr;
++                released = true;
++            }
++        }
++
++        return released;
++    }
++
++    bool MetalCommandList::resolveTextureAtPassEnd(const RenderTexture *dstTexture, const RenderTexture *srcTexture) {
++        assert(dstTexture != nullptr);
++        assert(srcTexture != nullptr);
++
++        MetalAutoreleasePool releasePool;
++        if (activeRenderEncoder == nullptr || targetFramebuffer == nullptr) {
++            lastFoldRefusal = "no active render pass";
++            return false;
++        }
++
++        if (pendingClears.active) {
++            // The barrier that follows would clear the source before the old path resolves it.
++            lastFoldRefusal = "a full clear is pending";
++            return false;
++        }
++
++        for (uint32_t i = 0; i < targetFramebuffer->colorAttachments.size() && i < MAX_RESOLVE_TARGETS; i++) {
++            if ((encoderResolveMask & (1U << i)) && targetFramebuffer->colorAttachments[i].texture == srcTexture && encoderResolveTargets[i] == dstTexture) {
++                // The pass resolves into the target as it ends.
++                endActiveRenderEncoder();
++                lastFoldRefusal = nullptr;
++                return true;
++            }
++        }
++
++        lastFoldRefusal = (encoderResolveMask == 0) ? "the pass has no resolve target (set after it began, or refused: size, format, view)" : "the pass resolves a different texture";
++        return false;
++    }
++
+     void MetalCommandList::resolveTextureRegion(const RenderTexture *dstTexture, const uint32_t dstX, const uint32_t dstY, const RenderTexture *srcTexture, const RenderRect *srcRect, RenderResolveMode resolveMode) {
+         assert(dstTexture != nullptr);
+         assert(srcTexture != nullptr);
+@@ -4153,6 +4230,28 @@ namespace plume {
+                 }
+             }
+ 
++            // A colour attachment with a resolve target (setColorResolveTarget) resolves into it as the pass
++            // ends. (The store action cannot be left Unknown and decided at the end: with a resolve texture
++            // set, Metal's validation insists on a resolve action.)
++            encoderResolveMask = 0;
++            for (uint32_t i = 0; i < targetFramebuffer->colorAttachments.size() && i < MAX_RESOLVE_TARGETS; i++) {
++                const MetalAttachment &attachment = targetFramebuffer->colorAttachments[i];
++                const MetalTexture *target = colorResolveTargets[i];
++                // Same size, same format, single-sample, a render target, and the attachment is a whole
++                // multisampled texture (no view of one mip or slice).
++                if (target == nullptr || target->mtl == nullptr || attachment.textureView != nullptr || attachment.sampleCount <= 1 ||
++                    target->desc.multisampling.sampleCount != 1 || target->mtl->width() != attachment.width || target->mtl->height() != attachment.height ||
++                    target->mtl->pixelFormat() != attachment.getTexture()->pixelFormat() || (target->mtl->usage() & MTL::TextureUsageRenderTarget) == 0) {
++                    continue;
++                }
++
++                MTL::RenderPassColorAttachmentDescriptor *colorAttachment = renderDescriptor->colorAttachments()->object(i);
++                colorAttachment->setResolveTexture(target->mtl);
++                colorAttachment->setStoreAction(MTL::StoreActionStoreAndMultisampleResolve);
++                encoderResolveMask |= 1U << i;
++                encoderResolveTargets[i] = target;
++            }
++
+             if (targetFramebuffer->samplePositionsEnabled) {
+                 renderDescriptor->setSamplePositions(targetFramebuffer->samplePositions, targetFramebuffer->sampleCount);
+             }
+@@ -4352,6 +4451,11 @@ namespace plume {
+             bindEncoderResources(activeRenderEncoder, false);
+             barrierUpdate(MetalBarrierStage::GRAPHICS, activeRenderEncoder);
+             activeRenderEncoder->updateFence(timestampQueryFence, MTL::RenderStageVertex | MTL::RenderStageFragment);
++            if (encoderResolveMask != 0) {
++                g_metalResolvePassEnds++;
++            }
++
++            encoderResolveMask = 0;
+             activeRenderEncoder->endEncoding();
+             activeRenderEncoder->release();
+             activeRenderEncoder = nullptr;
+diff --git a/plume_metal.h b/plume_metal.h
+index b136e9b..ee7605b 100644
+--- a/plume_metal.h
++++ b/plume_metal.h
+@@ -442,6 +442,10 @@ namespace plume {
+     };
+     inline MetalBarrierStats g_metalBarrierStats;
+ 
++    // Render passes that ended resolving into a resolve target (setColorResolveTarget): every one is a
++    // resolve and a store of the whole target, so the renderer counts how many a frame there are.
++    inline std::atomic<uint64_t> g_metalResolvePassEnds{0};
++
+     // One committed command buffer's time on the GPU.
+     struct MetalGpuInterval {
+         double start = 0.0;
+@@ -613,6 +617,16 @@ namespace plume {
+         bool encoderMayWriteTextures = false;
+         bool canKeepPassForBarrier(const RenderBufferBarrier *bufferBarriers, uint32_t bufferBarriersCount, const RenderTextureBarrier *textureBarriers, uint32_t textureBarriersCount);
+         void keepPassForBarrier(uint64_t sourceStageMask, uint64_t destStageMask);
++
++        // Resolve folded into a render pass (setColorResolveTarget, resolveTextureAtPassEnd). The targets
++        // set for the current framebuffer; and, for the active render encoder, the colour attachments that
++        // began with a resolve texture and the StoreAndMultisampleResolve store action, with their targets.
++        static constexpr uint32_t MAX_RESOLVE_TARGETS = 8;
++        const MetalTexture *colorResolveTargets[MAX_RESOLVE_TARGETS] = {};
++        uint32_t encoderResolveMask = 0;
++        const MetalTexture *encoderResolveTargets[MAX_RESOLVE_TARGETS] = {};
++        // Why the last resolveTextureAtPassEnd returned false.
++        const char *lastFoldRefusal = nullptr;
+         // The NSString of debugLabel, made again only when debugLabel points elsewhere.
+         const char *debugLabelCached = nullptr;
+         NS::String *debugLabelString = nullptr;
+@@ -679,6 +693,9 @@ namespace plume {
+         void copyBuffer(const RenderBuffer *dstBuffer, const RenderBuffer *srcBuffer) override;
+         void copyTexture(const RenderTexture *dstTexture, const RenderTexture *srcTexture) override;
+         void resolveTexture(const RenderTexture *dstTexture, const RenderTexture *srcTexture) override;
++        void setColorResolveTarget(uint32_t attachmentIndex, const RenderTexture *resolveTexture) override;
++        bool resolveTextureAtPassEnd(const RenderTexture *dstTexture, const RenderTexture *srcTexture) override;
++        bool releaseResolveTarget(const RenderTexture *texture) override;
+         void resolveTextureRegion(const RenderTexture *dstTexture, uint32_t dstX, uint32_t dstY, const RenderTexture *srcTexture, const RenderRect *srcRect, RenderResolveMode resolveMode) override;
+         void buildBottomLevelAS(const RenderAccelerationStructure *dstAccelerationStructure, RenderBufferReference scratchBuffer, const RenderBottomLevelASBuildInfo &buildInfo) override;
+         void buildTopLevelAS(const RenderAccelerationStructure *dstAccelerationStructure, RenderBufferReference scratchBuffer, RenderBufferReference instancesBuffer, const RenderTopLevelASBuildInfo &buildInfo) override;
+diff --git a/plume_render_interface.h b/plume_render_interface.h
+index 51d7969..659b17b 100644
+--- a/plume_render_interface.h
++++ b/plume_render_interface.h
+@@ -150,6 +150,26 @@ namespace plume {
+         virtual void copyTexture(const RenderTexture *dstTexture, const RenderTexture *srcTexture) = 0;
+         virtual void resolveTexture(const RenderTexture *dstTexture, const RenderTexture *srcTexture) = 0;
+         virtual void resolveTextureRegion(const RenderTexture *dstTexture, uint32_t dstX, uint32_t dstY, const RenderTexture *srcTexture, const RenderRect *srcRect = nullptr, RenderResolveMode resolveMode = RenderResolveMode::AVERAGE) = 0;
++        // Fable 2 (Metal): folds a multisample resolve into the end of the render pass that drew the source,
++        // instead of a pass of its own that loads the whole multisampled texture again.
++        // setColorResolveTarget names the single-sample texture that colour attachment attachmentIndex of the
++        // current framebuffer resolves into (null: none). It applies to the render passes begun from now until
++        // the next setFramebuffer; the pairing is checked (same size and format, single-sample, no view) and
++        // ignored when it does not fit. Such a pass resolves into the target EVERY time it ends (Metal wants
++        // the store action to say so when the resolve texture is set, and it is fixed when the pass begins),
++        // and stores the multisampled texture as usual: only name a target whose texture may be overwritten at
++        // the end of each of the framebuffer's passes. resolveTextureAtPassEnd(dst, src): if the active render
++        // pass has src as a colour attachment with dst as its resolve target and nothing is pending (a
++        // deferred full clear would change the result), the pass is ended now (so it resolves into dst) and
++        // this returns true: skip resolveTexture. False changes nothing: call resolveTexture. Other backends
++        // implement none of these (false). Changing the target of the current framebuffer to another texture
++        // ends the active pass if it resolves into a different one.
++        virtual void setColorResolveTarget(uint32_t attachmentIndex, const RenderTexture *resolveTexture) { (void)attachmentIndex; (void)resolveTexture; }
++        virtual bool resolveTextureAtPassEnd(const RenderTexture *dstTexture, const RenderTexture *srcTexture) { (void)dstTexture; (void)srcTexture; return false; }
++        // The texture is about to be handed to something else or destroyed: no pass may resolve into it from now
++        // on. Ends the active render pass if it resolves into it (so the pass resolves now) and forgets it as
++        // the resolve target of the current framebuffer. True if either applied.
++        virtual bool releaseResolveTarget(const RenderTexture *texture) { (void)texture; return false; }
+         virtual void buildBottomLevelAS(const RenderAccelerationStructure *dstAccelerationStructure, RenderBufferReference scratchBuffer, const RenderBottomLevelASBuildInfo &buildInfo) = 0;
+         virtual void buildTopLevelAS(const RenderAccelerationStructure *dstAccelerationStructure, RenderBufferReference scratchBuffer, RenderBufferReference instancesBuffer, const RenderTopLevelASBuildInfo &buildInfo) = 0;
+         virtual void discardTexture(const RenderTexture* texture) = 0; // D3D12 only.

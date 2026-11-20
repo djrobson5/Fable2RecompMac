@@ -30,6 +30,7 @@
 
 #include <rex/graphics/xenos.h>
 #include <rex/cvar.h>
+REXCVAR_DECLARE(bool, fable2_metal_fold_resolve);
 #include <rex/memory/utils.h>
 
 #if defined(EOT_D3D12)
@@ -511,9 +512,37 @@ bool SelectTargetImages(VideoState &s, Targets &t, const DrawClass &c) {
   return true;
 }
 
+// Metal: the single-sample twin that the multisampled colour image resolves into, to be named as the
+// resolve target of the draw passes that draw it (fable2_metal_fold_resolve; not the clear passes of
+// ClearImageToRemembered and the like). Each such pass then resolves into the twin as it ends, and
+// ResolveHostToSingle ends the last one with its resolve instead of running a pass of its own. That writes
+// the twin from the host image, so only when the host holds the newest content:
+//  - a draw that writes colour: SurfaceImageForDraw broadcast a newer twin to the host and NoteSurfaceDrawn
+//    made the host the content;
+//  - a draw that writes no colour (depth only, no pixel shader) changes nothing and broadcasts nothing: it
+//    keeps the twin the framebuffer already names while the host is still the content (the pass goes on
+//    without a split), and never names it newly (the twin may hold newer content: a copy into it, a
+//    twin-only clear).
+// Anything else names no target (null: the command list then drops the old one, ending a pass that would
+// resolve into it). Also null when the cvar is off, for the next bind whether or not the targets are cached.
+HostTexture *FoldResolveTarget(const VideoState &s, const GuestSurface &surf, const HostTexture &image,
+                               bool writes_color) {
+  if (!UseMetal() || surf.isDepth || &image != &surf.host || image.sampleCount <= 1 || !surf.single.valid() ||
+      !surf.single.texture || !REXCVAR_GET(fable2_metal_fold_resolve) ||
+      surf.content == GuestSurface::Content::Borrowed)
+    return nullptr;
+  if (writes_color)
+    return const_cast<HostTexture *>(&surf.single);
+  if (s.bound_draw_targets_valid && s.bound_resolve0 == surf.single.texture.get() &&
+      s.bound_draw_colors[0] == image.texture.get() &&
+      surf.content == GuestSurface::Content::Drawn && !surf.contentInSingle)
+    return const_cast<HostTexture *>(&surf.single);
+  return nullptr;
+}
+
 bool BindImages(VideoState &s, HostTexture *const colors[4], u32 color_count, HostTexture *depth,
-                bool init_clear) {
-  HostTextureTransition transitions[kMaxPendingTransitions + 5];
+                bool init_clear, HostTexture *resolve0 = nullptr) {
+  HostTextureTransition transitions[kMaxPendingTransitions + 6];
   u32 transition_count = 0;
   for (u32 i = 0; i < s.pending_transition_count; ++i)
     transitions[transition_count++] = s.pending_transitions[i];
@@ -522,6 +551,10 @@ bool BindImages(VideoState &s, HostTexture *const colors[4], u32 color_count, Ho
     transitions[transition_count++] = {colors[i], plume::RenderTextureLayout::COLOR_WRITE};
   if (depth)
     transitions[transition_count++] = {depth, plume::RenderTextureLayout::DEPTH_WRITE};
+  // The twin is written when the pass ends: its earlier readers (the previous frames') are ordered
+  // before the pass by the barrier, as before the resolve pass of the old path.
+  if (resolve0)
+    transitions[transition_count++] = {resolve0, plume::RenderTextureLayout::RESOLVE_DEST};
   TransitionManyLocked(s, transitions, transition_count);
   if (depth && color_count && colors[0]->sampleCount != depth->sampleCount) {
     u32 n;
@@ -535,6 +568,9 @@ bool BindImages(VideoState &s, HostTexture *const colors[4], u32 color_count, Ho
                       s.bound_draw_depth == (depth ? depth->texture.get() : nullptr);
   for (u32 i = 0; same_targets && i < color_count; ++i)
     same_targets = s.bound_draw_colors[i] == colors[i]->texture.get();
+  const plume::RenderTexture *resolve_texture = resolve0 ? resolve0->texture.get() : nullptr;
+  // The resolve target is part of the bound targets: it changes with the cvar and with where the content is.
+  same_targets = same_targets && s.bound_resolve0 == resolve_texture;
   if (same_targets) {
     s.perf.framebuffer_cache_hits++;
   } else {
@@ -545,6 +581,9 @@ bool BindImages(VideoState &s, HostTexture *const colors[4], u32 color_count, Ho
       s.command_list->setFramebuffer(fb);
       s.bound_framebuffer = fb;
     }
+    if (UseMetal())
+      s.command_list->setColorResolveTarget(0, resolve_texture);
+    s.bound_resolve0 = resolve_texture;
     s.bound_draw_color_count = color_count;
     for (u32 i = 0; i < 4; ++i)
       s.bound_draw_colors[i] = i < color_count ? colors[i]->texture.get() : nullptr;
@@ -583,7 +622,8 @@ bool BindTargets(VideoState &s, Targets &t) {
   u32 color_count = t.colorCount;
   if (t.velocity && color_count < 4)
     colors[color_count++] = &t.velocity->image;
-  if (!BindImages(s, colors, color_count, depth, true))
+  HostTexture *resolve0 = t.colorCount ? FoldResolveTarget(s, *t.color[0], *colors[0], t.writesColor) : nullptr;
+  if (!BindImages(s, colors, color_count, depth, true, resolve0))
     return false;
   if (t.velocity)
     velocity::BeforeDraw(s, *t.velocity, color_count - 1);
@@ -5848,6 +5888,7 @@ void ReplayClearLocked(VideoState &s, const ClearPacket &pk) {
     if (whole && (!surf.isDepth || clears_all(image)))
       image.needsClear = false;
     HostTexture *colors[4] = {surf.isDepth ? nullptr : &image, nullptr, nullptr, nullptr};
+    // No resolve target for a clear pass: it would resolve at its end too, for nothing.
     if (!BindImages(s, colors, surf.isDepth ? 0u : 1u, surf.isDepth ? &image : nullptr, true))
       return;
     if (surf.isDepth)

@@ -453,6 +453,9 @@ struct VideoState {
   const plume::RenderTexture *bound_draw_depth = nullptr;
   u32 bound_draw_color_count = 0;
   bool bound_draw_targets_valid = false;
+  // Metal: the texture the bound framebuffer's colour 0 resolves into (fable2_metal_fold_resolve), as told to the
+  // command list; part of what the bound targets are.
+  const plume::RenderTexture *bound_resolve0 = nullptr;
   plume::RenderBuffer *bound_root_buffer[3] = {};
   u64 bound_root_offset[3] = {};
   u64 perf_resets = 0;
@@ -576,6 +579,10 @@ u32 BindTextureSRVLocked(VideoState &s, HostTexture &host);
 u32 BindTextureSRVSwizzledLocked(VideoState &s, HostTexture &host, u32 swizzle);
 void ReleaseTextureSRVLocked(VideoState &s, HostTexture &host);
 void DrainDescriptorSlotsLocked(VideoState &s, u32 slot);
+
+// Metal: nothing may resolve into the texture from now on (it is handed to another surface or destroyed): ends
+// the pass that resolves into it and makes the next draw name its targets to the command list again.
+void ReleaseResolveTargetLocked(VideoState &s, const plume::RenderTexture *texture);
 
 void TransitionLocked(VideoState &s, HostTexture &host, plume::RenderTextureLayout layout);
 void TransitionManyLocked(VideoState &s, const HostTextureTransition *transitions, u32 count);

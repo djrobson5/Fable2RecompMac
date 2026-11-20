@@ -17,6 +17,9 @@
 #include <plume_d3d12.h>
 #endif
 
+#if defined(FABLE2_METAL_BACKEND)
+#include <plume_metal.h>
+#endif
 #include "core/logging.h"
 #include "core/memory_helpers.h"
 #include "gpu/backend.h"
@@ -33,6 +36,10 @@ REXCVAR_DEFINE_BOOL(fable2_full_height_1120, true, "Fable2",
                     "Native renderer: give 1120-wide tiled surfaces the full 720 lines");
 REXCVAR_DEFINE_BOOL(fable2_guest_msaa, true, "Fable2",
                     "Native renderer: multisample the frame-sized surfaces the game multisamples (at launch)");
+REXCVAR_DEFINE_BOOL(fable2_metal_fold_resolve, false, "Fable2",
+                    "Native renderer, Metal: end the pass that drew a multisampled surface with its host->single "
+                    "resolve (the pass's store action) instead of a render pass of its own that reloads the whole "
+                    "multisampled texture (live: takes effect when the surface's pass is next set up)");
 REXCVAR_DEFINE_BOOL(fable2_debug_skip_hw_resolve, false, "Fable2",
                     "Debug: skip the MSAA host->single resolves (cost test; the picture is wrong while on)");
 REXCVAR_DEFINE_BOOL(fable2_diag_hw_resolve, false, "Fable2",
@@ -651,11 +658,44 @@ bool ResolveHostToSingle(VideoState &s, GuestSurface &surf, const char *why) {
   surf.perfTransfers++;
   s.perf.surface_transfers++;
   surf.resolvedSinceDraw = true;
+  // Metal, fable2_metal_fold_resolve: when the pass that last drew the surface is still the open encoder
+  // and named the twin as its resolve target, it ends with the resolve (before the transitions below,
+  // whose barriers would end it first). The transitions are still made for the bookkeeping.
+  bool folded = false;
+#if defined(FABLE2_METAL_BACKEND)
+  static u32 fold_count = 0, fallback_count = 0, off_count = 0;
+  static u64 fold_log_frame = 0;
+  static const char *last_refusal = "";
+  if (UseMetal() && REXCVAR_GET(fable2_metal_fold_resolve) && !surf.isDepth && surf.host.sampleCount > 1 && surf.single.texture &&
+      surf.host.texture) {
+    folded = cmd->resolveTextureAtPassEnd(surf.single.texture.get(), surf.host.texture.get());
+    if (folded) {
+      fold_count++;
+    } else {
+      fallback_count++;
+      last_refusal = static_cast<plume::MetalCommandList *>(cmd)->lastFoldRefusal;
+    }
+  } else if (UseMetal() && !surf.isDepth && surf.host.sampleCount > 1) {
+    off_count++;
+  }
+  if ((REXCVAR_GET(fable2_metal_fold_resolve) || REXCVAR_GET(fable2_diag_hw_resolve)) && s.guest_frames >= fold_log_frame + 300) {
+    const u64 frames = s.guest_frames - fold_log_frame;
+    const u64 pass_ends = plume::g_metalResolvePassEnds.exchange(0);
+    if (fold_log_frame != 0 && fold_count + fallback_count + off_count)
+      EOT_INFO("[hw-resolve] fold (last {} frames): {} resolves folded into their pass, {} fell back to a pass of their "
+               "own{}{}, {} with the fold off; {:.2f} render passes a frame resolved at their end ({} in all)",
+               frames, fold_count, fallback_count, fallback_count ? " (last reason: " : "",
+               fallback_count ? std::string(last_refusal ? last_refusal : "?") + ")" : "", off_count,
+               static_cast<f64>(pass_ends) / static_cast<f64>(frames), pass_ends);
+    fold_log_frame = s.guest_frames;
+    fold_count = fallback_count = off_count = 0;
+  }
+#endif
   const HostTextureTransition transitions[] = {
       {&surf.host, plume::RenderTextureLayout::RESOLVE_SOURCE},
       {&surf.single, plume::RenderTextureLayout::RESOLVE_DEST}};
   TransitionManyLocked(s, transitions, 2);
-  {
+  if (!folded) {
     EOT_GPU_ZONE("resolve twin (hw)");
     cmd->resolveTexture(surf.single.texture.get(), surf.host.texture.get());
   }
@@ -773,6 +813,9 @@ void SurfaceTransferToMirror(VideoState &s, GuestSurface &surf, HostTexture &src
   const bool host_keeps = from_single && surf.host.sampleCount > 1 && surf.host.valid() &&
                           (!surf.contentInSingle || surf.imagesAgree);
   TextureReleaseBorrower(s, target);
+  // The twin's texture goes to the mirror: no pass may resolve into it any more (an open one does now).
+  if (from_single)
+    ReleaseResolveTargetLocked(s, src.texture.get());
   std::swap(target.host, src);
   target.bindingGeneration++;
   target.contentSerial++;

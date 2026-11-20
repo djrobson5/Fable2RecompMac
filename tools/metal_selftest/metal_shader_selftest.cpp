@@ -291,8 +291,10 @@ std::unique_ptr<plume::RenderShader> HostShader(plume::RenderDevice *device, con
 // GetDepthCopyPipeline, CreateHostGraphicsPipeline's dynamic state).
 std::unique_ptr<plume::RenderPipeline> CopyPipeline(plume::RenderDevice *device, plume::RenderPipelineLayout *layout,
                                                     plume::RenderShader *vs, plume::RenderShader *ps,
-                                                    plume::RenderFormat color, plume::RenderFormat depth) {
+                                                    plume::RenderFormat color, plume::RenderFormat depth,
+                                                    plume::RenderSampleCounts samples = plume::RenderSampleCount::COUNT_1) {
   plume::RenderGraphicsPipelineDesc desc;
+  desc.multisampling.sampleCount = samples;
   desc.pipelineLayout = layout;
   desc.vertexShader = vs;
   desc.pixelShader = ps;
@@ -965,6 +967,228 @@ bool RunPipelineTests(std::string *report) {
                    " with it on, " + std::to_string(kept_now) + " kept");
       }
       metal_device->keepPassOnBarrier.store(false);
+    }
+  }
+  {
+    // Resolve folded into the pass (plume patch 0021). A 2x multisampled target is cleared and drawn
+    // with a triangle whose left and bottom edges cut through pixels (a half-pixel viewport offset), so the
+    // resolve really averages. The same scene is resolved the old way (a pass of its own that loads the
+    // multisampled texture) and folded (the scene pass stores and resolves as it ends): the bytes must
+    // match. Also: a pass with a resolve target resolves into it as it ends, asked or not, and stores the
+    // multisampled texture; a barrier that ended the pass first, a pending full clear and a target of another
+    // size all make the fold refuse (false, nothing changed) so the old path still works.
+    auto blit_ms = CopyPipeline(device.get(), layout.get(), copy_vs.get(), blit_ps.get(), plume::RenderFormat::R8G8B8A8_UNORM,
+                                plume::RenderFormat::UNKNOWN, plume::RenderSampleCount::COUNT_2);
+    auto msaa = device->createTexture(plume::RenderTextureDesc::ColorTarget(
+        kSize, kSize, plume::RenderFormat::R8G8B8A8_UNORM, plume::RenderMultisampling(plume::RenderSampleCount::COUNT_2)));
+    auto single = device->createTexture(plume::RenderTextureDesc::ColorTarget(kSize, kSize, plume::RenderFormat::R8G8B8A8_UNORM));
+    auto wrong_size = device->createTexture(plume::RenderTextureDesc::ColorTarget(8, 8, plume::RenderFormat::R8G8B8A8_UNORM));
+    if (!blit_ms || !msaa || !single || !wrong_size) {
+      fail("resolve fold: test resources");
+    } else {
+      const plume::RenderTexture *msaa_color[1] = {msaa.get()};
+      auto msaa_fb = device->createFramebuffer(plume::RenderFramebufferDesc(msaa_color, 1));
+      const plume::RenderViewport half_pixel(0.5f, 0.5f, float(kSize), float(kSize), 0.0f, 1.0f);
+      const plume::RenderRect full_rect(0, 0, kSize, kSize);
+      auto read_single = [&]() {
+        list->barriers(plume::RenderBarrierStage::COPY, plume::RenderTextureBarrier(single.get(), plume::RenderTextureLayout::COPY_SOURCE));
+        list->copyTextureRegion(plume::RenderTextureCopyLocation::PlacedFootprint(readback.get(), td.format, kSize, kSize, 1, kSize),
+                                plume::RenderTextureCopyLocation::Subresource(single.get()));
+        list->end();
+        queue->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, fence.get());
+        queue->waitForCommandFence(fence.get());
+        std::vector<uint32_t> pixels(kSize * kSize);
+        std::memcpy(pixels.data(), readback->map(), sizeof(texels));
+        readback->unmap();
+        return pixels;
+      };
+      struct Mode {
+        const plume::RenderTexture *target = nullptr;       // setColorResolveTarget
+        const plume::RenderTexture *request_dst = nullptr;  // resolveTextureAtPassEnd (null: not asked)
+        bool barrier_first = false;
+        bool barrier_on_twin = false;  // the barrier is on the resolve target
+        bool retarget_null = false;    // the resolve target is taken away after the draw (setColorResolveTarget(0, null))
+        bool handoff = false;          // releaseResolveTarget after the draw, the twin gets other texels, the pass goes on
+        bool pending_clear = false;
+        bool prefill = false;
+        bool resolve_old = true;  // resolveTexture when the fold was not done
+      };
+      struct Result {
+        std::vector<uint32_t> pixels;
+        bool asked = false;
+        std::string refusal;
+      };
+      auto scene = [&](const Mode &m) {
+        Result r;
+        list->begin();
+        if (m.prefill)
+          list->copyTextureRegion(plume::RenderTextureCopyLocation::Subresource(single.get()),
+                                  plume::RenderTextureCopyLocation::PlacedFootprint(upload.get(), td.format, kSize, kSize, 1, kSize));
+        list->barriers(plume::RenderBarrierStage::GRAPHICS, plume::RenderTextureBarrier(msaa.get(), plume::RenderTextureLayout::COLOR_WRITE));
+        list->setFramebuffer(msaa_fb.get());
+        list->setColorResolveTarget(0, m.target);
+        list->clearColor(0, plume::RenderColor(0.2f, 0.4f, 0.6f, 1.0f));
+        auto draw_ms = [&]() {
+          list->setGraphicsPipelineLayout(layout.get());
+          list->setPipeline(blit_ms.get());
+          list->setGraphicsDescriptorSet(tex_set.get(), 0);
+          list->setGraphicsDescriptorSet(tex_set.get(), 1);
+          list->setGraphicsDescriptorSet(tex_set.get(), 2);
+          list->setGraphicsDescriptorSet(sampler_set.get(), 3);
+          list->setGraphicsDescriptorSet(tex_set.get(), 4);
+          list->setViewports(&half_pixel, 1);
+          list->setScissors(&full_rect, 1);
+          list->setGraphicsPushConstants(0, &pc, kCopyPushConstantByteOffset, sizeof(pc));
+          list->drawInstanced(3, 1, 0, 0);
+        };
+        draw_ms();
+        if (m.retarget_null)
+          list->setColorResolveTarget(0, nullptr);
+        if (m.handoff) {
+          r.asked = list->releaseResolveTarget(m.target);  // reused as "the release found the target"
+          list->barriers(plume::RenderBarrierStage::COPY, plume::RenderTextureBarrier(single.get(), plume::RenderTextureLayout::COPY_DEST));
+          list->copyTextureRegion(plume::RenderTextureCopyLocation::Subresource(single.get()),
+                                  plume::RenderTextureCopyLocation::PlacedFootprint(upload.get(), td.format, kSize, kSize, 1, kSize));
+          list->barriers(plume::RenderBarrierStage::GRAPHICS, plume::RenderTextureBarrier(msaa.get(), plume::RenderTextureLayout::COLOR_WRITE));
+          draw_ms();  // the pass is reopened on the same framebuffer
+          list->setFramebuffer(nullptr);
+          list->barriers(plume::RenderBarrierStage::GRAPHICS, plume::RenderTextureBarrier(msaa.get(), plume::RenderTextureLayout::RESOLVE_SOURCE));
+          r.pixels = read_single();
+          return r;
+        }
+        if (m.barrier_first)
+          list->barriers(plume::RenderBarrierStage::GRAPHICS, plume::RenderTextureBarrier(source.get(), plume::RenderTextureLayout::SHADER_READ));
+        if (m.barrier_on_twin)
+          list->barriers(plume::RenderBarrierStage::GRAPHICS, plume::RenderTextureBarrier(single.get(), plume::RenderTextureLayout::RESOLVE_DEST));
+        if (m.pending_clear)
+          list->clearColor(0, plume::RenderColor(1.0f, 0.0f, 0.0f, 1.0f));
+        if (m.request_dst) {
+          r.asked = list->resolveTextureAtPassEnd(m.request_dst, msaa.get());
+          const char *why = static_cast<plume::MetalCommandList *>(list.get())->lastFoldRefusal;
+          r.refusal = r.asked ? "" : (why ? why : "?");
+        }
+        list->barriers(plume::RenderBarrierStage::GRAPHICS, plume::RenderTextureBarrier(msaa.get(), plume::RenderTextureLayout::RESOLVE_SOURCE));
+        list->barriers(plume::RenderBarrierStage::GRAPHICS, plume::RenderTextureBarrier(single.get(), plume::RenderTextureLayout::RESOLVE_DEST));
+        if (m.resolve_old && !r.asked)
+          list->resolveTexture(single.get(), msaa.get());
+        list->setFramebuffer(nullptr);
+        r.pixels = read_single();
+        return r;
+      };
+      auto hex = [](const std::vector<uint32_t> &p) {
+        char buf[48];
+        std::snprintf(buf, sizeof(buf), "%08x %08x %08x", p[0], p[1], p[kSize]);
+        return std::string(buf);
+      };
+
+      const Result old_path = scene({});
+      bool varied = false;
+      for (uint32_t i = 1; i < kSize * kSize; ++i)
+        varied = varied || old_path.pixels[i] != old_path.pixels[0];
+      old_path.pixels[0] != 0 && varied ? pass("resolve fold: the reference scene (old path: a resolve pass of its own) resolves to " + hex(old_path.pixels) + " ...")
+                                         : fail("resolve fold: the reference scene is blank or uniform: " + hex(old_path.pixels));
+
+      Mode fold;
+      fold.target = single.get();
+      fold.request_dst = single.get();
+      const uint64_t pass_ends_before = plume::g_metalResolvePassEnds.load();
+      const Result folded = scene(fold);
+      const uint64_t pass_ends = plume::g_metalResolvePassEnds.load() - pass_ends_before;
+      pass_ends == 1 ? pass("resolve fold: one render pass ended resolving into its target (g_metalResolvePassEnds)")
+                     : fail("resolve fold: " + std::to_string(pass_ends) + " passes ended resolving, want 1");
+      folded.asked && folded.pixels == old_path.pixels
+          ? pass("resolve fold: folded into the scene pass's store action, 16/16 texels equal the old path's (" + hex(folded.pixels) + " ...)")
+          : fail(std::string("resolve fold: asked=") + (folded.asked ? "true" : "false") + " " + folded.refusal + ", texels differ from the old path: " + hex(folded.pixels));
+
+      // A pass that names a resolve target resolves into it as it ends, asked or not (Metal fixes the
+      // store action when the pass begins). Nobody asks here: the prefilled texels are overwritten.
+      Mode unused;
+      unused.target = single.get();
+      unused.prefill = true;
+      unused.resolve_old = false;
+      const Result unasked = scene(unused);
+      unasked.pixels == old_path.pixels
+          ? pass("resolve fold: a pass with a resolve target resolves into it as it ends even when nobody asks (prefilled texels replaced by the resolve)")
+          : fail("resolve fold: an unrequested resolve target holds " + hex(unasked.pixels) + ", want the resolve " + hex(old_path.pixels));
+      // The multisampled texture was stored: resolve it the old way, without drawing again.
+      list->begin();
+      list->barriers(plume::RenderBarrierStage::GRAPHICS, plume::RenderTextureBarrier(msaa.get(), plume::RenderTextureLayout::RESOLVE_SOURCE));
+      list->barriers(plume::RenderBarrierStage::GRAPHICS, plume::RenderTextureBarrier(single.get(), plume::RenderTextureLayout::RESOLVE_DEST));
+      list->resolveTexture(single.get(), msaa.get());
+      const auto stored = read_single();
+      stored == old_path.pixels ? pass("resolve fold: the multisampled texture of that pass was stored (resolving it later gives the same texels)")
+                                : fail("resolve fold: the multisampled texture was not stored by a pass with a resolve target: " + hex(stored));
+
+      Mode barrier = fold;
+      barrier.barrier_first = true;
+      const Result after_barrier = scene(barrier);
+      !after_barrier.asked && after_barrier.pixels == old_path.pixels
+          ? pass("resolve fold: refused after a barrier ended the pass (" + after_barrier.refusal + "); the old path gives the same texels")
+          : fail("resolve fold: after a barrier asked=" + std::string(after_barrier.asked ? "true" : "false") + ", " + hex(after_barrier.pixels));
+
+      // With the pass-keeping barriers on (plume patch 0020), the same unrelated barrier leaves the pass
+      // open and the fold goes through; a barrier on the resolve target itself still ends the pass.
+      plume::MetalDevice *fold_device = static_cast<plume::MetalDevice *>(device.get());
+      fold_device->keepPassOnBarrier.store(true);
+      const Result kept_open = scene(barrier);
+      Mode twin_barrier = fold;
+      twin_barrier.barrier_on_twin = true;
+      const Result twin_ended = scene(twin_barrier);
+      fold_device->keepPassOnBarrier.store(false);
+      kept_open.asked && kept_open.pixels == old_path.pixels
+          ? pass("resolve fold: a pass kept open across an unrelated barrier is then folded, 16/16 texels equal the old path's")
+          : fail("resolve fold: after a kept barrier asked=" + std::string(kept_open.asked ? "true" : "false") + " " + kept_open.refusal + ", " + hex(kept_open.pixels));
+      !twin_ended.asked && twin_ended.pixels == old_path.pixels
+          ? pass("resolve fold: a barrier on the resolve target ends the pass even with the switch on (" + twin_ended.refusal + "); the old path gives the same texels")
+          : fail("resolve fold: a barrier on the resolve target asked=" + std::string(twin_ended.asked ? "true" : "false") + ", " + hex(twin_ended.pixels));
+
+      // The target taken away mid-pass ends a pass that would resolve into it (and the fold is refused).
+      Mode retarget = fold;
+      retarget.retarget_null = true;
+      const Result taken_away = scene(retarget);
+      !taken_away.asked && taken_away.pixels == old_path.pixels
+          ? pass("resolve fold: taking the resolve target away mid-pass ends the pass that resolved into it (" + taken_away.refusal + "); the old path gives the same texels")
+          : fail("resolve fold: after taking the target away asked=" + std::string(taken_away.asked ? "true" : "false") + ", " + hex(taken_away.pixels));
+      // A texture handed over (releaseResolveTarget) is not written by the pass that is reopened on the
+      // framebuffer; without the release it is (the control).
+      Mode handoff;
+      handoff.target = single.get();
+      handoff.handoff = true;
+      const Result handed = scene(handoff);
+      const std::vector<uint32_t> sentinel_texels(texels, texels + kSize * kSize);
+      handed.asked && handed.pixels == sentinel_texels
+          ? pass("resolve fold: a texture handed over mid-frame (releaseResolveTarget) stays as it was handed, the reopened pass does not resolve into it")
+          : fail("resolve fold: after the hand-over the texture holds " + hex(handed.pixels) + (handed.asked ? "" : " (the release found no target)"));
+      Mode no_target_twin;
+      no_target_twin.prefill = true;
+      no_target_twin.resolve_old = false;
+      const Result untouched_twin = scene(no_target_twin);
+      untouched_twin.pixels == sentinel_texels
+          ? pass("resolve fold: a pass that names no target (the twin holds newer content) leaves the twin alone")
+          : fail("resolve fold: a pass without a target changed the twin: " + hex(untouched_twin.pixels));
+
+      Mode pending = fold;
+      pending.pending_clear = true;
+      const Result with_clear = scene(pending);
+      const std::vector<uint32_t> red(kSize * kSize, 0xFF0000FFu);
+      !with_clear.asked && with_clear.pixels == red
+          ? pass("resolve fold: refused with a full clear pending (" + with_clear.refusal + "); the old path resolves the cleared texture, as before")
+          : fail("resolve fold: pending clear asked=" + std::string(with_clear.asked ? "true" : "false") + ", " + hex(with_clear.pixels));
+
+      Mode wrong = fold;
+      wrong.target = wrong_size.get();
+      wrong.request_dst = wrong_size.get();
+      const Result mismatched = scene(wrong);
+      !mismatched.asked && mismatched.pixels == old_path.pixels
+          ? pass("resolve fold: a resolve target of another size is ignored (" + mismatched.refusal + ")")
+          : fail("resolve fold: a mismatched target asked=" + std::string(mismatched.asked ? "true" : "false") + ", " + hex(mismatched.pixels));
+
+      Mode not_set;
+      not_set.request_dst = single.get();
+      const Result no_target = scene(not_set);
+      !no_target.asked && no_target.pixels == old_path.pixels
+          ? pass("resolve fold: refused when the pass named no resolve target (" + no_target.refusal + ")")
+          : fail("resolve fold: without a target asked=" + std::string(no_target.asked ? "true" : "false") + ", " + hex(no_target.pixels));
     }
   }
   {

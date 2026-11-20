@@ -532,10 +532,20 @@ void ParkHostTexture(VideoState &s, HostTexture &host) {
   DestroyHostTexture(s, host);
 }
 
+void ReleaseResolveTargetLocked(VideoState &s, const plume::RenderTexture *texture) {
+  if (!UseMetal() || !texture || !s.command_list)
+    return;
+  if (s.command_list->releaseResolveTarget(texture) || s.bound_resolve0 == texture) {
+    s.bound_draw_targets_valid = false;
+    s.bound_resolve0 = nullptr;
+  }
+}
+
 void DestroyHostTexture(VideoState &s, HostTexture &host) {
   ReleaseTextureSRVLocked(s, host);
   if (host.texture) {
     const auto *dead = host.texture.get();
+    ReleaseResolveTargetLocked(s, dead);
     for (auto it = s.framebuffers.begin(); it != s.framebuffers.end();) {
       bool names_dead = false;
       for (u32 i = 0; i < it->second.attachmentCount; ++i)
