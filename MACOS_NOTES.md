@@ -306,3 +306,42 @@ files are picked up every 30 frames, next to the executable.
 Lessons: dump real data early instead of reasoning about swizzles/endianness; hide layers to find
 which draw is wrong; guest texture `baseAddress` is a virtual address (0xE0000000 alias is
 physical + 0x1000): use `mem::at` (as the texture upload does), not `mem::phys`.
+
+## MetalFX spatial upscaling (eot_upscale=metalfx)
+
+`--eot_upscale=metalfx` (native Metal backend only) draws at the internal size (`eot_resolution`) and has Apple's
+MetalFX spatial scaler fill the larger output; e.g. `--fullscreen=true --eot_resolution=1080p --eot_upscale=metalfx`.
+Where it is unavailable (Vulkan, a device MetalFX does not support, a size or format it refuses) the log says why
+once (`[metalfx] spatial upscaling unavailable (...)`) and the present uses bicubic. When it runs, the log has one
+`[metalfx] spatial WxH -> WxH, colour mode ...` line per size or format change. Like the other upscale filters it
+only applies when the output is larger than the frame image.
+
+Where: `RunMetalFxLocked` (src/gpu/present.cpp) scales the finished frame image into an intermediate of the size the
+picture is shown at (the aspect-fitted rect, rounded to whole pixels; one intermediate per frame slot), and the
+present pass then copies it 1:1 with the gamma ramp and colour adjustments as before. plume patch 0022 adds
+`MetalCommandList::encodeExternal` and `MetalSpatialScaler`.
+
+Ordering: MetalFX encodes encoders of its own, so no plume stage fence can be attached to them. Its input is
+ordered by Metal's hazard tracking (the frame image is a plain tracked texture, written by a render pass that
+`encodeExternal` ends first; it refuses pooled, heap-allocated and untracked textures, and the renderer then falls
+back to bicubic). Its output is read by the present pass through the bindless argument buffer, which hazard tracking
+does not see (with residency sets plume makes no `useResource` call), so `encodeExternal` follows MetalFX with a
+blit encoder of the copy stage that reads one texel of the output (bound directly, so tracked, so after MetalFX),
+which updates the copy stage's fence; the barrier the renderer issues on the output right after
+(`barriers(GRAPHICS, output SHADER_READ)`, the output's source stage set to copy) makes the present pass wait for that
+fence. The scaler is retained until the command buffer completes (plume's command buffers are unretained).
+
+Colour mode: the frame image is the game's finished picture, gamma-encoded display-referred colour whatever its
+storage format (the 360 gamma ramp is applied later, at present), so `auto` is always `perceptual`;
+`eot_metalfx_color` (auto|perceptual|linear|hdr) overrides. MetalFX sees storage-order channels (storeSwapRB and alpha
+swizzles are applied to its output at present), a quality matter only.
+
+A refusal at encode (a texture that is pooled, heap-allocated, untracked, not 2D) blits that one frame with bicubic
+and tries again the next; only a failure to make the scaler or its textures stops MetalFX for that size and format.
+A new size or format is taken up after 10 frames in a row (bicubic meanwhile, so a window being resized does not
+rebuild the scaler every frame). Leaving `eot_upscale=metalfx` gives the scaler and the intermediates back. MetalFX is
+weak-linked (`-weak_framework`), so the binary loads where it is missing and the bicubic fallback runs. `tools/metal_selftest` covers the scaler (fable2_metal_selftest, also under
+`MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`); its control, which leaves the barrier on the output out, reads stale
+colours in 39 of 40 iterations (0 under the validation layer, which serializes the encoders). The presets (`eot_quality_preset` other than `custom`) write `eot_upscale` at boot,
+so `metalfx` needs the default `custom`. The MetalFX pass itself is not in the `[pass-gpu]` timing: its
+encoders are MetalFX's, so no counter samples can be attached.

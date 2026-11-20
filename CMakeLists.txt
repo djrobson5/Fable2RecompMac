@@ -46,7 +46,7 @@ add_executable(Fable2 ${FABLE2_SOURCES})
 
 target_link_libraries(Fable2 PRIVATE dlmalloc)
 if(APPLE)
-    target_link_libraries(Fable2 PRIVATE "-framework Metal" "-framework Foundation" objc)
+    target_link_libraries(Fable2 PRIVATE "-framework Metal" "-Wl,-weak_framework,MetalFX" "-framework Foundation" objc)
 endif()
 
 # Generated sources, rex::runtime, platform entry point, runtime library

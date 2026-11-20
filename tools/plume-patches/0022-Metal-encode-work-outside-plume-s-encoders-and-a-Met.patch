@@ -1,0 +1,363 @@
+From 04fa776489d5d6d6a77084c6b092973c268bae83 Mon Sep 17 00:00:00 2001
+From: djrobson5 <256682087+djrobson5@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 14:45:03 -0800
+Subject: [PATCH] Metal: encode work outside plume's encoders, and a MetalFX
+ spatial scaler
+
+MetalCommandList::encodeExternal(reads, written, fn) ends the active
+encoder as a barrier does (the encoders before it update their stage
+fences, a kept pass applies its barrier), calls fn with the
+MTL::CommandBuffer, and orders what fn wrote before the work after it.
+MetalFX makes encoders of its own, so no stage fence can be attached to
+them. The order comes from Metal's hazard tracking instead: the textures
+read and written must be plain tracked textures (not pooled, heap
+allocated or drawables; the call returns false otherwise), and a blit
+encoder of the copy stage then reads a texel of each written texture
+straight away. The blit is bound to the texture directly, so Metal makes
+it wait for the external writes, and its end updates the copy stage's
+fence, which the next barriers() call naming the written texture (its
+barrierStages are set to copy) carries to the encoders after it. This is
+needed because with residency sets plume makes no useResource call, so a
+read through a descriptor set is invisible to hazard tracking.
+
+MetalSpatialScaler wraps MTLFXSpatialScaler: isSupported, create for one
+input and output size and format (and colour processing mode),
+outputTextureFlags for the output texture, and encode, which checks the
+sizes, formats and usage of both textures and runs the scaler through
+encodeExternal. The command buffer is unretained, so encode retains the
+scaler until the buffer completes.
+---
+ plume_metal.cpp | 200 ++++++++++++++++++++++++++++++++++++++++++++++++
+ plume_metal.h   |  63 +++++++++++++++
+ 2 files changed, 263 insertions(+)
+
+diff --git a/plume_metal.cpp b/plume_metal.cpp
+index 02bb019..6891074 100644
+--- a/plume_metal.cpp
++++ b/plume_metal.cpp
+@@ -8,9 +8,11 @@
+ #define NS_PRIVATE_IMPLEMENTATION
+ #define CA_PRIVATE_IMPLEMENTATION
+ #define MTL_PRIVATE_IMPLEMENTATION
++#define MTLFX_PRIVATE_IMPLEMENTATION
+ 
+ #include <Foundation/Foundation.hpp>
+ #include <Metal/Metal.hpp>
++#include <MetalFX/MetalFX.hpp>
+ #include <QuartzCore/QuartzCore.hpp>
+ #include <CoreFoundation/CoreFoundation.h>
+ 
+@@ -2646,6 +2648,10 @@ namespace plume {
+ 
+         timestampQueryFence->release();
+ 
++        if (externalScratch != nullptr) {
++            externalScratch->release();
++        }
++
+         if (debugLabelString != nullptr) {
+             debugLabelString->release();
+         }
+@@ -3698,6 +3704,64 @@ namespace plume {
+         activeBlitEncoder->copyFromTexture(src->mtl, dst->mtl);
+     }
+ 
++    // True when plume can rely on Metal's hazard tracking for the texture: a plain texture (not in a pool or heap)
++    // created with the default, tracked, hazard tracking mode, that is not framebuffer-only (a drawable of the swap
++    // chain is: it cannot be read by a blit or a scaler either).
++    static bool isHazardTrackedTexture(const RenderTexture *texture) {
++        const ExtendedRenderTexture *extended = static_cast<const ExtendedRenderTexture *>(texture);
++        const MTL::Texture *mtlTexture = extended->getTexture();
++        return mtlTexture != nullptr && !extended->isPooled() && mtlTexture->heap() == nullptr && !mtlTexture->framebufferOnly() && mtlTexture->hazardTrackingMode() != MTL::HazardTrackingModeUntracked;
++    }
++
++    bool MetalCommandList::encodeExternal(const RenderTexture *const *readTextures, const uint32_t readTextureCount, const RenderTexture *const *writtenTextures, const uint32_t writtenTextureCount, const std::function<void(MTL::CommandBuffer *)> &encode) {
++        assert(encode);
++        assert(mtl != nullptr);
++
++        MetalAutoreleasePool releasePool;
++        for (uint32_t i = 0; i < readTextureCount; i++) {
++            if (!isHazardTrackedTexture(readTextures[i])) {
++                return false;
++            }
++        }
++
++        for (uint32_t i = 0; i < writtenTextureCount; i++) {
++            if (!isHazardTrackedTexture(writtenTextures[i])) {
++                return false;
++            }
++        }
++
++        // The encoders before end as at a barrier: the stage fences they update, the barrier a kept pass holds.
++        endOtherEncoders(EncoderType::None);
++        handlePendingClears();
++
++        encode(mtl);
++        startedEncoding = true;
++
++        if (writtenTextureCount == 0) {
++            return true;
++        }
++
++        if (externalScratch == nullptr) {
++            // One texel of any format fits: a read of 16 bytes at most (RGBA32), a row and an image of 256.
++            externalScratch = device->mtl->newBuffer(256, MTL::ResourceStorageModePrivate | MTL::ResourceHazardTrackingModeUntracked);
++            externalScratch->setLabel(MTLSTR("External Pass Scratch"));
++        }
++
++        // The ordering reads: a blit encoder of the copy stage reads a texel of each written texture. The texture
++        // is bound to it directly, so Metal's hazard tracking makes it wait for the external work's writes.
++        checkActiveBlitEncoder();
++        activeBlitEncoder->pushDebugGroup(MTLSTR("External Pass Order"));
++        for (uint32_t i = 0; i < writtenTextureCount; i++) {
++            ExtendedRenderTexture *texture = static_cast<ExtendedRenderTexture *>(const_cast<RenderTexture *>(writtenTextures[i]));
++            activeBlitEncoder->copyFromTexture(texture->getTexture(), 0, 0, MTL::Origin(0, 0, 0), MTL::Size(1, 1, 1), externalScratch, 0, 256, 256);
++
++            // What a barriers() call on the texture takes as its source stage.
++            texture->barrierStages = RenderBarrierStage::COPY;
++        }
++        activeBlitEncoder->popDebugGroup();
++        return true;
++    }
++
+     void MetalCommandList::resolveTexture(const RenderTexture *dstTexture, const RenderTexture *srcTexture) {
+         assert(dstTexture != nullptr);
+         assert(srcTexture != nullptr);
+@@ -5242,6 +5306,142 @@ namespace plume {
+         }
+     }
+ 
++    // MetalSpatialScaler
++
++    static MTLFX::SpatialScalerColorProcessingMode mapColorMode(MetalSpatialScaler::ColorMode mode) {
++        switch (mode) {
++        case MetalSpatialScaler::ColorMode::Linear:
++            return MTLFX::SpatialScalerColorProcessingModeLinear;
++        case MetalSpatialScaler::ColorMode::HDR:
++            return MTLFX::SpatialScalerColorProcessingModeHDR;
++        default:
++            return MTLFX::SpatialScalerColorProcessingModePerceptual;
++        }
++    }
++
++    bool MetalSpatialScaler::isSupported(const MetalDevice *device) {
++        return device != nullptr && device->mtl != nullptr && MTLFX::SpatialScalerDescriptor::supportsDevice(device->mtl);
++    }
++
++    std::unique_ptr<MetalSpatialScaler> MetalSpatialScaler::create(MetalDevice *device, const Desc &desc, std::string *error) {
++        auto fail = [&](const char *why) -> std::unique_ptr<MetalSpatialScaler> {
++            if (error != nullptr) {
++                *error = why;
++            }
++
++            return nullptr;
++        };
++
++        MetalAutoreleasePool releasePool;
++        if (!isSupported(device)) {
++            return fail("MetalFX spatial scaling is not supported on this device");
++        }
++
++        if (desc.inputWidth == 0 || desc.inputHeight == 0 || desc.outputWidth < desc.inputWidth || desc.outputHeight < desc.inputHeight) {
++            return fail("the output is not at least as large as the input");
++        }
++
++        MTLFX::SpatialScalerDescriptor *descriptor = MTLFX::SpatialScalerDescriptor::alloc()->init();
++        descriptor->setColorTextureFormat(mapPixelFormat(desc.colorFormat));
++        descriptor->setOutputTextureFormat(mapPixelFormat(desc.outputFormat));
++        descriptor->setInputWidth(desc.inputWidth);
++        descriptor->setInputHeight(desc.inputHeight);
++        descriptor->setOutputWidth(desc.outputWidth);
++        descriptor->setOutputHeight(desc.outputHeight);
++        descriptor->setColorProcessingMode(mapColorMode(desc.colorMode));
++        MTLFX::SpatialScaler *scaler = descriptor->newSpatialScaler(device->mtl);
++        descriptor->release();
++        if (scaler == nullptr) {
++            return fail("newSpatialScaler returned nil (a size or format MetalFX does not support)");
++        }
++
++        auto result = std::make_unique<MetalSpatialScaler>();
++        result->device = device;
++        result->scaler = scaler;
++        result->desc = desc;
++        result->colorUsage = scaler->colorTextureUsage();
++        result->outputUsage = scaler->outputTextureUsage();
++        return result;
++    }
++
++    MetalSpatialScaler::~MetalSpatialScaler() {
++        if (scaler != nullptr) {
++            // A command buffer in flight holds its own reference (see encode).
++            scaler->release();
++        }
++    }
++
++    RenderTextureFlags MetalSpatialScaler::outputTextureFlags() const {
++        RenderTextureFlags flags = RenderTextureFlag::NONE;
++        if (outputUsage & MTL::TextureUsageShaderWrite) {
++            flags |= RenderTextureFlag::UNORDERED_ACCESS;
++        }
++
++        if (outputUsage & MTL::TextureUsageRenderTarget) {
++            flags |= RenderTextureFlag::RENDER_TARGET;
++        }
++
++        return flags;
++    }
++
++    bool MetalSpatialScaler::encode(MetalCommandList *list, const RenderTexture *input, const RenderTexture *output, std::string *error) {
++        auto fail = [&](const char *why) {
++            if (error != nullptr) {
++                *error = why;
++            }
++
++            return false;
++        };
++
++        if (list == nullptr || input == nullptr || output == nullptr || scaler == nullptr) {
++            return fail("no command list or texture");
++        }
++
++        const ExtendedRenderTexture *in = static_cast<const ExtendedRenderTexture *>(input);
++        const ExtendedRenderTexture *out = static_cast<const ExtendedRenderTexture *>(output);
++        MTL::Texture *inTexture = in->getTexture();
++        MTL::Texture *outTexture = out->getTexture();
++        if (inTexture == nullptr || outTexture == nullptr) {
++            return fail("a texture is not a Metal texture");
++        }
++
++        if (inTexture->width() != desc.inputWidth || inTexture->height() != desc.inputHeight || inTexture->pixelFormat() != mapPixelFormat(desc.colorFormat) || inTexture->sampleCount() != 1 || inTexture->textureType() != MTL::TextureType2D) {
++            return fail("the input texture does not match the scaler's input size or format (or is not a single-sample 2D texture)");
++        }
++
++        if (outTexture->width() != desc.outputWidth || outTexture->height() != desc.outputHeight || outTexture->pixelFormat() != mapPixelFormat(desc.outputFormat)) {
++            return fail("the output texture does not match the scaler's output size or format");
++        }
++
++        if ((inTexture->usage() & colorUsage) != colorUsage) {
++            return fail("the input texture lacks the usage the scaler needs");
++        }
++
++        if ((outTexture->usage() & outputUsage) != outputUsage) {
++            return fail("the output texture lacks the usage the scaler needs");
++        }
++
++        MTLFX::SpatialScaler *spatialScaler = scaler;
++        const bool encoded = list->encodeExternal(&input, 1, &output, 1, [spatialScaler, inTexture, outTexture](MTL::CommandBuffer *commandBuffer) {
++            spatialScaler->setColorTexture(inTexture);
++            spatialScaler->setOutputTexture(outTexture);
++            spatialScaler->setInputContentWidth(inTexture->width());
++            spatialScaler->setInputContentHeight(inTexture->height());
++            spatialScaler->encodeToCommandBuffer(commandBuffer);
++
++            // The command buffer is unretained: the scaler lives until the buffer completes even if the caller
++            // drops it. The scaler keeps the two textures set above until its next encode or its release, so
++            // the textures of the last buffer live until that buffer completes too (the scaler's last reference
++            // is the handler's), whatever the caller does with its own references.
++            spatialScaler->retain();
++            commandBuffer->addCompletedHandler([spatialScaler](MTL::CommandBuffer *) {
++                spatialScaler->release();
++            });
++        });
++
++        return encoded ? true : fail("a texture is not hazard-tracked (pooled, heap-allocated or untracked)");
++    }
++
+     // MetalInterface
+ 
+     MetalInterface::MetalInterface() {
+diff --git a/plume_metal.h b/plume_metal.h
+index ee7605b..8cea400 100644
+--- a/plume_metal.h
++++ b/plume_metal.h
+@@ -10,6 +10,8 @@
+ #include <atomic>
+ #include <condition_variable>
+ #include <cstdint>
++#include <functional>
++#include <memory>
+ #include <mutex>
+ #include <set>
+ #include <string>
+@@ -24,6 +26,10 @@
+ #include <QuartzCore/QuartzCore.hpp>
+ #include <TargetConditionals.h>
+ 
++namespace MTLFX {
++    class SpatialScaler;
++}
++
+ /// macOS
+ #ifndef PLUME_MACOS
+ #    define PLUME_MACOS                (TARGET_OS_OSX || TARGET_OS_MACCATALYST)
+@@ -722,6 +728,22 @@ namespace plume {
+         void setCommonClearState() const;
+         void handlePendingClears();
+ 
++        // Work that encodes into the MTL::CommandBuffer by itself, outside plume's encoders (MetalFX's scalers
++        // make encoders of their own). Ends the active encoder as a barrier would (the encoders before it
++        // update their stage fences, a kept pass applies its barrier), calls encode with the command buffer, and
++        // then orders what it wrote before the work after it:
++        //  - readTextures: read by the external work. Their writers, the encoders before, are ordered before the
++        //    external work by Metal's own hazard tracking, so each must be a plain, tracked texture (not in a
++        //    pool, not a drawable): the call refuses (returns false, encodes nothing) for another one.
++        //  - writtenTextures: written by the external work and read afterwards through plume (a descriptor set:
++        //    with residency sets plume makes no useResource call, so Metal does not see that use). A blit encoder
++        //    of plume's copy stage reads a texel of each straight away; the tracking orders it after the external
++        //    work, and the copy stage's fence it updates when it ends is what the texture's barrier then carries to
++        //    the encoders after the next barriers() call naming the texture (the textures' barrierStages are set to
++        //    copy). The caller must issue that barrier before reading the texture.
++        bool encodeExternal(const RenderTexture *const *readTextures, uint32_t readTextureCount, const RenderTexture *const *writtenTextures, uint32_t writtenTextureCount, const std::function<void(MTL::CommandBuffer *)> &encode);
++        MTL::Buffer *externalScratch = nullptr;
++
+         void barrierWait(MetalBarrierStage stage, MTL::RenderCommandEncoder* encoder);
+         void barrierWait(MetalBarrierStage stage, MTL::ComputeCommandEncoder* encoder);
+         void barrierWait(MetalBarrierStage stage, MTL::BlitCommandEncoder* encoder);
+@@ -1063,6 +1085,47 @@ namespace plume {
+         void removeResource(MTL::Resource *resource, bool addressable = false);
+     };
+ 
++    // MetalFX spatial upscaler (MTLFXSpatialScaler): one scaler for one input size and format, output size and
++    // format. The caller owns the output textures (create them with outputTextureFlags()); encode() runs the
++    // scaler on a command list through MetalCommandList::encodeExternal.
++    struct MetalSpatialScaler {
++        enum class ColorMode { Perceptual, Linear, HDR };
++
++        struct Desc {
++            RenderFormat colorFormat = RenderFormat::UNKNOWN;
++            RenderFormat outputFormat = RenderFormat::UNKNOWN;
++            uint32_t inputWidth = 0;
++            uint32_t inputHeight = 0;
++            uint32_t outputWidth = 0;
++            uint32_t outputHeight = 0;
++            ColorMode colorMode = ColorMode::Perceptual;
++        };
++
++        MetalDevice *device = nullptr;
++        MTLFX::SpatialScaler *scaler = nullptr;
++        Desc desc;
++        // Usage the scaler needs of its textures (colorTextureUsage / outputTextureUsage).
++        uint64_t colorUsage = 0;
++        uint64_t outputUsage = 0;
++
++        MetalSpatialScaler() = default;
++        // The destructor releases the scaler: a copy would release it twice.
++        MetalSpatialScaler(const MetalSpatialScaler &) = delete;
++        MetalSpatialScaler &operator=(const MetalSpatialScaler &) = delete;
++
++        // MTLFXSpatialScalerDescriptor supportsDevice for the device.
++        static bool isSupported(const MetalDevice *device);
++        // nullptr, with the reason in *error, when MetalFX is not available or refuses the description.
++        static std::unique_ptr<MetalSpatialScaler> create(MetalDevice *device, const Desc &desc, std::string *error);
++        ~MetalSpatialScaler();
++        // The flags the output texture needs (RenderTextureDesc::flags).
++        RenderTextureFlags outputTextureFlags() const;
++        // Scales input (desc.inputWidth x inputHeight, colorFormat) into output (outputWidth x outputHeight,
++        // outputFormat). false, with the reason in *error, encodes nothing. Afterwards the caller issues
++        // barriers() for output before sampling it (see MetalCommandList::encodeExternal).
++        bool encode(MetalCommandList *list, const RenderTexture *input, const RenderTexture *output, std::string *error);
++    };
++
+     struct MetalInterface : RenderInterface {
+         std::vector<std::string> deviceNames;
+         RenderInterfaceCapabilities capabilities;

@@ -165,7 +165,7 @@ if(APPLE AND FABLE2_METAL_BACKEND)
         "${FABLE2_THIRDPARTY}/XenosRecomp/thirdparty/smol-v/source")
     target_link_libraries(fable2_metal_selftest PRIVATE
         plume spirv-cross-msl fable2_shader_cache libzstd_static
-        "-framework Metal" "-framework QuartzCore" "-framework Foundation" "-framework CoreFoundation"
+        "-framework Metal" "-Wl,-weak_framework,MetalFX" "-framework QuartzCore" "-framework Foundation" "-framework CoreFoundation"
         "-framework Cocoa" "-framework IOSurface" "-framework IOKit")
 endif()
 
@@ -185,6 +185,7 @@ target_link_libraries(Fable2 PRIVATE
     "-framework Cocoa"
     "-framework QuartzCore"
     "-framework Metal"
+    "-Wl,-weak_framework,MetalFX"
     "-framework Foundation"
     "-framework CoreFoundation"
     "-framework IOKit"

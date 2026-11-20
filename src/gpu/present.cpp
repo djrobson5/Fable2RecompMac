@@ -86,6 +86,8 @@ REXCVAR_DEFINE_BOOL(fable2_lazy_clears, true, "Fable2",
 REXCVAR_DEFINE_BOOL(fable2_lazy_render_pass, true, "Fable2",
                     "Native renderer: a render pass ends only when a draw needs another framebuffer");
 
+REXCVAR_DECLARE(std::string, eot_upscale);
+REXCVAR_DECLARE(std::string, eot_metalfx_color);
 namespace eot::gpu { extern std::atomic<u64> g_pop_events, g_pop_draws; }
 namespace eot::gpu {
 
@@ -970,6 +972,230 @@ static void LogLateReads(const VideoState &s) {
 REXCVAR_DEFINE_BOOL(fable2_present_guest_memory, false, "Fable2",
                     "Debug: present the front buffer from guest memory (videos written by the CPU)");
 
+namespace {
+
+// Logs a MetalFX fallback once per reason (the frame that asks for it repeats every frame).
+void MetalFxFallbackOnce(const std::string &why) {
+  static std::vector<std::string> logged;
+  if (std::find(logged.begin(), logged.end(), why) != logged.end() || logged.size() >= 64)
+    return;
+  logged.push_back(why);
+  EOT_WARN("[metalfx] spatial upscaling unavailable ({}); using bicubic", why);
+}
+
+#if defined(FABLE2_METAL_BACKEND)
+// eot_upscale=metalfx: the finished frame image (internal size) is scaled by MetalFX's spatial scaler into an
+// intermediate image of the size it is shown at, and the present pass copies that 1:1 (still applying the gamma
+// ramp and colour adjustments). One intermediate per frame slot: the present pass reads it through the bindless
+// table, so the scaler's next write to it must wait for that slot's fence (AdvanceAndWaitReused does).
+struct MetalFxPresent {
+  std::unique_ptr<plume::MetalSpatialScaler> scaler;
+  HostTexture out[kNumFrames];
+  plume::MetalSpatialScaler::Desc desc;
+  // The description the last creation failed for; not retried until it changes. Only a failure to make the
+  // scaler or its textures latches: a refusal at encode is a property of that frame's image, for that frame.
+  bool failed = false;
+  plume::MetalSpatialScaler::Desc failed_desc;
+  // A description that differs from the one in use is taken up once it has been asked for on this many frames
+  // in a row (a window being resized asks for a new size every frame; bicubic in between).
+  static constexpr u32 kStableFrames = 10;
+  plume::MetalSpatialScaler::Desc pending;
+  u32 pending_frames = 0;
+};
+
+MetalFxPresent *g_metalfx = nullptr;
+
+bool SameScalerDesc(const plume::MetalSpatialScaler::Desc &a, const plume::MetalSpatialScaler::Desc &b) {
+  return a.colorFormat == b.colorFormat && a.outputFormat == b.outputFormat && a.inputWidth == b.inputWidth &&
+         a.inputHeight == b.inputHeight && a.outputWidth == b.outputWidth && a.outputHeight == b.outputHeight &&
+         a.colorMode == b.colorMode;
+}
+
+void DestroyMetalFxOutputs(VideoState &s, MetalFxPresent &fx) {
+  for (HostTexture &out : fx.out) {
+    if (out.valid())
+      DestroyHostTexture(s, out);
+    out = HostTexture{};
+  }
+}
+
+// eot_upscale left metalfx (or the renderer is shutting it down): the scaler holds the last front image and the
+// intermediates are ~46 MB each at 3024x1701; give both back (a command buffer in flight keeps what it needs).
+void ReleaseMetalFxLocked(VideoState &s) {
+  if (!g_metalfx)
+    return;
+  MetalFxPresent &fx = *g_metalfx;
+  if (!fx.scaler && !fx.failed && !fx.out[0].valid() && !fx.out[1].valid())
+    return;
+  fx.scaler.reset();
+  DestroyMetalFxOutputs(s, fx);
+  fx = MetalFxPresent{};
+}
+
+const char *ColorModeName(plume::MetalSpatialScaler::ColorMode mode) {
+  switch (mode) {
+  case plume::MetalSpatialScaler::ColorMode::Linear:
+    return "linear";
+  case plume::MetalSpatialScaler::ColorMode::HDR:
+    return "hdr";
+  default:
+    return "perceptual";
+  }
+}
+
+const char *FormatName(plume::RenderFormat format) {
+  switch (format) {
+  case plume::RenderFormat::R8G8B8A8_UNORM:
+    return "R8G8B8A8_UNORM";
+  case plume::RenderFormat::B8G8R8A8_UNORM:
+    return "B8G8R8A8_UNORM";
+  case plume::RenderFormat::R16G16B16A16_FLOAT:
+    return "R16G16B16A16_FLOAT";
+  case plume::RenderFormat::R16G16B16A16_UNORM:
+    return "R16G16B16A16_UNORM";
+  case plume::RenderFormat::R11G11B10_FLOAT:
+    return "R11G11B10_FLOAT";
+  default:
+    return "other";
+  }
+}
+
+// The colour processing mode. The image is the game's finished picture: the values the display shows after the
+// gamma ramp (applied later, at present), so they are gamma-encoded, display-referred colour in [0, 1] whatever
+// the storage format (UNORM or float): perceptual, MetalFX's mode for that. linear and hdr only as explicit
+// overrides of eot_metalfx_color. MetalFX sees the channels in storage order (storeSwapRB, and alpha swizzles,
+// are applied to its output at present, not to its input): at most a slightly different weighting of the colours,
+// a quality matter.
+plume::MetalSpatialScaler::ColorMode ChooseMetalFxColorMode() {
+  using Mode = plume::MetalSpatialScaler::ColorMode;
+  const std::string choice = REXCVAR_GET(eot_metalfx_color);
+  if (choice == "linear")
+    return Mode::Linear;
+  if (choice == "hdr")
+    return Mode::HDR;
+  return Mode::Perceptual;
+}
+
+// Scales `front` into the intermediate of the current frame slot and returns it, ready to be sampled by the
+// present pass; nullptr when the frame is not scaled this way (the caller then blits with the bicubic filter).
+// The size the image is shown at is rounded to whole pixels in place (fit_x, fit_y, fit_w, fit_h), so the present
+// pass maps one pixel of the intermediate to one pixel of the output.
+HostTexture *RunMetalFxLocked(VideoState &s, GuestTexture &front, float &fit_x, float &fit_y, float &fit_w,
+                              float &fit_h) {
+  if (!g_metalfx)
+    g_metalfx = new MetalFxPresent;
+  MetalFxPresent &fx = *g_metalfx;
+  if (!UseMetal()) {
+    MetalFxFallbackOnce("the renderer runs on Vulkan, MetalFX needs the native Metal backend");
+    return nullptr;
+  }
+  auto *list = static_cast<plume::MetalCommandList *>(s.command_list);
+  auto *device = static_cast<plume::MetalDevice *>(s.device.get());
+  if (!front.host.texture || front.host.isDepth)
+    return nullptr;
+  // The size and format of the Metal texture itself, not the HostTexture's bookkeeping of them.
+  const plume::RenderTextureDesc &image = static_cast<plume::ExtendedRenderTexture *>(front.host.texture.get())->desc;
+  const u32 in_w = image.width, in_h = image.height;
+  const u32 out_w = static_cast<u32>(std::lround(fit_w)), out_h = static_cast<u32>(std::lround(fit_h));
+  // Only an upscale, by the rule of the other filters (SelectPresentBlitMode).
+  if (!in_w || !in_h || in_w >= out_w * 0.98f || in_h >= out_h * 0.98f || image.multisampling.sampleCount != 1)
+    return nullptr;
+
+  plume::MetalSpatialScaler::Desc want;
+  want.colorFormat = want.outputFormat = image.format;
+  want.inputWidth = in_w;
+  want.inputHeight = in_h;
+  want.outputWidth = out_w;
+  want.outputHeight = out_h;
+  want.colorMode = ChooseMetalFxColorMode();
+  if (fx.failed && SameScalerDesc(want, fx.failed_desc))
+    return nullptr;
+
+  if (fx.scaler && SameScalerDesc(want, fx.desc)) {
+    fx.pending_frames = 0;
+  } else {
+    // Sizes or formats changed (window resize, fullscreen toggle, another front image): a new scaler and
+    // intermediates, once the change has lasted a few frames. The old ones go to the graveyards; a command
+    // buffer in flight keeps its scaler alive.
+    if (fx.pending_frames == 0 || !SameScalerDesc(want, fx.pending)) {
+      fx.pending = want;
+      fx.pending_frames = 0;
+    }
+    if (++fx.pending_frames < MetalFxPresent::kStableFrames)
+      return nullptr;
+    fx.pending_frames = 0;
+    fx.scaler.reset();
+    DestroyMetalFxOutputs(s, fx);
+    std::string why;
+    if (!plume::MetalSpatialScaler::isSupported(device)) {
+      why = "MTLFXSpatialScalerDescriptor supportsDevice is false for this device";
+    } else {
+      fx.scaler = plume::MetalSpatialScaler::create(device, want, &why);
+    }
+    if (fx.scaler) {
+      plume::RenderTextureDesc desc;
+      desc.dimension = plume::RenderTextureDimension::TEXTURE_2D;
+      desc.width = out_w;
+      desc.height = out_h;
+      desc.depth = 1;
+      desc.mipLevels = 1;
+      desc.arraySize = 1;
+      desc.format = want.outputFormat;
+      desc.flags = fx.scaler->outputTextureFlags();
+      desc.committed = true;
+      for (HostTexture &out : fx.out) {
+        out.texture = CreateHostTexture(s.device.get(), desc, "metalfx-out");
+        if (!out.valid()) {
+          why = "the intermediate texture could not be created";
+          break;
+        }
+        out.desc = desc;
+        out.format = desc.format;
+        out.viewDimension = plume::RenderTextureViewDimension::TEXTURE_2D;
+        out.width = out_w;
+        out.height = out_h;
+        out.layout = plume::RenderTextureLayout::UNKNOWN;
+      }
+    }
+    if (!fx.scaler || !why.empty()) {
+      fx.scaler.reset();
+      DestroyMetalFxOutputs(s, fx);
+      fx.failed = true;
+      fx.failed_desc = want;
+      MetalFxFallbackOnce(std::format("{}x{} -> {}x{}: {}", in_w, in_h, out_w, out_h, why));
+      return nullptr;
+    }
+    fx.failed = false;
+    fx.desc = want;
+    EOT_INFO("[metalfx] spatial {}x{} -> {}x{}, colour mode {} (eot_metalfx_color={}), image format {}", in_w, in_h,
+             out_w, out_h, ColorModeName(want.colorMode), REXCVAR_GET(eot_metalfx_color),
+             FormatName(want.colorFormat));
+  }
+
+  HostTexture &out = fx.out[s.recording_slot()];
+  std::string why;
+  if (!fx.scaler->encode(list, front.host.texture.get(), out.texture.get(), &why)) {
+    // Nothing was encoded. The refusal is about this frame's texture (pooled, heap, untracked, not 2D, ...): this
+    // frame is blitted with bicubic, the scaler stays, the next frame tries again.
+    MetalFxFallbackOnce(why);
+    return nullptr;
+  }
+  // The barrier carries the order of the scaler's writes (see MetalCommandList::encodeExternal) to the present
+  // pass; the layout is set here, not through TransitionLocked, which may defer it or skip a repeat.
+  plume::RenderTextureBarrier to_read(out.texture.get(), plume::RenderTextureLayout::SHADER_READ);
+  s.command_list->barriers(plume::RenderBarrierStage::GRAPHICS, &to_read, 1);
+  out.layout = plume::RenderTextureLayout::SHADER_READ;
+
+  fit_w = static_cast<float>(out_w);
+  fit_h = static_cast<float>(out_h);
+  fit_x = std::floor((s.swap_chain->getWidth() - fit_w) * 0.5f);
+  fit_y = std::floor((s.swap_chain->getHeight() - fit_h) * 0.5f);
+  return &out;
+}
+#endif
+
+}  // namespace
+
 void PresentLocked(VideoState &s, u32 front_buffer_texture_va) {
   UploadRingFramePresented();
   LogWindowMisses(s);
@@ -1071,6 +1297,13 @@ void PresentLocked(VideoState &s, u32 front_buffer_texture_va) {
   const float out_w = static_cast<float>(s.swap_chain->getWidth());
   const float out_h = static_cast<float>(s.swap_chain->getHeight());
   float fit_w = out_w, fit_h = out_h, fit_x = 0.0f, fit_y = 0.0f;
+  // What the blit samples: the front image, or its MetalFX-scaled copy (eot_upscale=metalfx).
+  HostTexture *blit_source = front ? &front->host : nullptr;
+#if defined(FABLE2_METAL_BACKEND)
+  const bool metalfx_on = REXCVAR_GET(eot_upscale) == "metalfx";
+  if (!metalfx_on)
+    ReleaseMetalFxLocked(s);
+#endif
   if (src_index != kInvalidDescriptorIndex) {
     ApplyAspectRatio();
     if (TakeMovieDrawnFlag())
@@ -1084,6 +1317,18 @@ void PresentLocked(VideoState &s, u32 front_buffer_texture_va) {
     }
     fit_x = (out_w - fit_w) * 0.5f;
     fit_y = (out_h - fit_h) * 0.5f;
+#if defined(FABLE2_METAL_BACKEND)
+    if (front && metalfx_on) {
+      // The frame image scaled by MetalFX, to the size it is shown at: the present pass copies it 1:1.
+      if (HostTexture *scaled = RunMetalFxLocked(s, *front, fit_x, fit_y, fit_w, fit_h)) {
+        blit_source = scaled;
+        src_index = BindTextureSRVSwizzledLocked(s, *scaled, SamplingSwizzle(*front, front->fetch[3] >> 1));
+      }
+    }
+#else
+    if (front && REXCVAR_GET(eot_upscale) == "metalfx")
+      MetalFxFallbackOnce("this build has no Metal backend");
+#endif
   }
 
   cmd->setFramebuffer(s.swap_framebuffers[image].get());
@@ -1114,7 +1359,7 @@ void PresentLocked(VideoState &s, u32 front_buffer_texture_va) {
     pc.resourceDescriptorIndex = src_index;
     pc.resourceDescriptorIndex2 = lut_index != kInvalidDescriptorIndex ? lut_index : 0u;
     pc.param0 = 1.0f;
-    SelectPresentBlitMode(front->host.width, front->host.height, fit_w, fit_h, pc.extra);
+    SelectPresentBlitMode(blit_source->width, blit_source->height, fit_w, fit_h, pc.extra);
     pc.colorAdjust[0] = static_cast<float>(std::clamp(Settings::Brightness(), -0.5, 0.5));
     pc.colorAdjust[1] = static_cast<float>(std::clamp(Settings::Contrast(), 0.25, 3.0));
     pc.colorAdjust[2] = static_cast<float>(std::clamp(Settings::Saturation(), 0.0, 3.0));
@@ -1287,8 +1532,16 @@ void Video::PresentOverlayOnly() {
 
 }
 
-REXCVAR_DEFINE_STRING(eot_upscale, "bicubic", "EdgeOfTime/Graphics", "Filter used for upscaling")
-    .allowed({"bilinear", "bicubic", "lanczos"});
+REXCVAR_DEFINE_STRING(eot_metalfx_color, "auto", "EdgeOfTime/Graphics",
+                      "eot_upscale=metalfx: how MetalFX reads the colours of the frame image. auto is perceptual "
+                      "(the image holds gamma-encoded, display-referred colour whatever its storage format); linear "
+                      "and hdr are overrides")
+    .allowed({"auto", "perceptual", "linear", "hdr"});
+
+REXCVAR_DEFINE_STRING(eot_upscale, "bicubic", "EdgeOfTime/Graphics",
+                      "Filter used for upscaling. metalfx: Apple's MetalFX spatial upscaler (native Metal backend "
+                      "only; bicubic where it is unavailable)")
+    .allowed({"bilinear", "bicubic", "lanczos", "metalfx"});
 
 namespace eot::gpu {
 
@@ -1310,7 +1563,7 @@ void SelectPresentBlitMode(u32 src_w, u32 src_h, float dst_w, float dst_h, float
     const std::string filter = REXCVAR_GET(eot_upscale);
     if (filter == "lanczos")
       extra[0] = 2.0f;
-    else if (filter == "bicubic")
+    else if (filter == "bicubic" || filter == "metalfx")  // metalfx: the fallback when it is not active
       extra[0] = 3.0f;
   }
 }

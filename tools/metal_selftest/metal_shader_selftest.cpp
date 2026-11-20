@@ -13,6 +13,10 @@
 //     main pipeline layout (main_layout.h) and runs the blit on the GPU into an
 //     offscreen target from bindless slot 20000 (past the 16384 plume used to
 //     size the heap for), reading the pixels back with a texture-to-buffer copy.
+//  5. runs MetalFX's spatial scaler through plume (patch 0022, 1920x1080 ->
+//     3024x1898) on a frame image written by a render pass that is still open,
+//     samples the result through the bindless table and checks four flat
+//     quadrants and the mean colour against a bilinear upscale's.
 //
 // Usage: fable2_metal_selftest [shader_runtime dir] [--dump <dir>] [--errors N]
 
@@ -1343,6 +1347,295 @@ bool RunPipelineTests(std::string *report) {
   return ok;
 }
 
+// ---- MetalFX spatial scaler through plume (patch 0022) --------------------------------------------------------------
+//
+// A frame image F (1920x1080, a render target) is written by a render pass that is still open when the scaler runs,
+// as the renderer's present does: four flat quadrants by quad clears. MetalCommandList::encodeExternal ends the pass,
+// MetalFX scales F into O (3024x1898, the fullscreen size of the machine this was written for), and the barrier on O
+// then carries the order to a render pass that samples O through the bindless table (the way the present pass reads
+// it) into a target T, which is read back. The readback itself is an explicit use (a blit bound to T), so only the
+// bindless read of O says whether the ordering of the scaler's writes is carried. The palette rotates every
+// iteration: a stale read of F (the scaler running before the clears) or of O (the sampling pass before the scaler)
+// shows as the previous iteration's colours.
+bool RunMetalFxTests(std::string *report) {
+  auto iface = plume::CreateMetalInterface();
+  auto device = iface ? iface->createDevice() : nullptr;
+  if (!device) {
+    *report = "  FAIL no Metal device\n";
+    return false;
+  }
+  bool ok = true;
+  auto fail = [&](const std::string &what) {
+    ok = false;
+    *report += "  FAIL " + what + "\n";
+  };
+  auto pass = [&](const std::string &what) { *report += "  ok   " + what + "\n"; };
+  plume::MetalDevice *metal_device = static_cast<plume::MetalDevice *>(device.get());
+  if (!plume::MetalSpatialScaler::isSupported(metal_device)) {
+    *report += "  --   MTLFXSpatialScalerDescriptor supportsDevice is false here: nothing to test\n";
+    return true;
+  }
+  pass("MTLFXSpatialScalerDescriptor supportsDevice is true");
+
+  plume::RenderDescriptorSetBuilder tex_builder, sampler_builder;
+  eot::gpu::DescribeTextureHeapSet(tex_builder);
+  eot::gpu::DescribeSamplerHeapSet(sampler_builder);
+  auto tex_set = tex_builder.create(device.get());
+  auto sampler_set = sampler_builder.create(device.get());
+  plume::RenderPipelineLayoutBuilder layout_builder;
+  layout_builder.begin(false, true);
+  eot::gpu::DescribeMainLayoutSets(layout_builder, tex_builder, sampler_builder);
+  eot::gpu::DescribeMainLayoutPushConstants(layout_builder, false);
+  layout_builder.end();
+  auto layout = layout_builder.create(device.get());
+  auto copy_vs = HostShader(device.get(), g_copy_vs_spirv, sizeof(g_copy_vs_spirv));
+  auto blit_ps = HostShader(device.get(), g_blit_ps_spirv, sizeof(g_blit_ps_spirv));
+  if (!tex_set || !sampler_set || !layout || !copy_vs || !blit_ps) {
+    fail("main layout and blit shaders");
+    return false;
+  }
+  auto blit = CopyPipeline(device.get(), layout.get(), copy_vs.get(), blit_ps.get(), plume::RenderFormat::R8G8B8A8_UNORM,
+                           plume::RenderFormat::UNKNOWN);
+  if (!blit) {
+    fail("blit pipeline");
+    return false;
+  }
+  plume::RenderSamplerDesc linear;
+  linear.minFilter = linear.magFilter = plume::RenderFilter::LINEAR;
+  linear.addressU = linear.addressV = linear.addressW = plume::RenderTextureAddressMode::CLAMP;
+  plume::RenderSamplerDesc point = linear;
+  point.minFilter = point.magFilter = plume::RenderFilter::NEAREST;
+  point.mipmapMode = plume::RenderMipmapMode::NEAREST;
+  auto linear_sampler = device->createSampler(linear);
+  auto point_sampler = device->createSampler(point);
+  sampler_set->setSampler(0, linear_sampler.get());
+  sampler_set->setSampler(1, point_sampler.get());
+
+  constexpr uint32_t kInW = 1920, kInH = 1080, kOutW = 3024, kOutH = 1898, kSlotO = 20010;
+  auto target = device->createTexture(plume::RenderTextureDesc::ColorTarget(kOutW, kOutH, plume::RenderFormat::R8G8B8A8_UNORM));
+  auto readback = device->createBuffer(plume::RenderBufferDesc::ReadbackBuffer(uint64_t(kOutW) * kOutH * 4));
+  if (!target || !readback) {
+    fail("test resources");
+    return false;
+  }
+  const plume::RenderTexture *target_colors[1] = {target.get()};
+  auto target_fb = device->createFramebuffer(plume::RenderFramebufferDesc(target_colors, 1));
+  auto queue = device->createCommandQueue(plume::RenderCommandListType::DIRECT);
+  auto list = queue->createCommandList();
+  auto fence = device->createCommandFence();
+  const plume::RenderCommandList *lists[] = {list.get()};
+
+  struct Case {
+    plume::RenderFormat format;
+    plume::MetalSpatialScaler::ColorMode mode;
+    const char *name;
+    int iterations;
+    // The largest error of a quadrant's mean, in 1/255 (R11G11B10 keeps 5 bits of mantissa in blue).
+    double tolerance = 6.0;
+    // Informational control: the barrier on O that carries the scaler's order to the sampling pass is left out.
+    bool control = false;
+  };
+  const Case cases[] = {
+      {plume::RenderFormat::R8G8B8A8_UNORM, plume::MetalSpatialScaler::ColorMode::Perceptual, "R8G8B8A8_UNORM, perceptual", 40},
+      {plume::RenderFormat::B8G8R8A8_UNORM, plume::MetalSpatialScaler::ColorMode::Perceptual, "B8G8R8A8_UNORM, perceptual", 8},
+      {plume::RenderFormat::R8G8B8A8_UNORM, plume::MetalSpatialScaler::ColorMode::Linear, "R8G8B8A8_UNORM, linear", 4},
+      {plume::RenderFormat::R16G16B16A16_FLOAT, plume::MetalSpatialScaler::ColorMode::HDR, "R16G16B16A16_FLOAT, hdr", 8},
+      {plume::RenderFormat::R16G16B16A16_UNORM, plume::MetalSpatialScaler::ColorMode::Perceptual, "R16G16B16A16_UNORM, perceptual", 4},
+      {plume::RenderFormat::R11G11B10_FLOAT, plume::MetalSpatialScaler::ColorMode::HDR, "R11G11B10_FLOAT, hdr", 4, 12.0},
+      {plume::RenderFormat::R8G8B8A8_UNORM, plume::MetalSpatialScaler::ColorMode::Perceptual,
+       "control without the barrier on the output (R8G8B8A8_UNORM)", 40, 6.0, true},
+  };
+  const float palette[8][3] = {{0.85f, 0.15f, 0.15f}, {0.15f, 0.75f, 0.2f}, {0.2f, 0.25f, 0.9f}, {0.9f, 0.85f, 0.1f},
+                               {0.1f, 0.8f, 0.8f},    {0.8f, 0.2f, 0.75f},  {0.5f, 0.5f, 0.5f},  {0.95f, 0.6f, 0.15f}};
+  for (const Case &c : cases) {
+    plume::MetalSpatialScaler::Desc desc;
+    desc.colorFormat = desc.outputFormat = c.format;
+    desc.inputWidth = kInW;
+    desc.inputHeight = kInH;
+    desc.outputWidth = kOutW;
+    desc.outputHeight = kOutH;
+    desc.colorMode = c.mode;
+    std::string why;
+    auto scaler = plume::MetalSpatialScaler::create(metal_device, desc, &why);
+    if (!scaler) {
+      *report += std::string("  --   ") + c.name + ": no scaler (" + why + ")\n";
+      continue;
+    }
+    auto frame = device->createTexture(plume::RenderTextureDesc::ColorTarget(kInW, kInH, c.format));
+    plume::RenderTextureDesc out_desc = plume::RenderTextureDesc::Texture2D(kOutW, kOutH, 1, c.format, scaler->outputTextureFlags());
+    auto out = device->createTexture(out_desc);
+    if (!frame || !out) {
+      *report += std::string("  --   ") + c.name + ": a texture could not be created (output flags " +
+                 std::to_string(static_cast<uint32_t>(scaler->outputTextureFlags())) + ")\n";
+      continue;
+    }
+    plume::RenderTextureViewDesc view_desc;
+    view_desc.format = c.format;
+    view_desc.dimension = plume::RenderTextureViewDimension::TEXTURE_2D;
+    view_desc.mipLevels = 1;
+    auto out_view = out->createTextureView(view_desc);
+    tex_set->setTexture(kSlotO, out.get(), plume::RenderTextureLayout::SHADER_READ, out_view.get());
+    const plume::RenderTexture *frame_colors[1] = {frame.get()};
+    auto frame_fb = device->createFramebuffer(plume::RenderFramebufferDesc(frame_colors, 1));
+
+    uint32_t wrong = 0, trivial = 0, refused = 0;
+    double worst_quadrant = 0.0, worst_mean = 0.0;
+    std::string first_wrong;
+    for (int k = 0; k < c.iterations; ++k) {
+      const float *quad[4];
+      for (int q = 0; q < 4; ++q)
+        quad[q] = palette[(k + 2 * q) % 8];
+      list->begin();
+      // Before the scaler runs: this barrier takes its source stage from the target (copy, left by the last
+      // readback), and a wait it set after the scaler would stand in for the one on the output.
+      list->barriers(plume::RenderBarrierStage::GRAPHICS,
+                     plume::RenderTextureBarrier(target.get(), plume::RenderTextureLayout::COLOR_WRITE));
+      list->barriers(plume::RenderBarrierStage::GRAPHICS,
+                     plume::RenderTextureBarrier(frame.get(), plume::RenderTextureLayout::COLOR_WRITE));
+      list->setFramebuffer(frame_fb.get());
+      list->clearColor(0, plume::RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
+      const int32_t mx = kInW / 2, my = kInH / 2;
+      const plume::RenderRect rects[4] = {{0, 0, mx, my}, {mx, 0, int32_t(kInW), my}, {0, my, mx, int32_t(kInH)},
+                                          {mx, my, int32_t(kInW), int32_t(kInH)}};
+      for (int q = 0; q < 4; ++q)
+        list->clearColor(0, plume::RenderColor(quad[q][0], quad[q][1], quad[q][2], 1.0f), &rects[q], 1);
+      // The render pass is still open here, as at the present.
+      std::string error;
+      if (!scaler->encode(static_cast<plume::MetalCommandList *>(list.get()), frame.get(), out.get(), &error)) {
+        refused++;
+        if (first_wrong.empty())
+          first_wrong = "encode refused: " + error;
+        list->setFramebuffer(nullptr);
+        list->end();
+        continue;
+      }
+      if (!c.control)
+        list->barriers(plume::RenderBarrierStage::GRAPHICS,
+                       plume::RenderTextureBarrier(out.get(), plume::RenderTextureLayout::SHADER_READ));
+      list->setGraphicsPipelineLayout(layout.get());
+      list->setPipeline(blit.get());
+      list->setGraphicsDescriptorSet(tex_set.get(), 0);
+      list->setGraphicsDescriptorSet(tex_set.get(), 1);
+      list->setGraphicsDescriptorSet(tex_set.get(), 2);
+      list->setGraphicsDescriptorSet(sampler_set.get(), 3);
+      list->setGraphicsDescriptorSet(tex_set.get(), 4);
+      list->setFramebuffer(target_fb.get());
+      const plume::RenderViewport vp(0.0f, 0.0f, float(kOutW), float(kOutH), 0.0f, 1.0f);
+      const plume::RenderRect sc(0, 0, kOutW, kOutH);
+      list->setViewports(&vp, 1);
+      list->setScissors(&sc, 1);
+      CopyPushConstants pc;
+      pc.resourceDescriptorIndex = kSlotO;
+      pc.param1 = 1.0f;
+      list->setGraphicsPushConstants(0, &pc, kCopyPushConstantByteOffset, sizeof(pc));
+      list->drawInstanced(3, 1, 0, 0);
+      list->setFramebuffer(nullptr);
+      list->barriers(plume::RenderBarrierStage::COPY,
+                     plume::RenderTextureBarrier(target.get(), plume::RenderTextureLayout::COPY_SOURCE));
+      list->copyTextureRegion(plume::RenderTextureCopyLocation::PlacedFootprint(readback.get(), plume::RenderFormat::R8G8B8A8_UNORM,
+                                                                                kOutW, kOutH, 1, kOutW),
+                              plume::RenderTextureCopyLocation::Subresource(target.get()));
+      list->end();
+      queue->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, fence.get());
+      queue->waitForCommandFence(fence.get());
+
+      const auto *pixels = static_cast<const uint8_t *>(readback->map());
+      // The mean of each quadrant, away from the lines where the colours meet (a filter rings there), and of
+      // the whole image: what a bilinear upscale of the four flat quadrants keeps (the mean of the four).
+      double whole[3] = {};
+      uint64_t whole_count = 0;
+      for (uint32_t y = 0; y < kOutH; y += 2)
+        for (uint32_t x = 0; x < kOutW; x += 2) {
+          const uint8_t *p = pixels + (size_t(y) * kOutW + x) * 4;
+          for (int ch = 0; ch < 3; ++ch)
+            whole[ch] += p[ch];
+          whole_count++;
+        }
+      double mean_error = 0.0, sum = 0.0;
+      for (int ch = 0; ch < 3; ++ch) {
+        const double want = 255.0 * (quad[0][ch] + quad[1][ch] + quad[2][ch] + quad[3][ch]) * 0.25;
+        mean_error = std::max(mean_error, std::fabs(whole[ch] / whole_count - want));
+        sum += whole[ch];
+      }
+      worst_mean = std::max(worst_mean, mean_error);
+      if (sum < 1.0)
+        trivial++;
+      const uint32_t qx = kOutW / 2, qy = kOutH / 2, margin = 48;
+      const uint32_t x0[4] = {margin, qx + margin, margin, qx + margin};
+      const uint32_t x1[4] = {qx - margin, kOutW - margin, qx - margin, kOutW - margin};
+      const uint32_t y0[4] = {margin, margin, qy + margin, qy + margin};
+      const uint32_t y1[4] = {qy - margin, qy - margin, kOutH - margin, kOutH - margin};
+      bool iteration_wrong = mean_error > std::max(3.0, c.tolerance * 0.5);
+      for (int q = 0; q < 4; ++q) {
+        double m[3] = {};
+        uint64_t n = 0;
+        for (uint32_t y = y0[q]; y < y1[q]; y += 3)
+          for (uint32_t x = x0[q]; x < x1[q]; x += 3) {
+            const uint8_t *p = pixels + (size_t(y) * kOutW + x) * 4;
+            for (int ch = 0; ch < 3; ++ch)
+              m[ch] += p[ch];
+            n++;
+          }
+        double err = 0.0;
+        for (int ch = 0; ch < 3; ++ch)
+          err = std::max(err, std::fabs(m[ch] / n - 255.0 * quad[q][ch]));
+        worst_quadrant = std::max(worst_quadrant, err);
+        if (err > c.tolerance) {
+          iteration_wrong = true;
+          if (first_wrong.empty()) {
+            char buf[160];
+            std::snprintf(buf, sizeof(buf), "iteration %d quadrant %d: got (%.1f %.1f %.1f) want (%.1f %.1f %.1f)", k, q,
+                          m[0] / n, m[1] / n, m[2] / n, 255.0 * quad[q][0], 255.0 * quad[q][1], 255.0 * quad[q][2]);
+            first_wrong = buf;
+          }
+        }
+      }
+      readback->unmap();
+      wrong += iteration_wrong;
+    }
+    char buf[400];
+    std::snprintf(buf, sizeof(buf),
+                  "%s, %ux%u -> %ux%u, %d iterations with the pass open: %u wrong, %u all-zero, %u refused; worst quadrant error "
+                  "%.2f/255, worst whole-image mean error vs a bilinear upscale's %.2f/255%s%s",
+                  c.name, kInW, kInH, kOutW, kOutH, c.iterations, wrong, trivial, refused, worst_quadrant, worst_mean,
+                  first_wrong.empty() ? "" : "; first: ", first_wrong.c_str());
+    if (c.control)
+      *report += std::string("  --   ") + buf + " (informational: a nonzero count shows the test sees a missing order)\n";
+    else
+      (wrong == 0 && trivial == 0 && refused == 0) ? pass(buf) : fail(buf);
+  }
+
+  {
+    // The refusals: a texture of the wrong size, and a texture that is not hazard-tracked (a pooled one).
+    plume::MetalSpatialScaler::Desc desc;
+    desc.colorFormat = desc.outputFormat = plume::RenderFormat::R8G8B8A8_UNORM;
+    desc.inputWidth = kInW;
+    desc.inputHeight = kInH;
+    desc.outputWidth = kOutW;
+    desc.outputHeight = kOutH;
+    std::string error;
+    auto scaler = plume::MetalSpatialScaler::create(metal_device, desc, &error);
+    if (!scaler) {
+      fail("refusals: the scaler could not be created (" + error + ")");
+      return false;
+    }
+    auto wrong_size = device->createTexture(plume::RenderTextureDesc::ColorTarget(kInW / 2, kInH / 2, desc.colorFormat));
+    auto out = device->createTexture(plume::RenderTextureDesc::Texture2D(kOutW, kOutH, 1, desc.colorFormat, scaler->outputTextureFlags()));
+    list->begin();
+    const bool refused_size = !scaler->encode(static_cast<plume::MetalCommandList *>(list.get()), wrong_size.get(), out.get(), &error);
+    list->end();
+    refused_size ? pass("an input of the wrong size is refused and nothing is encoded (" + error + ")")
+                 : fail("an input of the wrong size was accepted");
+    std::string too_small;
+    desc.outputWidth = kInW / 2;
+    desc.outputHeight = kInH / 2;
+    plume::MetalSpatialScaler::create(metal_device, desc, &too_small)
+        ? fail("a scaler whose output is smaller than its input was created")
+        : pass("a scaler whose output is smaller than its input is refused (" + too_small + ")");
+  }
+  return ok;
+}
+
 // The GPU busy arithmetic (src/gpu/gpu_busy.h): union of overlapping intervals, clipping to the
 // window, what is carried over, and which buffer labels count.
 bool RunBusyMathTests(std::string *report) {
@@ -1481,7 +1774,11 @@ int main(int argc, char **argv) {
   const bool busy_ok = RunBusyMathTests(&busy_report);
   std::printf("GPU busy arithmetic (gpu_busy.h):\n%s", busy_report.c_str());
 
-  const bool ok = g_failures.empty() && pipelines_ok && busy_ok && total > 0;
+  std::string metalfx_report;
+  const bool metalfx_ok = RunMetalFxTests(&metalfx_report);
+  std::printf("MetalFX spatial scaler through plume (patch 0022):\n%s", metalfx_report.c_str());
+
+  const bool ok = g_failures.empty() && pipelines_ok && busy_ok && metalfx_ok && total > 0;
   std::printf("%s\n", ok ? "PASS" : "FAIL");
   return ok ? 0 : 1;
 }
