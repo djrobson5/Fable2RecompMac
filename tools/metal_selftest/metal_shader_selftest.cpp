@@ -680,6 +680,76 @@ bool RunPipelineTests(std::string *report) {
                      : fail("draw after a rect clear ran with the clear's scissor: " + std::to_string(differences) +
                             "/16 texels differ");
   }
+
+  // Per-encoder GPU timing (plume patch 0019): the blit's render pass and the readback copy each get
+  // two counter samples through their own pass descriptors (no encoder is added or split). The
+  // samples, converted with the device's GPU clock, must fall inside the command buffer's GPU
+  // interval on the host clock: that checks the tick unit and the clock mapping at once.
+  {
+    plume::MetalDevice *metal_device = static_cast<plume::MetalDevice *>(device.get());
+    plume::MetalPassTiming timing(metal_device);
+    std::string error;
+    if (!timing.create(4096, &error)) {
+      fail("pass timing: " + error);
+    } else {
+      static uint32_t hook_calls, hook_width, hook_height, hook_attachments;
+      hook_calls = hook_width = hook_height = hook_attachments = 0;
+      timing.renderPassHook = [](uint32_t w, uint32_t h, uint32_t a) {
+        hook_calls++;
+        hook_width = w;
+        hook_height = h;
+        hook_attachments = a;
+      };
+      std::vector<plume::MetalGpuInterval> stale;
+      metal_queue->drainGpuIntervals(stale);
+      timing.begin();
+      metal_queue->passTiming = &timing;
+      const plume::RenderRect full(0, 0, kSize, kSize);
+      run_target([&]() {
+        bind_blit();
+        list->setScissors(&full, 1);
+        list->drawInstanced(3, 1, 0, 0);
+      });
+      metal_queue->passTiming = nullptr;
+      timing.end();
+      metal_queue->waitIdle();
+      std::vector<plume::MetalGpuInterval> intervals;
+      metal_queue->drainGpuIntervals(intervals);
+      const plume::MetalGpuInterval *work = nullptr;
+      for (const plume::MetalGpuInterval &i : intervals)
+        if (eot::gpu::IsGpuWorkLabel(i.label))
+          work = &i;
+      std::vector<plume::MetalPassTiming::Span> spans;
+      uint32_t invalid = 0, rejected = 0;
+      timing.resolve(spans, &invalid, &rejected);
+      const auto &clock = metal_device->getGpuClock();
+      uint32_t renders = 0, blits = 0, outside = 0;
+      double span_total = 0.0;
+      for (const auto &span : spans) {
+        renders += span.kind == plume::MetalPassTiming::Kind::Render;
+        blits += span.kind == plume::MetalPassTiming::Kind::Blit;
+        span_total += span.end - span.start;
+        if (work && (span.start < work->start - 0.001 || span.end > work->end + 0.001))
+          outside++;
+      }
+      char buf[320];
+      std::snprintf(buf, sizeof(buf),
+                    "%zu spans (%u render, %u blit), %u invalid, %u rejected, %u untimed, hook %u calls (%ux%u, %u attachments), "
+                    "work buffer %s, %u spans outside it, GPU tick %.3f ns",
+                    spans.size(), renders, blits, invalid, rejected, timing.untimed, hook_calls, hook_width, hook_height,
+                    hook_attachments, work ? "found" : "missing", outside, clock.secondsPerTick * 1e9);
+      const bool good = clock.valid && work && renders >= 1 && blits >= 1 && invalid == 0 && rejected == 0 && timing.untimed == 0 &&
+                        outside == 0 && span_total > 0.0 && hook_calls == renders && hook_width == kSize &&
+                        hook_height == kSize && hook_attachments == 1;
+      if (good) {
+        std::snprintf(buf + std::strlen(buf), sizeof(buf) - std::strlen(buf), "; spans total %.1f us of the buffer's %.1f us",
+                      span_total * 1e6, (work->end - work->start) * 1e6);
+        pass(std::string("per-encoder GPU timing from a sample buffer of ") + std::to_string(timing.capacity) + " samples: " + buf);
+      } else {
+        fail(std::string("per-encoder GPU timing: ") + buf);
+      }
+    }
+  }
   {
     // A waiter that sees the fence finds the list's interval recorded (the interval's handler is
     // registered before the fence's): 200 empty lists, drained right after each fence wait.
@@ -703,6 +773,129 @@ bool RunPipelineTests(std::string *report) {
     metal_queue->waitIdle();
     missing == 0 ? pass("the list's GPU interval is recorded before its fence is seen (200 of 200 lists)")
                  : fail("the list's GPU interval was not there when the fence was seen: " + std::to_string(missing) + " of 200");
+  }
+  {
+    // Passes with no draw: a load-and-resolve pass (MSAA source) and a clear-only pass, in three rounds
+    // that reuse the same sample indices (the sample buffer is never cleared). Each pass must write
+    // both of its samples afresh: the value of an index is replaced by a later GPU timestamp, not
+    // left over from the round before. Metal's answer to "what does a pass with no vertex work write
+    // for start-of-vertex" is part of the message.
+    plume::MetalDevice *md = static_cast<plume::MetalDevice *>(device.get());
+    plume::MetalPassTiming t(md);
+    std::string err;
+    auto msaa = device->createTexture(plume::RenderTextureDesc::ColorTarget(
+        kSize, kSize, plume::RenderFormat::R8G8B8A8_UNORM, plume::RenderMultisampling(plume::RenderSampleCount::COUNT_4)));
+    if (!t.create(256, &err) || !msaa) {
+      fail("draw-less pass timing: " + (err.empty() ? std::string("no MSAA texture") : err));
+    } else {
+      (void)md->getGpuClock();
+      auto raw = [&](uint32_t n) {
+        std::vector<uint64_t> v(n);
+        const NS::Data *d = t.sampleBuffer->resolveCounterRange(NS::Range(0, n));
+        std::memcpy(v.data(), d->mutableBytes(), n * sizeof(uint64_t));
+        return v;
+      };
+      auto timed = [&](auto &&submit) {
+        t.begin();
+        metal_queue->passTiming = &t;
+        submit();
+        metal_queue->passTiming = nullptr;
+        t.end();
+        metal_queue->waitIdle();
+      };
+      bool good = true;
+      std::string detail;
+      std::vector<uint64_t> before;
+      for (int round = 0; round < 3; ++round) {
+        // A real draw pass first: the indices 0..3 hold its samples.
+        const plume::RenderRect full(0, 0, kSize, kSize);
+        timed([&]() {
+          run_target([&]() {
+            bind_blit();
+            list->setScissors(&full, 1);
+            list->drawInstanced(3, 1, 0, 0);
+          });
+        });
+        before = raw(2);
+        // The draw-less resolve.
+        timed([&]() {
+          list->begin();
+          list->barriers(plume::RenderBarrierStage::GRAPHICS,
+                         plume::RenderTextureBarrier(msaa.get(), plume::RenderTextureLayout::RESOLVE_SOURCE));
+          list->barriers(plume::RenderBarrierStage::GRAPHICS,
+                         plume::RenderTextureBarrier(target.get(), plume::RenderTextureLayout::RESOLVE_DEST));
+          list->resolveTexture(target.get(), msaa.get());
+          list->end();
+          queue->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, fence.get());
+          queue->waitForCommandFence(fence.get());
+        });
+        std::vector<plume::MetalPassTiming::Span> spans;
+        uint32_t invalid = 0, rejected = 0;
+        t.resolve(spans, &invalid, &rejected);
+        const auto after = raw(2);
+        const bool resolve_ok = t.records.size() == 1 && spans.size() == 1 && invalid == 0 && rejected == 0 &&
+                                after[0] > before[0] && after[1] > after[0] && after[1] != ~0ull;
+        good = good && resolve_ok;
+        char buf[200];
+        if (round == 0) {
+          std::snprintf(buf, sizeof(buf), "load+resolve pass: start-of-vertex %llu -> %llu (+%.1f us over the draw pass's), end-of-fragment %llu, span %.1f us",
+                        static_cast<unsigned long long>(before[0]), static_cast<unsigned long long>(after[0]),
+                        double(after[0] - before[0]) * 1e-3, static_cast<unsigned long long>(after[1]),
+                        spans.empty() ? 0.0 : (spans[0].end - spans[0].start) * 1e6);
+          detail += buf;
+        }
+        // The clear-only pass (and the readback blit after it).
+        before = raw(2);
+        timed([&]() {
+          run_target([&]() { list->clearColor(0, plume::RenderColor(0.0f, 1.0f, 0.0f, 1.0f)); });
+        });
+        spans.clear();
+        invalid = rejected = 0;
+        t.resolve(spans, &invalid, &rejected);
+        const auto clear_after = raw(2);
+        const bool clear_ok = spans.size() == 2 && invalid == 0 && rejected == 0 && clear_after[0] > before[0] &&
+                              clear_after[1] > clear_after[0];
+        good = good && clear_ok;
+        if (round == 0) {
+          std::snprintf(buf, sizeof(buf), "; clear-only pass: start-of-vertex %llu -> %llu, end-of-fragment %llu, span %.1f us",
+                        static_cast<unsigned long long>(before[0]), static_cast<unsigned long long>(clear_after[0]),
+                        static_cast<unsigned long long>(clear_after[1]),
+                        spans.empty() ? 0.0 : (spans[0].end - spans[0].start) * 1e6);
+          detail += buf;
+        }
+      }
+      good ? pass("draw-less passes (3 rounds on reused indices): Metal writes both samples afresh, none stale or error: " + detail)
+           : fail("draw-less passes wrote a stale, error or missing sample: " + detail);
+
+      // The guard: an index nothing wrote this frame still holds the last frame's value, and resolve
+      // rejects the span (and counts it) instead of reporting it.
+      t.begin();
+      uint32_t a = 0, b = 0;
+      t.allocate(plume::MetalPassTiming::Kind::Compute, a, b);
+      std::vector<plume::MetalPassTiming::Span> spans;
+      uint32_t invalid = 0, rejected = 0;
+      t.resolve(spans, &invalid, &rejected);
+      spans.empty() && rejected == 1 && invalid == 0
+          ? pass("a span whose samples predate begin() is rejected and counted (stale index)")
+          : fail("a stale span was not rejected: " + std::to_string(spans.size()) + " spans, " + std::to_string(rejected) + " rejected");
+    }
+  }
+  {
+    // The sample buffer's capacity: a frame with more encoders than it holds leaves the rest untimed.
+    plume::MetalPassTiming small(static_cast<plume::MetalDevice *>(device.get()));
+    std::string error;
+    if (!small.create(64, &error)) {
+      fail("pass timing: " + error);
+    } else {
+      small.begin();
+      uint32_t timed = 0, a = 0, b = 0;
+      for (uint32_t i = 0; i < small.capacity / 2 + 3; ++i)
+        timed += small.allocate(plume::MetalPassTiming::Kind::Compute, a, b);
+      timed == small.capacity / 2 && small.untimed == 3 && small.records.size() == timed
+          ? pass("pass timing capacity: " + std::to_string(timed) + " encoders timed in " + std::to_string(small.capacity) +
+                 " samples, 3 more left untimed")
+          : fail("pass timing capacity: " + std::to_string(timed) + " timed, " + std::to_string(small.untimed) + " untimed");
+    }
   }
   return ok;
 }

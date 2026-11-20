@@ -75,7 +75,8 @@ REXCVAR_DEFINE_BOOL(fable2_barrier_keeps_pass, true, "Fable2",
                     "Native renderer (MoltenVK): layout changes of textures not attached to the render pass keep the pass");
 REXCVAR_DEFINE_BOOL(fable2_diag_pass_gpu, false, "Fable2",
                     "Diagnostic: GPU time per render pass on the timed frames (timestamps between passes only), "
-                    "averaged and logged as [pass-gpu] every 240 timed frames");
+                    "averaged and logged as [pass-gpu] every 240 timed frames. Metal: counter samples on each "
+                    "encoder's own pass descriptor (nothing is split); the times overlap, see the union line");
 REXCVAR_DEFINE_BOOL(fable2_diag_pass_timing, false, "Fable2",
                     "Native renderer: diag frames time render passes (a timestamp before each pass begin) "
                     "instead of draws");

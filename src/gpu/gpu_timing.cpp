@@ -151,6 +151,143 @@ void GpuBusyPoll(VideoState &s) {
   g_busy.window_start = hi;
   g_busy.presented = presented;
 }
+
+// Metal per-pass GPU time (fable2_diag_pass_gpu), on the timed frames (one in fable2_gpu_timing_every):
+// plume puts two counter samples on each encoder's own pass descriptor (MetalPassTiming), so no
+// encoder is split or added. One MetalPassTiming per frame in flight; GpuTimingFrameBegin hooks it to
+// the queue, GpuTimingFrameEnd takes it off, GpuTimingCollect resolves it once the slot's frame ran.
+// Metal does not call the renderer's pass-trace callback, so the pass tag ("<w>x<h> att <n>") is made
+// by the hook plume calls as a render encoder begins. g_open is never set on Metal, so the timestamp
+// marks (GpuTimingDiagActive, GpuTimingMark) do nothing there.
+constexpr u32 kMetalPassSamples = 4096;
+
+struct MetalPassSlot {
+  std::unique_ptr<plume::MetalPassTiming> timing;
+  bool pending = false;
+};
+MetalPassSlot g_metal_slots[kNumFrames];
+bool g_metal_open = false;
+bool g_metal_failed = false;
+u32 g_metal_slot = 0;
+
+void MetalRenderPassBegan(uint32_t width, uint32_t height, uint32_t attachments) {
+  g_metal_slots[g_metal_slot].timing->tag = std::format("{}x{} att {}", width, height, attachments);
+}
+
+void MetalPassFrameBegin(VideoState &s, u32 slot) {
+  if (g_metal_failed)
+    return;
+  MetalPassSlot &ms = g_metal_slots[slot];
+  // A slot submitted and begun again in the middle of a frame (a writeback or capture that waits
+  // for the GPU) goes on with the frame's records, which are not resolved yet.
+  const bool resume = ms.pending && ms.timing;
+  if (!resume) {
+    if (!REXCVAR_GET(fable2_diag_pass_gpu))
+      return;
+    // One Present in fable2_gpu_timing_every is timed (the same for every begin of that frame).
+    const i32 every = REXCVAR_GET(fable2_gpu_timing_every);
+    if (every > 1 && UploadRingFramesPresented() % static_cast<u64>(every) != 0)
+      return;
+    if (!ms.timing) {
+      auto *device = static_cast<plume::MetalDevice *>(s.device.get());
+      auto timing = std::make_unique<plume::MetalPassTiming>(device);
+      std::string error;
+      if (!timing->create(kMetalPassSamples, &error)) {
+        EOT_WARN("[pass-gpu] no counter sample buffer ({}); per-pass GPU timing is off", error);
+        g_metal_failed = true;
+        return;
+      }
+      if (timing->capacity < kMetalPassSamples)
+        EOT_WARN("[pass-gpu] the device gave a counter sample buffer of {} samples, not {}", timing->capacity,
+                 kMetalPassSamples);
+      const auto &clock = device->getGpuClock();
+      EOT_INFO("[pass-gpu] counter sample buffer: {} samples ({} encoders) a frame; GPU tick {:.3f} ns{}",
+               timing->capacity, timing->capacity / 2, clock.secondsPerTick * 1e9,
+               clock.valid ? "" : " (calibration failed: spans dropped)");
+      timing->renderPassHook = &MetalRenderPassBegan;
+      ms.timing = std::move(timing);
+    }
+    ms.timing->begin();
+  } else {
+    ms.timing->resume();
+  }
+  MetalQueue(s)->passTiming = ms.timing.get();
+  g_metal_slot = slot;
+  g_metal_open = true;
+}
+
+void MetalPassFrameEnd() {
+  if (!g_metal_open)
+    return;
+  g_metal_open = false;
+  MetalPassSlot &ms = g_metal_slots[g_metal_slot];
+  ms.timing->end();
+  MetalQueue(state())->passTiming = nullptr;
+  ms.pending = ms.timing->used > 0;
+}
+
+void MetalPassCollect(VideoState &s, u32 slot) {
+  (void)s;
+  MetalPassSlot &ms = g_metal_slots[slot];
+  if (!ms.pending || !ms.timing)
+    return;
+  ms.pending = false;
+  std::vector<plume::MetalPassTiming::Span> spans;
+  u32 invalid = 0, rejected = 0;
+  ms.timing->resolve(spans, &invalid, &rejected);
+
+  struct Sum {
+    f64 us = 0.0;
+    u32 count = 0;
+  };
+  static std::map<std::string, Sum> sums;
+  static u32 frames = 0, invalid_total = 0, rejected_total = 0, untimed_total = 0, span_total = 0;
+  static f64 sum_us = 0.0, union_us = 0.0;
+  static bool capped_logged = false;
+  std::vector<BusyInterval> intervals;
+  for (const auto &span : spans) {
+    const f64 us = (span.end - span.start) * 1e6;
+    Sum &sum = sums[span.tag];
+    sum.us += us;
+    sum.count++;
+    sum_us += us;
+    intervals.push_back({span.start, span.end});
+  }
+  if (!intervals.empty()) {
+    f64 lo = intervals[0].start, hi = intervals[0].end;
+    for (const BusyInterval &i : intervals) {
+      lo = std::min(lo, i.start);
+      hi = std::max(hi, i.end);
+    }
+    union_us += UnionBusySeconds(intervals, lo, hi) * 1e6;
+  }
+  span_total += static_cast<u32>(spans.size());
+  invalid_total += invalid;
+  rejected_total += rejected;
+  untimed_total += ms.timing->untimed;
+  if (ms.timing->untimed && !capped_logged) {
+    capped_logged = true;
+    EOT_WARN("[pass-gpu] counter sample buffer full ({} samples): {} encoders of a frame are untimed (logged once)",
+             ms.timing->capacity, ms.timing->untimed);
+  }
+  if (++frames < 240)
+    return;
+  std::vector<std::pair<f64, std::string>> order;
+  for (const auto &[tag, sum] : sums)
+    order.emplace_back(sum.us / frames, std::format("{} (x{:.1f})", tag, f64(sum.count) / frames));
+  std::sort(order.begin(), order.end(), std::greater<>());
+  EOT_INFO("[pass-gpu] {} timed frames, per-pass time (an encoder's own span; they overlap on Apple GPUs, so the "
+           "sum can exceed the frame): {:.2f} ms summed over passes a frame, {:.2f} ms union",
+           frames, sum_us / frames * 1e-3, union_us / frames * 1e-3);
+  for (size_t i = 0; i < order.size() && i < 30; ++i)
+    EOT_INFO("[pass-gpu]   {:7.1f} us  {}", order[i].first, order[i].second);
+  EOT_INFO("[pass-gpu] {:.1f} encoders timed a frame, {} dropped (error or missing samples), {} rejected (a sample "
+           "from before the frame or after the resolve), {} untimed (sample buffer full)",
+           f64(span_total) / frames, invalid_total, rejected_total, untimed_total);
+  sums.clear();
+  frames = invalid_total = rejected_total = untimed_total = span_total = 0;
+  sum_us = union_us = 0.0;
+}
 #endif
 
 void WriteMark(SlotTiming &st, plume::RenderCommandList *cmd, u32 closing) {
@@ -250,6 +387,7 @@ void GpuTimingFrameBegin(VideoState &s, plume::RenderCommandList *cmd, u32 slot)
   if (UseMetal()) {
 #if defined(FABLE2_METAL_BACKEND)
     GpuBusySync(s);
+    MetalPassFrameBegin(s, slot);
 #endif
     return;
   }
@@ -338,6 +476,12 @@ void GpuTimingDiagMark(VideoState &s, plume::RenderCommandList *cmd, std::string
 }
 
 void GpuTimingFrameEnd(plume::RenderCommandList *cmd) {
+#if defined(FABLE2_METAL_BACKEND)
+  if (UseMetal()) {
+    MetalPassFrameEnd();
+    return;
+  }
+#endif
   if (!g_supported || !g_open || !cmd)
     return;
   auto &st = g_slots[g_active_slot];
@@ -350,6 +494,7 @@ void GpuTimingCollect(VideoState &s, u32 slot) {
 #if defined(FABLE2_METAL_BACKEND)
   if (UseMetal()) {
     GpuBusyPoll(s);
+    MetalPassCollect(s, slot);
     return;
   }
 #endif

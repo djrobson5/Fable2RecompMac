@@ -1,0 +1,469 @@
+From 3d9201ce365ab5fe4eae60ce31148ac2d954922e Mon Sep 17 00:00:00 2001
+From: djrobson5 <256682087+djrobson5@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 12:22:01 -0800
+Subject: [PATCH 19/19] Metal: per-encoder GPU timing through counter sample
+ attachments
+
+MetalPassTiming (owned by the renderer, one per frame in flight) is set as the
+queue's passTiming. While it is active, every render, compute and blit encoder
+the queue's command lists begin gets two counter samples through its own pass
+descriptor: start of vertex and end of fragment for render passes, start and
+end of the encoder for compute and blit. No encoder is split or added, unlike
+writeTimestamp, which on Apple GPUs ends the encoder and waits for all earlier
+work. A blit encoder made for timing gets a descriptor of its own (the shared
+one stays untouched); a timed compute encoder keeps the concurrent dispatch
+type.
+
+Each record keeps the encoder's kind and a tag (render passes: the one the
+renderer set, through an optional hook called as the encoder begins; the other
+kinds are named after themselves). resolve() reads the used samples once the
+frame's command buffers completed, leaves out spans with an error or missing
+sample, and converts GPU ticks to host-clock seconds with MetalDevice::
+getGpuClock: two sampleTimestamps calls 20 ms apart, each paired with the host
+time around the call.
+
+The sample buffer is not cleared and the indices restart at 0 every frame, so a
+sample a pass did not write would be read from an older frame. begin() takes a
+GPU timestamp (beginTicks); resolve() rejects, and counts, spans with a sample
+below it or above the timestamp at resolve time. (Metal does write both samples
+for a pass with no draw: a load-and-resolve pass and a clear-only pass, checked
+in tools/metal_selftest; the check is a guard.) resume() continues a frame whose
+records were not resolved yet, for a slot that is begun again mid-frame.
+
+The sample buffer is made with a real NS::Error (halved from the requested
+size until the device accepts it); encoders beyond its capacity are left
+untimed and counted.
+---
+ plume_metal.cpp | 238 +++++++++++++++++++++++++++++++++++++++++++++++-
+ plume_metal.h   |  86 +++++++++++++++++
+ 2 files changed, 320 insertions(+), 4 deletions(-)
+
+diff --git a/plume_metal.cpp b/plume_metal.cpp
+index e1c9365..3f9599d 100644
+--- a/plume_metal.cpp
++++ b/plume_metal.cpp
+@@ -18,6 +18,10 @@
+ #include <atomic>
+ #include <cstring>
+ #include <mutex>
++#include <string>
++
++#include <time.h>
++#include <unistd.h>
+ 
+ #include "plume_metal.h"
+ 
+@@ -2449,6 +2453,173 @@ namespace plume {
+         lastCommandBuffer = commandBuffer;
+     }
+ 
++    // MetalPassTiming
++
++    MetalPassTiming::MetalPassTiming(MetalDevice *device) : device(device) {
++    }
++
++    MetalPassTiming::~MetalPassTiming() {
++        MetalAutoreleasePool releasePool;
++        if (sampleBuffer != nullptr) {
++            sampleBuffer->release();
++        }
++    }
++
++    bool MetalPassTiming::create(uint32_t sampleCount, std::string *error) {
++        MetalAutoreleasePool releasePool;
++        if (device->timestampCounterSet == nullptr) {
++            *error = "the device has no timestamp counter set";
++            return false;
++        }
++
++        if (!device->mtl->supportsCounterSampling(MTL::CounterSamplingPointAtStageBoundary)) {
++            *error = "the device cannot sample counters at stage boundaries";
++            return false;
++        }
++
++        for (; sampleCount >= 64; sampleCount /= 2) {
++            MTL::CounterSampleBufferDescriptor *sampleBufferDesc = MTL::CounterSampleBufferDescriptor::alloc()->init();
++            sampleBufferDesc->setCounterSet(device->timestampCounterSet);
++            sampleBufferDesc->setStorageMode(MTL::StorageModeShared);
++            sampleBufferDesc->setSampleCount(sampleCount);
++            NS::Error *sampleError = nullptr;
++            sampleBuffer = device->mtl->newCounterSampleBuffer(sampleBufferDesc, &sampleError);
++            sampleBufferDesc->release();
++            if (sampleBuffer != nullptr) {
++                capacity = sampleCount;
++                return true;
++            }
++
++            *error = "newCounterSampleBuffer(" + std::to_string(sampleCount) + " samples) failed";
++            if (sampleError != nullptr && sampleError->localizedDescription() != nullptr) {
++                *error += std::string(": ") + sampleError->localizedDescription()->utf8String();
++            }
++        }
++
++        return false;
++    }
++
++    void MetalPassTiming::begin() {
++        used = 0;
++        untimed = 0;
++        records.clear();
++        tag.clear();
++        active = true;
++
++        MTL::Timestamp cpu = 0, gpu = 0;
++        device->mtl->sampleTimestamps(&cpu, &gpu);
++        beginTicks = gpu;
++    }
++
++    void MetalPassTiming::resume() {
++        active = true;
++    }
++
++    void MetalPassTiming::end() {
++        active = false;
++    }
++
++    bool MetalPassTiming::allocate(const Kind kind, uint32_t &startIndex, uint32_t &endIndex) {
++        if (!active || sampleBuffer == nullptr) {
++            return false;
++        }
++
++        if (used + 2 > capacity) {
++            untimed++;
++            return false;
++        }
++
++        startIndex = used;
++        endIndex = used + 1;
++        used += 2;
++
++        Record record;
++        switch (kind) {
++        case Kind::Render:
++            record.tag = tag.empty() ? "render" : tag;
++            break;
++        case Kind::Compute:
++            record.tag = "compute";
++            break;
++        case Kind::Blit:
++            record.tag = "blit";
++            break;
++        case Kind::Resolve:
++            record.tag = "resolve";
++            break;
++        }
++
++        record.kind = kind;
++        record.startIndex = startIndex;
++        record.endIndex = endIndex;
++        records.push_back(std::move(record));
++        return true;
++    }
++
++    void MetalPassTiming::resolve(std::vector<Span> &out, uint32_t *invalid, uint32_t *rejected) {
++        if (used == 0 || sampleBuffer == nullptr) {
++            return;
++        }
++
++        MetalAutoreleasePool releasePool;
++        const NS::Data *data = sampleBuffer->resolveCounterRange(NS::Range(0, used));
++        if (data == nullptr || data->length() < used * sizeof(MTL::CounterResultTimestamp)) {
++            *invalid += uint32_t(records.size());
++            return;
++        }
++
++        const MetalDevice::GpuClock &clock = device->getGpuClock();
++        MTL::Timestamp cpuNow = 0, nowTicks = 0;
++        device->mtl->sampleTimestamps(&cpuNow, &nowTicks);
++        const MTL::CounterResultTimestamp *samples = static_cast<const MTL::CounterResultTimestamp *>(data->mutableBytes());
++        auto toHost = [&](const uint64_t ticks) {
++            return clock.hostSeconds + double(int64_t(ticks) - int64_t(clock.ticks)) * clock.secondsPerTick;
++        };
++
++        for (const Record &record : records) {
++            const uint64_t start = samples[record.startIndex].timestamp;
++            const uint64_t end = samples[record.endIndex].timestamp;
++            if (!clock.valid || start == 0 || end == 0 || start == MTL::CounterErrorValue || end == MTL::CounterErrorValue || end < start) {
++                (*invalid)++;
++                continue;
++            }
++
++            // Both samples lie between begin() and now (so the span is no longer than that), or one
++            // of them is left over from an older frame.
++            if (start < beginTicks || end > nowTicks) {
++                (*rejected)++;
++                continue;
++            }
++
++            out.push_back({ record.tag, record.kind, toHost(start), toHost(end) });
++        }
++    }
++
++    const MetalDevice::GpuClock &MetalDevice::getGpuClock() {
++        std::call_once(gpuClockOnce, [this]() {
++            auto hostNow = []() { return double(clock_gettime_nsec_np(CLOCK_UPTIME_RAW)) * 1e-9; };
++            MTL::Timestamp cpu0 = 0, gpu0 = 0, cpu1 = 0, gpu1 = 0;
++            const double before0 = hostNow();
++            mtl->sampleTimestamps(&cpu0, &gpu0);
++            const double after0 = hostNow();
++            usleep(20000);
++            const double before1 = hostNow();
++            mtl->sampleTimestamps(&cpu1, &gpu1);
++            const double after1 = hostNow();
++
++            // The host time of each sample is taken as the middle of the call that made it.
++            const double host0 = (before0 + after0) * 0.5, host1 = (before1 + after1) * 0.5;
++            if (gpu1 > gpu0 && host1 > host0) {
++                gpuClock.hostSeconds = host0;
++                gpuClock.ticks = gpu0;
++                gpuClock.secondsPerTick = (host1 - host0) / double(gpu1 - gpu0);
++                gpuClock.valid = true;
++            }
++        });
++
++        return gpuClock;
++    }
++
+     // MetalCommandList
+ 
+     MetalCommandList::MetalCommandList(const MetalCommandQueue *queue) {
+@@ -3428,13 +3599,14 @@ namespace plume {
+         handlePendingClears();
+         activeType = EncoderType::Render;
+ 
+-        const MTL::RenderPassDescriptor *renderPassDescriptor = MTL::RenderPassDescriptor::renderPassDescriptor();
++        MTL::RenderPassDescriptor *renderPassDescriptor = MTL::RenderPassDescriptor::renderPassDescriptor();
+         MTL::RenderPassColorAttachmentDescriptor *colorAttachment = renderPassDescriptor->colorAttachments()->object(0);
+ 
+         colorAttachment->setTexture(src->mtl);
+         colorAttachment->setResolveTexture(dst->mtl);
+         colorAttachment->setLoadAction(MTL::LoadActionLoad);
+         colorAttachment->setStoreAction(MTL::StoreActionMultisampleResolve);
++        timeRenderPass(renderPassDescriptor, MetalPassTiming::Kind::Resolve, 0, 0, 1);
+ 
+         MTL::RenderCommandEncoder *encoder = mtl->renderCommandEncoder(renderPassDescriptor);
+         encoder->setLabel(MTLSTR("Resolve Texture Encoder"));
+@@ -3693,6 +3865,61 @@ namespace plume {
+         }
+     }
+ 
++    void MetalCommandList::timeRenderPass(MTL::RenderPassDescriptor *descriptor, const MetalPassTiming::Kind kind, const uint32_t width, const uint32_t height, const uint32_t attachments) {
++        MetalPassTiming *timing = queue->passTiming;
++        if (timing == nullptr || !timing->active) {
++            return;
++        }
++
++        if (kind == MetalPassTiming::Kind::Render && timing->renderPassHook != nullptr) {
++            timing->renderPassHook(width, height, attachments);
++        }
++
++        uint32_t startIndex, endIndex;
++        if (!timing->allocate(kind, startIndex, endIndex)) {
++            return;
++        }
++
++        MTL::RenderPassSampleBufferAttachmentDescriptor *sampleDescriptor = descriptor->sampleBufferAttachments()->object(0);
++        sampleDescriptor->setSampleBuffer(timing->sampleBuffer);
++        sampleDescriptor->setStartOfVertexSampleIndex(startIndex);
++        sampleDescriptor->setEndOfVertexSampleIndex(MTL::CounterDontSample);
++        sampleDescriptor->setStartOfFragmentSampleIndex(MTL::CounterDontSample);
++        sampleDescriptor->setEndOfFragmentSampleIndex(endIndex);
++    }
++
++    MTL::ComputeCommandEncoder *MetalCommandList::newComputeEncoder(const MetalPassTiming::Kind kind) {
++        MetalPassTiming *timing = queue->passTiming;
++        uint32_t startIndex, endIndex;
++        if (timing == nullptr || !timing->allocate(kind, startIndex, endIndex)) {
++            return mtl->computeCommandEncoder(MTL::DispatchTypeConcurrent);
++        }
++
++        MTL::ComputePassDescriptor *descriptor = MTL::ComputePassDescriptor::computePassDescriptor();
++        descriptor->setDispatchType(MTL::DispatchTypeConcurrent);
++        MTL::ComputePassSampleBufferAttachmentDescriptor *sampleDescriptor = descriptor->sampleBufferAttachments()->object(0);
++        sampleDescriptor->setSampleBuffer(timing->sampleBuffer);
++        sampleDescriptor->setStartOfEncoderSampleIndex(startIndex);
++        sampleDescriptor->setEndOfEncoderSampleIndex(endIndex);
++        return mtl->computeCommandEncoder(descriptor);
++    }
++
++    MTL::BlitCommandEncoder *MetalCommandList::newBlitEncoder() {
++        MetalPassTiming *timing = queue->passTiming;
++        uint32_t startIndex, endIndex;
++        if (timing == nullptr || !timing->allocate(MetalPassTiming::Kind::Blit, startIndex, endIndex)) {
++            return mtl->blitCommandEncoder(device->sharedBlitDescriptor);
++        }
++
++        // Not the shared descriptor: it is the one every untimed blit encoder uses.
++        MTL::BlitPassDescriptor *descriptor = MTL::BlitPassDescriptor::blitPassDescriptor();
++        MTL::BlitPassSampleBufferAttachmentDescriptor *sampleDescriptor = descriptor->sampleBufferAttachments()->object(0);
++        sampleDescriptor->setSampleBuffer(timing->sampleBuffer);
++        sampleDescriptor->setStartOfEncoderSampleIndex(startIndex);
++        sampleDescriptor->setEndOfEncoderSampleIndex(endIndex);
++        return mtl->blitCommandEncoder(descriptor);
++    }
++
+     void MetalCommandList::endOtherEncoders(EncoderType type) {
+         if (activeType == type) {
+           // Early return for the most likely case.
+@@ -3726,7 +3953,7 @@ namespace plume {
+         activeType = EncoderType::Compute;
+ 
+         if (activeComputeEncoder == nullptr) {
+-            activeComputeEncoder = mtl->computeCommandEncoder(MTL::DispatchTypeConcurrent);
++            activeComputeEncoder = newComputeEncoder(MetalPassTiming::Kind::Compute);
+             activeComputeEncoder->setLabel(MTLSTR("Compute Encoder"));
+             activeComputeEncoder->retain();
+ 
+@@ -3830,6 +4057,9 @@ namespace plume {
+                 renderDescriptor->setVisibilityResultBuffer(visibilityPool->visibilityBuffer);
+             }
+ 
++            timeRenderPass(renderDescriptor, MetalPassTiming::Kind::Render, targetFramebuffer->width, targetFramebuffer->height,
++                uint32_t(targetFramebuffer->colorAttachments.size()) + (targetFramebuffer->depthAttachment.format != RenderFormat::UNKNOWN ? 1u : 0u));
++
+             activeRenderEncoder = mtl->renderCommandEncoder(renderDescriptor);
+             activeRenderEncoder->setLabel(MTLSTR("Graphics Render Encoder"));
+ 
+@@ -4036,7 +4266,7 @@ namespace plume {
+         activeType = EncoderType::Blit;
+ 
+         if (activeBlitEncoder == nullptr) {
+-            activeBlitEncoder = mtl->blitCommandEncoder(device->sharedBlitDescriptor);
++            activeBlitEncoder = newBlitEncoder();
+             activeBlitEncoder->retain();
+             activeBlitEncoder->setLabel(MTLSTR("Copy Blit Encoder"));
+ 
+@@ -4063,7 +4293,7 @@ namespace plume {
+         activeType = EncoderType::Resolve;
+ 
+         if (activeResolveComputeEncoder == nullptr) {
+-            activeResolveComputeEncoder = mtl->computeCommandEncoder(MTL::DispatchTypeConcurrent);
++            activeResolveComputeEncoder = newComputeEncoder(MetalPassTiming::Kind::Resolve);
+             activeResolveComputeEncoder->retain();
+             activeResolveComputeEncoder->setLabel(MTLSTR("Resolve Texture Encoder"));
+             activeResolveComputeEncoder->setComputePipelineState(device->resolveTexturePipelineState);
+diff --git a/plume_metal.h b/plume_metal.h
+index 3e76e0d..1039849 100644
+--- a/plume_metal.h
++++ b/plume_metal.h
+@@ -12,6 +12,7 @@
+ #include <cstdint>
+ #include <mutex>
+ #include <set>
++#include <string>
+ #include <unordered_set>
+ #include <vector>
+ 
+@@ -363,6 +364,68 @@ namespace plume {
+         }
+     }
+ 
++    // Per-encoder GPU timing for one frame (Fable 2 diagnostics): while it is set as the queue's
++    // passTiming and active, every encoder the queue's command lists begin gets two counter
++    // samples through its pass descriptor (render: start of vertex and end of fragment; compute and
++    // blit: start and end of the encoder), so no encoder is split or added. The renderer owns the
++    // object (one per frame in flight: the samples are written when the command buffers run) and
++    // resolves it once they completed.
++    struct MetalPassTiming {
++        enum class Kind : uint32_t { Render, Compute, Blit, Resolve };
++
++        struct Record {
++            std::string tag;
++            Kind kind = Kind::Render;
++            uint32_t startIndex = 0;
++            uint32_t endIndex = 0;
++        };
++
++        // An encoder's time on the host clock (seconds, the one of CACurrentMediaTime).
++        struct Span {
++            std::string tag;
++            Kind kind = Kind::Render;
++            double start = 0.0;
++            double end = 0.0;
++        };
++
++        MetalDevice *device = nullptr;
++        MTL::CounterSampleBuffer *sampleBuffer = nullptr;
++        uint32_t capacity = 0;
++        // Samples handed out this frame, the encoders that did not fit (left untimed), and the
++        // frame's records. The renderer's recording thread writes them; read them after the frame
++        // completed.
++        uint32_t used = 0;
++        uint32_t untimed = 0;
++        std::vector<Record> records;
++        bool active = false;
++        // The GPU timestamp taken by begin(): a sample below it was written before this frame (the
++        // sample buffer is not cleared, and the indices restart at 0), so it is stale.
++        uint64_t beginTicks = 0;
++        // The tag of the next render encoder (the renderer sets it, directly or through the hook).
++        std::string tag;
++        // Called when a render encoder is about to begin (before its tag is read), with the pass's
++        // size and attachment count.
++        void (*renderPassHook)(uint32_t width, uint32_t height, uint32_t attachments) = nullptr;
++
++        explicit MetalPassTiming(MetalDevice *device);
++        ~MetalPassTiming();
++        // Creates a sample buffer for sampleCount samples (halved while the device refuses it, down
++        // to 64); false with the device's message in *error when none can be made.
++        bool create(uint32_t sampleCount, std::string *error);
++        // Starts a frame: clears the records and takes beginTicks. resume() goes on with a frame
++        // whose records were not resolved yet (the renderer submitted and began the same slot's list
++        // again in the middle of a frame): the records and the indices are kept.
++        void begin();
++        void resume();
++        void end();
++        bool allocate(Kind kind, uint32_t &startIndex, uint32_t &endIndex);
++        // Resolves the used samples (the frame's command buffers must have completed). Spans with an
++        // error or missing sample are counted in *invalid. Spans with a sample from before begin() or
++        // from the future (stale data of an older frame, or a pass that wrote nothing) are counted in
++        // *rejected. Both are left out.
++        void resolve(std::vector<Span> &out, uint32_t *invalid, uint32_t *rejected);
++    };
++
+     // One committed command buffer's time on the GPU.
+     struct MetalGpuInterval {
+         double start = 0.0;
+@@ -529,6 +592,12 @@ namespace plume {
+         const char *debugLabelCached = nullptr;
+         NS::String *debugLabelString = nullptr;
+ 
++        // Pass timing (the queue's passTiming): the pass descriptors of the encoders begun while it
++        // is active carry counter samples.
++        void timeRenderPass(MTL::RenderPassDescriptor *descriptor, MetalPassTiming::Kind kind, uint32_t width, uint32_t height, uint32_t attachments);
++        MTL::ComputeCommandEncoder *newComputeEncoder(MetalPassTiming::Kind kind);
++        MTL::BlitCommandEncoder *newBlitEncoder();
++
+         // Occlusion queries. visibilityPool's buffer is the visibility result buffer of every render
+         // encoder begun from now on (encoderVisibilityPool: the one of the active encoder). One query
+         // counts at a time (Vulkan also allows one active occlusion query); it counts in every encoder
+@@ -676,6 +745,10 @@ namespace plume {
+         // Appends the recorded intervals to out and returns how many were dropped since the last drain.
+         uint64_t drainGpuIntervals(std::vector<MetalGpuInterval> &out);
+         void recordGpuInterval(MTL::CommandBuffer *commandBuffer, const char *label);
++
++        // The frame's pass timing, or null. Set by the renderer while it records a frame, from the
++        // recording thread; every command list of the queue reads it when it begins an encoder.
++        MetalPassTiming *passTiming = nullptr;
+         // Waits until nothing is in flight; false after timeoutMs (a buffer stuck on a semaphore).
+         bool waitIdle(uint32_t timeoutMs = 5000);
+ 
+@@ -885,6 +958,19 @@ namespace plume {
+         // Counter sets for query pools
+         MTL::CounterSet* timestampCounterSet = nullptr;
+ 
++        // The GPU's counter timestamps on the host clock: a GPU timestamp and the host time it was
++        // sampled at, and seconds per tick measured between two samples 20 ms apart. The first
++        // getGpuClock call makes the measurement (and waits that long).
++        struct GpuClock {
++            bool valid = false;
++            double hostSeconds = 0.0;
++            uint64_t ticks = 0;
++            double secondsPerTick = 0.0;
++        };
++        std::once_flag gpuClockOnce;
++        GpuClock gpuClock;
++        const GpuClock &getGpuClock();
++
+         explicit MetalDevice(MetalInterface *renderInterface, const std::string &preferredDeviceName);
+         ~MetalDevice() override;
+         std::unique_ptr<RenderDescriptorSet> createDescriptorSet(const RenderDescriptorSetDesc &desc) override;
