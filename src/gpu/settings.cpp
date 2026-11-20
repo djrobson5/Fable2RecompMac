@@ -17,6 +17,7 @@
 #include <rex/cvar.h>
 
 #include "core/logging.h"
+#include "gpu/backend.h"
 
 REXCVAR_DEFINE_INT32(eot_trace_frames, 0, "EdgeOfTime/Debug", "Frames of D3D call tracing")
     .range(0, 100000);
@@ -40,6 +41,13 @@ REXCVAR_DEFINE_DOUBLE(eot_render_scale, 1.0, "EdgeOfTime/Video", "Internal rende
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(eot_resolution, "1080p", "EdgeOfTime/Video", "Internal render resolution")
     .allowed({"native", "720p", "1080p", "1440p", "2160p", "display"})
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+// Fable 2: the GPU backend. vulkan = plume's Vulkan backend on MoltenVK (the
+// tested path); metal = plume's Metal backend, shaders converted to MSL at run
+// time (work in progress; tools/metal_selftest checks every shader offline).
+// Read once, at device creation.
+REXCVAR_DEFINE_STRING(fable2_gpu_backend, "vulkan", "Fable2", "GPU backend: vulkan (MoltenVK) or metal")
+    .allowed({"vulkan", "metal"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(eot_fullscreen_mode, "borderless", "EdgeOfTime/Video", "Borderless or exclusive fullscreen")
     .allowed({"borderless", "exclusive"})
@@ -131,6 +139,25 @@ i32 Settings::DiagVerbosity() { return REXCVAR_GET(eot_diag); }
 bool Settings::Vsync() { return REXCVAR_GET(eot_vsync); }
 bool Settings::FastSettersVerify() { return REXCVAR_GET(eot_fast_setters_verify); }
 f64 Settings::RenderScale() { return REXCVAR_GET(eot_render_scale); }
+#if !defined(EOT_D3D12)
+bool UseMetal() {
+  static const bool metal = [] {
+    const bool asked = std::string(REXCVAR_GET(fable2_gpu_backend)) == "metal";
+#if defined(__APPLE__) && defined(FABLE2_METAL_BACKEND)
+    if (asked)
+      EOT_INFO("[gpu] fable2_gpu_backend=metal: plume's Metal backend (work in progress)");
+    return asked;
+#else
+    if (asked)
+      EOT_WARN("[gpu] fable2_gpu_backend=metal, but this build has no Metal backend "
+               "(FABLE2_METAL_BACKEND off): using Vulkan");
+    return false;
+#endif
+  }();
+  return metal;
+}
+#endif
+
 std::string Settings::Resolution() { return std::string(REXCVAR_GET(eot_resolution)); }
 std::string Settings::FullscreenMode() { return std::string(REXCVAR_GET(eot_fullscreen_mode)); }
 i32 Settings::PipScalePercent() { return REXCVAR_GET(eot_pip_scale); }

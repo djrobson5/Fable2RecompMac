@@ -30,6 +30,7 @@
 
 #include "core/logging.h"
 #include "core/memory_helpers.h"
+#include "gpu/backend.h"
 #include "gpu/device.h"
 
 REXCVAR_DEFINE_BOOL(fable2_resolve_writeback, true, "Fable2",
@@ -211,6 +212,13 @@ bool QueueResolveWritebackLocked(VideoState &s, GuestTexture &d) {
     return false;
 
   TransitionLocked(s, h, plume::RenderTextureLayout::COPY_SOURCE);
+#if defined(FABLE2_METAL_BACKEND)
+  if (UseMetal()) {
+    MetalCopyTextureToBuffer(s.command_list, h.texture.get(), 0, buffer.get(), 0, host_format, 0, 0, h.width,
+                             h.height, row / 4);
+  } else
+#endif
+  {
   VkBufferImageCopy region{};
   region.bufferOffset = 0;
   region.bufferRowLength = row / 4;
@@ -221,6 +229,7 @@ bool QueueResolveWritebackLocked(VideoState &s, GuestTexture &d) {
                          static_cast<plume::VulkanTexture *>(h.texture.get())->vk,
                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                          static_cast<plume::VulkanBuffer *>(buffer.get())->vk, 1, &region);
+  }
   s.bound_framebuffer = nullptr;
 
   Pending p;
@@ -314,10 +323,21 @@ void ProbeAfterDrawLocked(VideoState &s, HostTexture *colour, HostTexture *depth
   e.x = std::min(static_cast<u32>(fx * static_cast<float>(width) * scale), 1u << 14);
   e.y = std::min(static_cast<u32>(fy * static_cast<float>(height) * scale), 1u << 14);
   const u64 offset = u64(g_probe.entries.size()) * kProbeStride;
-  auto *cmd = static_cast<plume::VulkanCommandList *>(s.command_list)->vk;
-  auto *buffer = static_cast<plume::VulkanBuffer *>(g_probe.buffer.get())->vk;
+  const bool metal = UseMetal();
+  auto *cmd = metal ? nullptr : static_cast<plume::VulkanCommandList *>(s.command_list)->vk;
+  auto *buffer = metal ? nullptr : static_cast<plume::VulkanBuffer *>(g_probe.buffer.get())->vk;
   auto copy = [&](HostTexture &h, VkImageAspectFlags aspect, u64 at) {
     TransitionLocked(s, h, plume::RenderTextureLayout::COPY_SOURCE);
+#if defined(FABLE2_METAL_BACKEND)
+    if (metal) {
+      // One texel: the colour target's format, or the depth as a float.
+      const plume::RenderFormat format =
+          aspect == VK_IMAGE_ASPECT_DEPTH_BIT ? plume::RenderFormat::R32_FLOAT : h.format;
+      MetalCopyTextureToBuffer(s.command_list, h.texture.get(), 0, g_probe.buffer.get(), at, format, e.x, e.y, 1, 1,
+                               1);
+      return;
+    }
+#endif
     VkBufferImageCopy region{};
     region.bufferOffset = at;
     region.imageSubresource = {aspect, 0, 0, 1};

@@ -19,6 +19,10 @@
 #else
 #include <plume_vulkan.h>
 #endif
+#if defined(FABLE2_METAL_BACKEND)
+#include <dispatch/dispatch.h>
+#include <plume_metal.h>
+#endif
 #include <rex/cvar.h>
 
 REXCVAR_DEFINE_INT32(fable2_chunk_submit_draws, 600, "Fable2",
@@ -32,6 +36,7 @@ REXCVAR_DEFINE_BOOL(fable2_destroy_when_queue_idle, true, "Fable2",
 #include "gpu/queries.h"
 #include "gpu/writeback.h"
 #include "gpu/render_thread.h"
+#include "gpu/backend.h"
 #include "gpu/device.h"
 #include "gpu/draw.h"
 #include "gpu/gpu_timing.h"
@@ -236,6 +241,18 @@ bool QueueIdleLocked(VideoState &s, bool wait) {
 #else
   if (!s.tail_fence_inflight)
     return false;
+#if defined(FABLE2_METAL_BACKEND)
+  if (UseMetal()) {
+    // plume's Metal fence is a dispatch semaphore the marker's completion
+    // handler signals; a successful wait consumes the signal (the reset).
+    if (!s.tail_fence_is_last)
+      wait = false;
+    auto *fence = static_cast<plume::MetalCommandFence *>(s.tail_fence.get());
+    if (dispatch_semaphore_wait(fence->semaphore, wait ? DISPATCH_TIME_FOREVER : DISPATCH_TIME_NOW) != 0)
+      return false;
+  } else
+#endif
+  {
   auto *dev = static_cast<plume::VulkanDevice *>(s.device.get());
   VkFence fence = TailFence(s);
   if (!s.tail_fence_is_last)
@@ -245,6 +262,7 @@ bool QueueIdleLocked(VideoState &s, bool wait) {
   if (res != VK_SUCCESS)
     return false;
   vkResetFences(dev->vk, 1, &fence);
+  }
   s.tail_fence_inflight = false;
   if (s.tail_fence_is_last) {
     s.tail_fence_is_last = false;
@@ -279,6 +297,25 @@ void SubmitQueueMarkerLocked(VideoState &s) {
   QueueIdleLocked(s, false); // reclaim the previous marker if it signalled
   if (s.tail_fence_inflight)
     return;
+#if defined(FABLE2_METAL_BACKEND)
+  if (UseMetal()) {
+    // Metal: an empty command list carries the marker fence (plume submits
+    // at least one list); the queue runs command buffers in commit order.
+    if (!s.tail_fence)
+      s.tail_fence = s.device->createCommandFence();
+    if (!s.tail_list)
+      s.tail_list = s.queue->createCommandList();
+    if (!s.tail_fence || !s.tail_list)
+      return;
+    s.tail_list->begin();
+    s.tail_list->end();
+    const plume::RenderCommandList *lists[] = {s.tail_list.get()};
+    s.queue->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, s.tail_fence.get());
+    s.tail_fence_inflight = true;
+    s.tail_fence_is_last = true;
+    return;
+  }
+#endif
   VkFence fence = TailFence(s);
   if (fence == VK_NULL_HANDLE)
     return;

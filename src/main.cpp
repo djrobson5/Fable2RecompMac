@@ -101,8 +101,10 @@ class Fable2App : public rex::ReXApp {
 #if defined(__APPLE__)
     // MoltenVK warns on every pipeline that Metal can't disable primitive
     // restart; logging that tens of thousands of times costs frame time.
-    // Errors only, unless the user set their own level.
-    setenv("MVK_CONFIG_LOG_LEVEL", "1", 0);
+    // Errors only, unless the user set their own level. (The native renderer's
+    // Metal backend, fable2_gpu_backend=metal, loads no MoltenVK.)
+    if (rex::cvar::GetFlagByName("fable2_gpu_backend") != "metal")
+      setenv("MVK_CONFIG_LOG_LEVEL", "1", 0);
 #if !defined(FABLE2_NATIVE_RENDERER)
     // Encode Vulkan commands into Metal on MoltenVK's own thread instead of
     // the GPU emulation thread. (The native renderer sets its own MoltenVK

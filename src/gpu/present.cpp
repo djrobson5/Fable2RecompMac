@@ -137,6 +137,10 @@ bool HandleResize(VideoState &s) {
   }
 
 #if !defined(EOT_D3D12)
+  // Metal: plume has no queue-idle wait; the fence waits above cover every
+  // command list this renderer submitted, and Metal keeps a drawable being
+  // presented alive across the layer's resize.
+  if (!UseMetal()) {
   auto *vk_queue = static_cast<plume::VulkanCommandQueue *>(s.queue.get());
   VkResult idle_result = VK_ERROR_DEVICE_LOST;
   if (vk_queue && vk_queue->queue) {
@@ -150,6 +154,7 @@ bool HandleResize(VideoState &s) {
     ReportSwapChainFailure(s, "present queue idle wait");
     DisableFailedDevice(s);
     return false;
+  }
   }
 #endif
 
@@ -1092,7 +1097,8 @@ void PresentLocked(VideoState &s, u32 front_buffer_texture_va) {
   FlushGeometryStaging(s);
   GpuTimingFrameEnd(cmd);
 #if !defined(EOT_D3D12)
-  plume::VulkanCommandList::lazyClearsEndFrame();
+  if (!UseMetal())
+    plume::VulkanCommandList::lazyClearsEndFrame();
 #endif
   s.command_lists[cur]->end();
   s.command_list_open = false;

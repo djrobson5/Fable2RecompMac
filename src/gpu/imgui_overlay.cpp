@@ -125,8 +125,8 @@ bool OverlayDrawer::EnsureResources(VideoState &s) {
   if (failed_ || !s.ready || !s.device)
     return false;
 
-  vs_ = s.device->createShader(EOT_SHADER_BLOB(imgui_vs), "main", kHostShaderFormat);
-  ps_ = s.device->createShader(EOT_SHADER_BLOB(imgui_ps), "main", kHostShaderFormat);
+  vs_ = CreateHostShader(s.device.get(), EOT_SHADER_BLOB(imgui_vs));
+  ps_ = CreateHostShader(s.device.get(), EOT_SHADER_BLOB(imgui_ps), 1);
   if (!vs_ || !ps_) {
     EOT_ERROR("[overlay] createShader failed; overlays will not draw");
     failed_ = true;

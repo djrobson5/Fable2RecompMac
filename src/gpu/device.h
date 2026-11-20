@@ -345,6 +345,7 @@ struct VideoState {
   // known idle: a fence-only submit after each present has signalled with
   // nothing submitted since (fable2_destroy_when_queue_idle).
   std::unique_ptr<plume::RenderCommandFence> tail_fence;
+  std::unique_ptr<plume::RenderCommandList> tail_list; // Metal: the marker's empty list
   bool tail_fence_inflight = false; // submitted, not yet seen signalled
   bool tail_fence_is_last = false;  // no queue operation after it
   bool queue_idle = false;          // nothing submitted since the queue drained
@@ -582,6 +583,12 @@ bool DumpHostMipBc1Locked(VideoState &s, HostTexture &host, u32 level, const cha
 // Temporary diagnostics: mip 0 of a 4-byte-per-texel image (or a depth image's
 // depth aspect) as raw texels after a "w h isDepth" text line.
 bool DumpHostRawLocked(VideoState &s, HostTexture &host, const char *path);
+#if defined(FABLE2_METAL_BACKEND)
+// Metal's vkCmdCopyImageToBuffer (plume copyTextureRegion into a buffer).
+void MetalCopyTextureToBuffer(plume::RenderCommandList *cmd, plume::RenderTexture *texture, u32 level,
+                              plume::RenderBuffer *buffer, u64 offset, plume::RenderFormat footprint_format,
+                              u32 x, u32 y, u32 w, u32 h, u32 row_texels);
+#endif
 bool DumpHostTextureLocked(VideoState &s, HostTexture &host, const char *path, float scale,
                            u32 lut_index = kInvalidDescriptorIndex,
                            u32 swizzle = kIdentityFetchSwizzle, u32 level = 0, bool alpha_view = false);

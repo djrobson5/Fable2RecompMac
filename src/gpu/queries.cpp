@@ -25,6 +25,7 @@
 
 #include "core/logging.h"
 #include <rex/cvar.h>
+#include "gpu/backend.h"
 #include "gpu/device.h"
 #include "gpu/render_thread.h"
 #include "gpu/settings.h"
@@ -136,7 +137,8 @@ namespace {
 bool QueriesBreakPass(VideoState &s) {
   const bool brk = REXCVAR_GET(fable2_query_break_pass);
 #if !defined(EOT_D3D12)
-  static_cast<plume::VulkanCommandList *>(s.command_list)->queriesEndRenderPass = brk;
+  if (!UseMetal())
+    static_cast<plume::VulkanCommandList *>(s.command_list)->queriesEndRenderPass = brk;
 #endif
   return brk;
 }

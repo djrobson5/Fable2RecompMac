@@ -226,7 +226,7 @@ bool EnsureShader(VideoState &s, State &st, plume::RenderFormat format) {
   if (st.shaderFailed)
     return false;
   if (!st.ps) {
-    st.ps = s.device->createShader(EOT_SHADER_BLOB(taa_ps), "main", kHostShaderFormat);
+    st.ps = CreateHostShader(s.device.get(), EOT_SHADER_BLOB(taa_ps));
     if (!st.ps) {
       st.shaderFailed = true;
       EOT_ERROR("[taa] createShader failed; temporal anti-aliasing off");
@@ -792,16 +792,13 @@ bool EnsureResolvePipeline(VideoState &s, u32 samples) {
   if (!r.resolvePs[tier]) {
     switch (tier) {
     case 0:
-      r.resolvePs[tier] = s.device->createShader(EOT_SHADER_BLOB(velocity_resolve_2x_ps), "main",
-                                                 kHostShaderFormat);
+      r.resolvePs[tier] = CreateHostShader(s.device.get(), EOT_SHADER_BLOB(velocity_resolve_2x_ps));
       break;
     case 1:
-      r.resolvePs[tier] = s.device->createShader(EOT_SHADER_BLOB(velocity_resolve_4x_ps), "main",
-                                                 kHostShaderFormat);
+      r.resolvePs[tier] = CreateHostShader(s.device.get(), EOT_SHADER_BLOB(velocity_resolve_4x_ps));
       break;
     default:
-      r.resolvePs[tier] = s.device->createShader(EOT_SHADER_BLOB(velocity_resolve_8x_ps), "main",
-                                                 kHostShaderFormat);
+      r.resolvePs[tier] = CreateHostShader(s.device.get(), EOT_SHADER_BLOB(velocity_resolve_8x_ps));
       break;
     }
     if (!r.resolvePs[tier]) {

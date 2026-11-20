@@ -29,6 +29,9 @@
 #if !defined(EOT_D3D12)
 #include <smolv.h>
 #endif
+#if defined(FABLE2_METAL_BACKEND)
+#include "gpu/shaders/msl_convert.h"
+#endif
 
 void Fable2WriteShaderContainer(const unsigned char *virtual_bytes, unsigned virtual_size,
                                 const unsigned char *physical_bytes, unsigned physical_size,
@@ -685,7 +688,10 @@ plume::RenderShader *GetHostShaderByHash(VideoState &s, u64 hash, u32 spec_mask,
       decoded.clear();
     }
 #if defined(EOT_MVK)
-    StrictMathForMetal(decoded);
+    // MoltenVK only: on Metal the MSL converter turns NoContraction into safe
+    // math itself (msl_convert.cpp).
+    if (!UseMetal())
+      StrictMathForMetal(decoded);
 #endif
     bytes = decoded.data();
     size = static_cast<u32>(decoded.size());
@@ -719,6 +725,16 @@ plume::RenderShader *GetHostShaderByHash(VideoState &s, u64 hash, u32 spec_mask,
 #endif
   if (bytes && size) {
     (void)worker;
+#if defined(FABLE2_METAL_BACKEND)
+    if (UseMetal()) {
+      const MslShader msl = SpirvToMsl(bytes, size);
+      if (msl.ok())
+        host = s.device->createShader(msl.source.data(), msl.source.size(), msl.entry.c_str(),
+                                      plume::RenderShaderFormat::METAL);
+      else
+        EOT_ERROR("[shaders] {:016x}: SPIR-V to MSL failed: {}", hash, msl.error);
+    } else
+#endif
     host = s.device->createShader(bytes, size, GuestEntryPoint(bytes, size).c_str(), kHostShaderFormat);
     if (host)
       host->setName(std::format("{:016x}", hash));

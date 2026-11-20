@@ -28,6 +28,10 @@
 #else
 #include <plume_vulkan.h>
 #endif
+#if defined(FABLE2_METAL_BACKEND)
+#include <plume_metal.h>
+#include "gpu/shaders/msl_convert.h"
+#endif
 
 #if !defined(_WIN32)
 #include <dlfcn.h>
@@ -89,6 +93,9 @@ namespace plume {
 extern std::unique_ptr<RenderInterface> CreateD3D12Interface();
 #else
 extern std::unique_ptr<RenderInterface> CreateVulkanInterface();
+#endif
+#if defined(FABLE2_METAL_BACKEND)
+extern std::unique_ptr<RenderInterface> CreateMetalInterface();
 #endif
 }
 
@@ -180,10 +187,48 @@ std::string DescribeBackend(plume::RenderDevice *device) {
   return "D3D12";
 #else
   (void)device;
-  return "Vulkan";
+  return UseMetal() ? "Metal" : "Vulkan";
 #endif
 }
 
+
+}
+
+#if defined(FABLE2_METAL_BACKEND)
+// Metal: what vkCmdCopyImageToBuffer does on Vulkan, through plume (patch
+// 0011): w x h texels at (x, y) of a mip level into the buffer at offset, rows
+// of row_texels texels of footprint_format (for a depth texture, R32_FLOAT
+// takes the depth).
+void MetalCopyTextureToBuffer(plume::RenderCommandList *cmd, plume::RenderTexture *texture, u32 level,
+                              plume::RenderBuffer *buffer, u64 offset, plume::RenderFormat footprint_format,
+                              u32 x, u32 y, u32 w, u32 h, u32 row_texels) {
+  const plume::RenderBox box(static_cast<i32>(x), static_cast<i32>(y), static_cast<i32>(x + w),
+                             static_cast<i32>(y + h));
+  cmd->copyTextureRegion(
+      plume::RenderTextureCopyLocation::PlacedFootprint(buffer, footprint_format, w, h, 1, row_texels, offset),
+      plume::RenderTextureCopyLocation::Subresource(texture, level), 0, 0, 0, &box);
+}
+#endif
+
+std::unique_ptr<plume::RenderShader> CreateHostShader(plume::RenderDevice *device, const void *blob, u64 size,
+                                                      u32 push_binding) {
+  if (!device)
+    return nullptr;
+#if defined(FABLE2_METAL_BACKEND)
+  if (UseMetal()) {
+    MslOptions options;
+    options.pushConstantBinding = push_binding;
+    const MslShader msl = SpirvToMsl(blob, size, options);
+    if (!msl.ok()) {
+      EOT_ERROR("[metal] host shader: SPIR-V to MSL failed: {}", msl.error);
+      return nullptr;
+    }
+    return device->createShader(msl.source.data(), msl.source.size(), msl.entry.c_str(),
+                                plume::RenderShaderFormat::METAL);
+  }
+#endif
+  (void)push_binding;
+  return device->createShader(blob, size, "main", kHostShaderFormat);
 }
 
 namespace {
@@ -262,6 +307,14 @@ bool DumpHostRawLocked(VideoState &s, HostTexture &host, const char *path) {
   if (!readback)
     return false;
   TransitionLocked(s, host, plume::RenderTextureLayout::COPY_SOURCE);
+#if defined(FABLE2_METAL_BACKEND)
+  if (UseMetal()) {
+    MetalCopyTextureToBuffer(s.command_list, host.texture.get(), 0, readback.get(), 0,
+                             host.isDepth ? plume::RenderFormat::R32_FLOAT : plume::RenderFormat::R8G8B8A8_UNORM,
+                             0, 0, w, h, w);
+  } else
+#endif
+  {
   VkBufferImageCopy region{};
   region.imageSubresource = {
       static_cast<VkImageAspectFlags>(host.isDepth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0,
@@ -271,6 +324,7 @@ bool DumpHostRawLocked(VideoState &s, HostTexture &host, const char *path) {
                          static_cast<plume::VulkanTexture *>(host.texture.get())->vk,
                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                          static_cast<plume::VulkanBuffer *>(readback.get())->vk, 1, &region);
+  }
   s.bound_pipeline = nullptr;
   s.bound_framebuffer = nullptr;
   const u32 cur = s.recording_slot();
@@ -309,6 +363,12 @@ bool DumpHostMipBc1Locked(VideoState &s, HostTexture &host, u32 level, const cha
     return false;
   auto *cmd = s.command_list;
   TransitionLocked(s, host, plume::RenderTextureLayout::COPY_SOURCE);
+#if defined(FABLE2_METAL_BACKEND)
+  if (UseMetal()) {
+    MetalCopyTextureToBuffer(cmd, host.texture.get(), level, readback.get(), 0, host.format, 0, 0, w, h, bw * 4);
+  } else
+#endif
+  {
   VkBufferImageCopy region{};
   region.bufferRowLength = bw * 4;
   region.bufferImageHeight = bh * 4;
@@ -320,6 +380,7 @@ bool DumpHostMipBc1Locked(VideoState &s, HostTexture &host, u32 level, const cha
                          static_cast<plume::VulkanTexture *>(host.texture.get())->vk,
                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                          static_cast<plume::VulkanBuffer *>(readback.get())->vk, 1, &region);
+  }
   s.bound_pipeline = nullptr;
   s.bound_framebuffer = nullptr;
   const u32 cur = s.recording_slot();
@@ -453,6 +514,12 @@ bool DumpHostTextureLocked(VideoState &s, HostTexture &host, const char *path, f
                                                                         nullptr);
   }
 #else
+#if defined(FABLE2_METAL_BACKEND)
+  if (UseMetal()) {
+    MetalCopyTextureToBuffer(cmd, target.texture.get(), 0, readback.get(), 0, plume::RenderFormat::R8G8B8A8_UNORM, 0,
+                             0, w, h, row / 4);
+  } else
+#endif
   {
     VkBufferImageCopy region{};
     region.bufferOffset = 0;
@@ -799,6 +866,9 @@ CreateHostBuffer(plume::RenderDevice *device, const plume::RenderBufferDesc &des
   if (!buffer
 #if defined(EOT_D3D12)
       || static_cast<plume::D3D12Buffer *>(buffer.get())->d3d == nullptr
+#elif defined(FABLE2_METAL_BACKEND)
+      || (UseMetal() ? static_cast<plume::MetalBuffer *>(buffer.get())->mtl == nullptr
+                     : static_cast<plume::VulkanBuffer *>(buffer.get())->vk == VK_NULL_HANDLE)
 #else
       || static_cast<plume::VulkanBuffer *>(buffer.get())->vk == VK_NULL_HANDLE
 #endif
@@ -833,6 +903,9 @@ CreateHostTexture(plume::RenderDevice *device, const plume::RenderTextureDesc &d
   if (!texture
 #if defined(EOT_D3D12)
       || static_cast<plume::D3D12Texture *>(texture.get())->d3d == nullptr
+#elif defined(FABLE2_METAL_BACKEND)
+      || (UseMetal() ? static_cast<plume::MetalTexture *>(texture.get())->mtl == nullptr
+                     : static_cast<plume::VulkanTexture *>(texture.get())->vk == VK_NULL_HANDLE)
 #else
       || static_cast<plume::VulkanTexture *>(texture.get())->vk == VK_NULL_HANDLE
 #endif
@@ -863,6 +936,9 @@ CreateHostGraphicsPipeline(plume::RenderDevice *device,
   if (!pipeline
 #if defined(EOT_D3D12)
       || static_cast<plume::D3D12GraphicsPipeline *>(pipeline.get())->d3d == nullptr
+#elif defined(FABLE2_METAL_BACKEND)
+      || (UseMetal() ? static_cast<plume::MetalGraphicsPipeline *>(pipeline.get())->state.renderPipelineState == nullptr
+                     : static_cast<plume::VulkanGraphicsPipeline *>(pipeline.get())->vk == VK_NULL_HANDLE)
 #else
       || static_cast<plume::VulkanGraphicsPipeline *>(pipeline.get())->vk == VK_NULL_HANDLE
 #endif
@@ -996,26 +1072,26 @@ bool BuildPipelineLayout(VideoState &s) {
 }
 
 bool BuildHelperPipelines(VideoState &s) {
-  s.copy_vs = s.device->createShader(EOT_SHADER_BLOB(copy_vs), "main", kHostShaderFormat);
-  s.blit_ps = s.device->createShader(EOT_SHADER_BLOB(blit_ps), "main", kHostShaderFormat);
+  s.copy_vs = CreateHostShader(s.device.get(), EOT_SHADER_BLOB(copy_vs));
+  s.blit_ps = CreateHostShader(s.device.get(), EOT_SHADER_BLOB(blit_ps));
   s.copy_depth_ps =
-      s.device->createShader(EOT_SHADER_BLOB(copy_depth_ps), "main", kHostShaderFormat);
+      CreateHostShader(s.device.get(), EOT_SHADER_BLOB(copy_depth_ps));
   if (!s.copy_vs || !s.blit_ps || !s.copy_depth_ps) {
     EOT_ERROR("createShader for the host helper passes failed");
     return false;
   }
   s.resolve_msaa_color_ps[0] =
-      s.device->createShader(EOT_SHADER_BLOB(resolve_msaa_color_2x_ps), "main", kHostShaderFormat);
+      CreateHostShader(s.device.get(), EOT_SHADER_BLOB(resolve_msaa_color_2x_ps));
   s.resolve_msaa_color_ps[1] =
-      s.device->createShader(EOT_SHADER_BLOB(resolve_msaa_color_4x_ps), "main", kHostShaderFormat);
+      CreateHostShader(s.device.get(), EOT_SHADER_BLOB(resolve_msaa_color_4x_ps));
   s.resolve_msaa_color_ps[2] =
-      s.device->createShader(EOT_SHADER_BLOB(resolve_msaa_color_8x_ps), "main", kHostShaderFormat);
+      CreateHostShader(s.device.get(), EOT_SHADER_BLOB(resolve_msaa_color_8x_ps));
   s.resolve_msaa_depth_ps[0] =
-      s.device->createShader(EOT_SHADER_BLOB(resolve_msaa_depth_2x_ps), "main", kHostShaderFormat);
+      CreateHostShader(s.device.get(), EOT_SHADER_BLOB(resolve_msaa_depth_2x_ps));
   s.resolve_msaa_depth_ps[1] =
-      s.device->createShader(EOT_SHADER_BLOB(resolve_msaa_depth_4x_ps), "main", kHostShaderFormat);
+      CreateHostShader(s.device.get(), EOT_SHADER_BLOB(resolve_msaa_depth_4x_ps));
   s.resolve_msaa_depth_ps[2] =
-      s.device->createShader(EOT_SHADER_BLOB(resolve_msaa_depth_8x_ps), "main", kHostShaderFormat);
+      CreateHostShader(s.device.get(), EOT_SHADER_BLOB(resolve_msaa_depth_8x_ps));
   for (u32 i = 0; i < 3; ++i) {
     if (!s.resolve_msaa_color_ps[i] || !s.resolve_msaa_depth_ps[i]) {
       EOT_ERROR("createShader for the multisample resolve passes failed");
@@ -1235,7 +1311,9 @@ bool Video::CreateHostDevice(rex::ui::Window *window) {
     return false;
   }
 #elif defined(__APPLE__)
-  if (!eot::platform::PrepareMoltenVK() || !eot::platform::GetMetalRenderWindow(render_window))
+  // Metal needs only the window's CAMetalLayer; the MoltenVK setup (Vulkan
+  // loader, ICD, MVK_CONFIG_*) is for the Vulkan backend.
+  if ((!UseMetal() && !eot::platform::PrepareMoltenVK()) || !eot::platform::GetMetalRenderWindow(render_window))
     return false;
 #else
   EOT_ERROR("Native window handles are not wired up for this platform");
@@ -1254,6 +1332,8 @@ bool Video::CreateHostDevice(rex::ui::Window *window) {
   }
 #endif
   s.render_iface = plume::CreateD3D12Interface();
+#elif defined(FABLE2_METAL_BACKEND)
+  s.render_iface = UseMetal() ? plume::CreateMetalInterface() : plume::CreateVulkanInterface();
 #else
   s.render_iface = plume::CreateVulkanInterface();
 #endif
@@ -1267,6 +1347,11 @@ bool Video::CreateHostDevice(rex::ui::Window *window) {
     return false;
   }
   s.backend_info = DescribeBackend(s.device.get());
+  if (UseMetal())
+    EOT_WARN("[metal] the Metal backend is work in progress. Not on Metal yet: occlusion queries (they "
+             "report not ready), GPU timing, Vulkan's lazy clears and persistent render pass (plume patches "
+             "0006/0007; plume's Metal backend has its own clear load actions), a shader cache (shaders are "
+             "converted to MSL and compiled when first used)");
 
   s.queue = s.device->createCommandQueue(plume::RenderCommandListType::DIRECT);
   for (u32 i = 0; i < kNumFrames; ++i) {

@@ -23,6 +23,7 @@
 
 #include "core/logging.h"
 #include "core/profiling.h"
+#include "gpu/backend.h"
 #include "gpu/device.h"
 #include "gpu/draw.h"
 #include "gpu/settings.h"
@@ -332,7 +333,8 @@ void DepthPrerun(VideoState &s, Queue &q, u64 head) {
   uint32_t known_stencil = 0;
   bool known_clear = false;
 #if !defined(EOT_D3D12)
-  known_clear = dimg && dimg->valid() && !pending_clear && REXCVAR_GET(fable2_zpass_reclear) &&
+  // Vulkan's lazy clears (plume patch 0007) only; Metal keeps no such list.
+  known_clear = !UseMetal() && dimg && dimg->valid() && !pending_clear && REXCVAR_GET(fable2_zpass_reclear) &&
                 plume::VulkanCommandList::pendingWholeDepthClear(dimg->texture.get(), &known_depth, &known_stencil);
 #endif
   static HostTexture spare;

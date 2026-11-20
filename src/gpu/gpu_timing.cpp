@@ -157,6 +157,12 @@ bool DiagFrameNow(const VideoState &s);
 void GpuTimingFrameBegin(VideoState &s, plume::RenderCommandList *cmd, u32 slot) {
   if (!g_supported || !s.device || !cmd)
     return;
+  // Metal: GpuTimingCollect reads the timestamps with vkGetQueryPoolResults;
+  // plume's Metal query pools are not wired up here yet.
+  if (UseMetal()) {
+    g_supported = false;
+    return;
+  }
   static u64 frames = 0;
   const i32 every = REXCVAR_GET(fable2_gpu_timing_every);
   const bool sampled = every <= 1 || (frames++ % static_cast<u64>(every)) == 0 || DiagFrameNow(s);
