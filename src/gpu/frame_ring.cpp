@@ -33,7 +33,7 @@
 REXCVAR_DEFINE_INT32(fable2_chunk_submit_draws, 600, "Fable2",
                      "Native renderer: submit the frame so far at the first resolve after this many draws "
                      "(up to 4 times a frame; 0 = one submit at Present)");
-REXCVAR_DEFINE_BOOL(fable2_metal_keep_pass_on_barrier, false, "Fable2",
+REXCVAR_DEFINE_BOOL(fable2_metal_keep_pass_on_barrier, true, "Fable2",
                     "Native renderer, Metal: a barrier that does not concern the open render pass (no attachment, "
                     "no buffer, nothing the pass wrote) leaves the pass open instead of ending it, which stored "
                     "and reloaded the whole multisampled colour and depth (live; the [barriers] line every 300 "

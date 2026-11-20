@@ -36,7 +36,7 @@ REXCVAR_DEFINE_BOOL(fable2_full_height_1120, true, "Fable2",
                     "Native renderer: give 1120-wide tiled surfaces the full 720 lines");
 REXCVAR_DEFINE_BOOL(fable2_guest_msaa, true, "Fable2",
                     "Native renderer: multisample the frame-sized surfaces the game multisamples (at launch)");
-REXCVAR_DEFINE_BOOL(fable2_metal_fold_resolve, false, "Fable2",
+REXCVAR_DEFINE_BOOL(fable2_metal_fold_resolve, true, "Fable2",
                     "Native renderer, Metal: end the pass that drew a multisampled surface with its host->single "
                     "resolve (the pass's store action) instead of a render pass of its own that reloads the whole "
                     "multisampled texture (live: takes effect when the surface's pass is next set up)");
