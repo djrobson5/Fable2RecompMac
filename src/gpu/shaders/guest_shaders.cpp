@@ -5,6 +5,7 @@
 #include "gpu/shaders/guest_shaders.h"
 
 #include <algorithm>
+#include <condition_variable>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -177,6 +178,10 @@ struct CacheState {
   std::unordered_map<u64, u64> canonical;
   std::mutex host_mutex;
   std::unordered_map<u64, std::unique_ptr<plume::RenderShader>> host;
+  // Metal: keys whose shader a thread is converting and compiling; the others wait for it instead
+  // of doing it again (the render thread and the pipeline workers ask for the same shaders).
+  std::condition_variable host_cv;
+  std::unordered_set<u64> host_compiling;
   bool ready = false;
 };
 
@@ -671,11 +676,44 @@ plume::RenderShader *GetHostShaderByHash(VideoState &s, u64 hash, u32 spec_mask,
   (void)spec_mask;
   const u64 salt = (u64(effective) << 3) | (u64(variant) << 1) | 1u;
   const u64 key = hash ^ (salt * 0x9E3779B97F4A7C15ull) ^ (is_pixel ? 1u : 0u);
+  // Metal: the thread that finds no shader claims the key; the claim is released with the shader
+  // stored (or when this function leaves some other way).
+  struct CompileClaim {
+    CacheState &c;
+    u64 key;
+    bool held = false;
+    void Release() {
+      if (!held)
+        return;
+      held = false;
+      c.host_compiling.erase(key);
+      c.host_cv.notify_all();
+    }
+    ~CompileClaim() {
+      if (held) {
+        std::lock_guard lock(c.host_mutex);
+        Release();
+      }
+    }
+  } claim{c, key};
   {
-    std::lock_guard lock(c.host_mutex);
-    auto it = c.host.find(key);
-    if (it != c.host.end())
-      return it->second.get();
+    std::unique_lock lock(c.host_mutex);
+    for (;;) {
+      auto it = c.host.find(key);
+      if (it != c.host.end())
+        return it->second.get();
+#if defined(FABLE2_METAL_BACKEND)
+      if (!UseMetal())
+        break;
+      if (c.host_compiling.insert(key).second) {
+        claim.held = true;
+        break;
+      }
+      c.host_cv.wait(lock);
+#else
+      break;
+#endif
+    }
   }
   u32 size = 0;
   const u8 *bytes = EntryBytes(*entry, &size, variant);
@@ -743,6 +781,7 @@ plume::RenderShader *GetHostShaderByHash(VideoState &s, u64 hash, u32 spec_mask,
   }
   std::lock_guard lock(c.host_mutex);
   auto [it, inserted] = c.host.emplace(key, std::move(host));
+  claim.Release();
   return it->second.get();
 }
 
