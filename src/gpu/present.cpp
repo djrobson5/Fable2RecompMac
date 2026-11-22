@@ -756,6 +756,11 @@ void LogPerfLocked(VideoState &s) {
     EOT_INFO("[shaders] {} draws waited {:.0f} ms in all for runtime translations this window (longest {:.0f} ms, {} "
              "gave up and were skipped)",
              waits.waits, waits.total_ms, waits.max_ms, waits.gave_up);
+  // Fable 2: draws that waited for a pipeline build this window (nothing is said when none did).
+  if (const PsoWaitStats waits = PsoTakeWaitStats(); waits.waits > 0 || waits.budget_skipped > 0)
+    EOT_INFO("[pso] {} draws waited {:.0f} ms in all for pipeline builds this window (longest {:.0f} ms, {} gave up "
+             "at the cap, {} cut short by the frame budget, {} skipped with the budget spent)",
+             waits.waits, waits.total_ms, waits.max_ms, waits.gave_up, waits.cut_short, waits.budget_skipped);
   {
     plume::g_lazyPassSwitch.store(REXCVAR_GET(fable2_lazy_render_pass), std::memory_order_relaxed);
     plume::g_barrierKeepsPass.store(REXCVAR_GET(fable2_barrier_keeps_pass), std::memory_order_relaxed);

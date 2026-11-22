@@ -70,6 +70,18 @@ plume::RenderPipeline *GetOrCreatePipeline(VideoState &s, const PipelineState &s
                                            PsoSource source = PsoSource::Draw,
                                            u16 template_index = 0xFFFF);
 
+// Draws that waited for a pipeline build since the last call (the [pso] line of each [perf] window).
+struct PsoWaitStats {
+  u64 waits = 0;
+  double total_ms = 0, max_ms = 0;
+  u64 gave_up = 0;         // the wait ran out at the full cap (the draw was skipped)
+  u64 cut_short = 0;       // the frame's wait budget ended the wait before the cap (skipped, not remembered)
+  u64 budget_skipped = 0;  // skipped without waiting: the frame's wait budget was already spent
+};
+PsoWaitStats PsoTakeWaitStats();
+// Shutdown: every waiting draw goes on and the build workers leave.
+void PsoAsyncStop();
+
 void PsoCachePrecache();
 
 void PsoCacheFlushIfDirty(bool force);

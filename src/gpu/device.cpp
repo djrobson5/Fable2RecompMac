@@ -1479,6 +1479,7 @@ void Video::BeginShutdown() {
   auto &s = state();
   s.shutting_down.store(true, std::memory_order_release);
   RuntimeShadersStop();  // first: a draw waiting for a translation goes on, so the render queue can drain
+  PsoAsyncStop();        // likewise for a draw waiting for a pipeline build
   RenderThreadStop();
   PsoPrecacheStop();
   PsoCacheFlushIfDirty(true);

@@ -124,6 +124,7 @@ output to a file:
 | `--eot_render_scale` | `1.0` | Extra scale on top of the render resolution |
 | `--fable2_shader_dump_dir=<dir>` | | Save shaders the build doesn't have yet into `<dir>` |
 | `--fable2_shader_wait=<bool>` | `true` | A draw whose shader is not translated yet waits for it instead of being skipped (`--fable2_shader_wait_max_ms`, default 5000, caps one draw's wait) |
+| `--fable2_pso_wait=<bool>` | `true` | A depth-tested draw whose pipeline is still being built waits for it instead of being skipped: at most `--fable2_pso_wait_max_ms` (default 20) per draw, `--fable2_pso_wait_frame_ms` (default 33) for all of one frame's waits; during a loading screen `--fable2_pso_wait_loading_ms` (default 500) per draw and `--fable2_pso_wait_loading_frame_ms` (default 1000) per frame (keep each frame limit at or above its per-draw one) |
 | `--eot_perf_frames=<N>` | `600` | Write a `[perf]` timing line (CPU and GPU per frame) to the log every N frames |
 | `--log_level=debug` | `info` | More detailed log |
 

@@ -54,6 +54,7 @@ class Board {
     if (!added)
       return false;
     it->second.state = State::Queued;
+    it->second.added = std::chrono::steady_clock::now();
     it->second.payload = std::move(payload);
     normal_.push_back(hash);
     wake_.notify_all();
@@ -106,8 +107,9 @@ class Board {
 
   // Waits up to `cap` for the job to end. A queued job is moved to the urgent line first. After one wait on a hash
   // ran out, later waits on it do not wait at all: the caller's old behaviour (skip the draw) applies until the
-  // result lands.
-  WaitResult Wait(uint64_t hash, std::chrono::milliseconds cap) {
+  // result lands. `remember_timeout` false: a wait that runs out does not count as that (the caller cut it short,
+  // so it says nothing about how long the job takes).
+  WaitResult Wait(uint64_t hash, std::chrono::milliseconds cap, bool remember_timeout = true) {
     std::unique_lock lock(m_);
     auto it = jobs_.find(hash);
     if (it == jobs_.end())
@@ -132,16 +134,19 @@ class Board {
       return WaitResult::Failed;
     if (stop_)
       return WaitResult::Stopped;
-    e.gave_up = true;
+    e.gave_up = e.gave_up || remember_timeout;
     return WaitResult::TimedOut;
   }
 
-  // Looks at a job without waiting or changing anything.
-  Peek Look(uint64_t hash) {
+  // Looks at a job without waiting or changing anything. `age` (optional) gets the time since the job was added.
+  Peek Look(uint64_t hash, std::chrono::milliseconds *age = nullptr) {
     std::lock_guard lock(m_);
     auto it = jobs_.find(hash);
     if (it == jobs_.end())
       return Peek::Unknown;
+    if (age)
+      *age = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+                                                                    it->second.added);
     if (it->second.state == State::Done)
       return Peek::Done;
     if (it->second.state == State::Failed)
@@ -157,6 +162,11 @@ class Board {
     done_.notify_all();
   }
 
+  bool Stopped() {
+    std::lock_guard lock(m_);
+    return stop_;
+  }
+
   // For logs and tests: how many jobs wait in the normal and the urgent line.
   std::pair<size_t, size_t> Queued() {
     std::lock_guard lock(m_);
@@ -167,6 +177,7 @@ class Board {
   struct Entry {
     State state = State::Queued;
     bool gave_up = false;
+    std::chrono::steady_clock::time_point added{};   // MarkDone entries keep the zero time: only Pending jobs report an age
     Payload payload{};
   };
 

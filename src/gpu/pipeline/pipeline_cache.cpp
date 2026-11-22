@@ -27,6 +27,7 @@
 #include "gpu/d3d.h"
 #include "gpu/device.h"
 #include "gpu/pipeline/pso_precache.h"
+#include "gpu/pipeline/pso_wait.h"
 #include "gpu/pipeline/pso_predictor.h"
 #include "gpu/pipeline/pso_records.h"
 #include "gpu/settings.h"
@@ -35,8 +36,25 @@
 
 #include <rex/cvar.h>
 REXCVAR_DEFINE_BOOL(fable2_pso_async, true, "Fable2",
-                    "Native renderer: a depth-tested draw whose pipeline is not built yet is skipped while a "
-                    "background thread builds it (the frame waited up to 2 s for a first-seen pipeline)");
+                    "Native renderer: a depth-tested draw whose pipeline is not built yet does not build it on the "
+                    "render thread (the frame waited up to 2 s for a first-seen pipeline): a background thread "
+                    "builds it, and the draw waits for it a short while (fable2_pso_wait) or is skipped");
+REXCVAR_DEFINE_BOOL(fable2_pso_wait, true, "Fable2",
+                    "Native renderer: a depth-tested draw whose pipeline is still being built waits for it (moving "
+                    "it to the front of the builds) instead of being skipped; false = skipped, as before");
+REXCVAR_DEFINE_INT32(fable2_pso_wait_max_ms, 20, "Fable2",
+                     "Native renderer: the longest one draw waits for its pipeline in play (then it is skipped, and "
+                     "later draws with that pipeline do not wait until it lands)");
+REXCVAR_DEFINE_INT32(fable2_pso_wait_frame_ms, 33, "Fable2",
+                     "Native renderer: the longest all the pipeline waits of one guest frame take together in play "
+                     "(a draw that finds the budget spent is skipped; 0 = no waiting in play). Keep it at or above "
+                     "fable2_pso_wait_max_ms: a wait the budget cuts short is skipped without being remembered");
+REXCVAR_DEFINE_INT32(fable2_pso_wait_loading_ms, 500, "Fable2",
+                     "Native renderer: the longest one draw waits for its pipeline while a loading screen is up");
+REXCVAR_DEFINE_INT32(fable2_pso_wait_loading_frame_ms, 1000, "Fable2",
+                     "Native renderer: the longest all the pipeline waits of one guest frame take together while a "
+                     "loading screen is up (a separate budget from play's; 0 = no waiting in loading screens). Keep "
+                     "it at or above fable2_pso_wait_loading_ms");
 REXCVAR_DEFINE_BOOL(fable2_pso_compiled_in, false, "Fable2",
                     "Native renderer: also build the compiled-in pipeline records (Edge of Time's)");
 
@@ -256,70 +274,109 @@ void CanonicalizePipelineState(PipelineState &st, u32 spec_mask, u32 stream_mask
   }
 }
 
-// First-seen pipelines of depth-tested draws (world geometry, shadow casters)
-// are built here instead of on the render thread; the draw is skipped until
-// the pipeline exists. Post passes and UI still build in place (a skipped
-// full-screen pass would flash).
+// First-seen pipelines of depth-tested draws (world geometry, shadow casters) are built here instead of on the
+// render thread. The draw that needs one moves its build to the front and waits for it a short while (the rules
+// in pso_wait.h: fable2_pso_wait*), then goes ahead; if the build is not there in time the draw is skipped, as
+// before the waits, and later draws with that pipeline are skipped (not waited for) until it lands. Post passes
+// and UI still build in place (a skipped full-screen pass would flash).
+using AsyncWaiter = psowait::Waiter<std::unique_ptr<PipelineState>>;
 struct AsyncBuilds {
-  std::mutex mutex;
-  std::condition_variable cv;
-  std::deque<PipelineState> queue;
-  std::unordered_map<u64, std::chrono::steady_clock::time_point> pending;
-  bool started = false;
-  u64 queued = 0, skipped = 0;
+  AsyncWaiter waiter;
+  std::atomic<u64> queued{0}, skipped{0};
+  std::once_flag started;
 };
 AsyncBuilds &async_builds() {
-  static AsyncBuilds a;
-  return a;
+  // Never destroyed: the workers are detached and may still be finishing at exit.
+  static AsyncBuilds *a = new AsyncBuilds;
+  return *a;
 }
 
-// True: the caller skips this draw (its pipeline is being built).
-bool AsyncBuildPending(VideoState &s, const PipelineState &st, u64 key) {
-  if (!REXCVAR_GET(fable2_pso_async) || !st.depthEnable)
-    return false;
+constexpr int kUrgentPsoWorkers = 2;
+
+void StartAsyncBuildWorkers(VideoState &s) {
   auto &a = async_builds();
-  std::lock_guard lock(a.mutex);
-  const auto now = std::chrono::steady_clock::now();
-  auto it = a.pending.find(key);
-  if (it != a.pending.end()) {
-    // Built too slowly (or failed): build it here after all.
-    if (now - it->second > std::chrono::milliseconds(2500))
-      return false;
-    ++a.skipped;
-    return true;
-  }
-  a.pending.emplace(key, now);
-  a.queue.push_back(st);
-  ++a.queued;
-  if (a.queued <= 64 || (a.queued & 255) == 0)
-    EOT_DEBUG("[pso] async build #{} key={:016x} vs={:016x} ps={:016x} ({} draws skipped so far)", a.queued, key,
-              st.vsHash, st.psHash, a.skipped);
-  if (!a.started) {
-    a.started = true;
-    std::thread([&s] {
+  std::call_once(a.started, [&] {
+    auto worker = [&s](bool urgent_only) {
       auto &a = async_builds();
       for (;;) {
-        PipelineState st;
-        {
-          std::unique_lock lock(a.mutex);
-          a.cv.wait(lock, [&] { return !a.queue.empty(); });
-          st = a.queue.front();
-          a.queue.pop_front();
-        }
-        const u64 key = HashPipelineState(st);
+        u64 key = 0;
+        std::unique_ptr<PipelineState> st;
+        bool urgent = false;
+        if (!a.waiter.board().Take(urgent_only, &key, &st, &urgent))
+          return;  // shutdown
         const auto t0 = std::chrono::steady_clock::now();
-        GetOrCreatePipeline(s, st, true, PsoSource::Draw);
+        plume::RenderPipeline *built = GetOrCreatePipeline(s, *st, true, PsoSource::Draw);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         if (ms > 50.0)
-          EOT_DEBUG("[pso] async build key={:016x} vs={:016x} ps={:016x} took {:.0f} ms", key, st.vsHash,
-                    st.psHash, ms);
-        std::lock_guard lock(a.mutex);
-        a.pending.erase(key);
+          EOT_DEBUG("[pso] async build key={:016x} vs={:016x} ps={:016x} took {:.0f} ms{}", key, st->vsHash,
+                    st->psHash, ms, urgent ? " (a draw was waiting)" : "");
+        // The pipeline (or its failure) is in the cache before this: a waiter that sees Done finds it there.
+        a.waiter.board().Finish(key, built != nullptr);
       }
-    }).detach();
+    };
+    // One worker for the background queue (it takes a waited-for build first when one is there), and
+    // kUrgentPsoWorkers that take nothing else, so a waited build never sits behind the queue.
+    std::thread(worker, false).detach();
+    for (int i = 0; i < kUrgentPsoWorkers; ++i)
+      std::thread(worker, true).detach();
+  });
+}
+
+enum class AsyncAction {
+  Build,   // build it here
+  Skip,    // skip the draw
+  Ready,   // it is in the cache now: look it up again
+};
+
+AsyncAction AsyncBuildGate(VideoState &s, const PipelineState &st, u64 key) {
+  if (!REXCVAR_GET(fable2_pso_async) || !st.depthEnable)
+    return AsyncAction::Build;
+  auto &a = async_builds();
+  StartAsyncBuildWorkers(s);
+  psowait::Limits limits;
+  limits.max_ms = std::clamp(int(REXCVAR_GET(fable2_pso_wait_max_ms)), 0, 2000);
+  limits.frame_ms = std::clamp(int(REXCVAR_GET(fable2_pso_wait_frame_ms)), 0, 2000);
+  limits.loading_ms = std::clamp(int(REXCVAR_GET(fable2_pso_wait_loading_ms)), 0, 2000);
+  limits.loading_frame_ms = std::clamp(int(REXCVAR_GET(fable2_pso_wait_loading_frame_ms)), 0, 10000);
+  const bool loading = PsoCacheInLoadingScreen();
+  bool added = false;
+  const psowait::Outcome o = a.waiter.Gate(
+      key,
+      [&] {
+        added = true;
+        return std::make_unique<PipelineState>(st);
+      },
+      REXCVAR_GET(fable2_pso_wait), loading, limits, s.guest_frames);
+  if (added) {
+    const u64 n = ++a.queued;
+    if (n <= 64 || (n & 255) == 0)
+      EOT_DEBUG("[pso] async build #{} key={:016x} vs={:016x} ps={:016x} ({} draws skipped so far)", n, key,
+                st.vsHash, st.psHash, a.skipped.load());
   }
-  a.cv.notify_one();
-  return true;
+  switch (o) {
+    case psowait::Outcome::BuildHere:
+      return AsyncAction::Build;
+    case psowait::Outcome::Ready: {
+      // A waiter that was woken by Done finds the pipeline in the cache; if it is not there (cannot happen),
+      // skip rather than loop.
+      auto &c = cache();
+      std::shared_lock lock(c.mutex);
+      if (c.map.count(key))
+        return AsyncAction::Ready;
+      break;
+    }
+    default:
+      break;
+  }
+  ++a.skipped;
+  return AsyncAction::Skip;
+}
+
+void PsoAsyncStop() { async_builds().waiter.Stop(); }
+
+PsoWaitStats PsoTakeWaitStats() {
+  const psowait::Stats st = async_builds().waiter.TakeStats();
+  return {st.waits, st.total_ms, st.max_ms, st.gave_up, st.cut_short, st.budget_skipped};
 }
 
 plume::RenderPipeline *GetOrCreatePipeline(VideoState &s, const PipelineState &st, bool worker,
@@ -356,8 +413,16 @@ plume::RenderPipeline *GetOrCreatePipeline(VideoState &s, const PipelineState &s
       return pipeline;
     }
   }
-  if (!worker && AsyncBuildPending(s, st, key))
-    return nullptr;
+  if (!worker) {
+    switch (AsyncBuildGate(s, st, key)) {
+      case AsyncAction::Skip:
+        return nullptr;
+      case AsyncAction::Ready:
+        return GetOrCreatePipeline(s, st, worker, source, template_index);  // found in the cache now
+      case AsyncAction::Build:
+        break;
+    }
+  }
   std::unique_ptr<PerfScope> perf_scope;
   if (!worker) {
     perf_scope = std::make_unique<PerfScope>(s.perf.pso_ms);

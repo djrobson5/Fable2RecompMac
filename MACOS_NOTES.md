@@ -453,3 +453,29 @@ next load). So that a first start has nothing to translate that the game's own d
   `[shaders] runtime: <hash> translated in N ms for a waiting draw`, `[shaders] gave up waiting ...`, and with each
   `[perf]` window `[shaders] N draws waited M ms in all ...`. The game thread is stopped while it waits, so the
   frame takes that long; the watchdog's "stuck frame" warning (over 2 s) can show.
+- **A draw waits for its pipeline** (`fable2_pso_wait`, on by default; `src/gpu/pipeline/pipeline_cache.cpp`,
+  `AsyncBuildGate`). A first-seen pipeline of a depth-tested draw is built on a background worker
+  (`fable2_pso_async`), and the draw that needs it used to be skipped (`[draw] dropped: pipeline not built`), so the
+  geometry flickered for the frames the build took. Now that draw moves its build to the front and waits for it,
+  then goes ahead. In play the wait is at most `fable2_pso_wait_max_ms` (20) per draw, and all the pipeline waits of
+  one guest frame (`s.guest_frames`) together at most `fable2_pso_wait_frame_ms` (33); while a loading screen is up
+  (`PsoCacheInLoadingScreen`) a draw may wait `fable2_pso_wait_loading_ms` (500) and all of a frame's waits
+  together `fable2_pso_wait_loading_frame_ms` (1000), a budget of its own (the render thread holds `s.mutex` for
+  a whole sorted batch, so the loading frame needs a cap too; a loading frame does not spend the play budget, nor
+  the other way round). A budget of 0 turns waiting off for that case.
+  With the OS shader cache warm a build takes 0.1 to 3 ms, so in play nothing is skipped; with a cold one
+  (about 240 ms a build) a draw still waits only its cap, is skipped as before, and costs the frame at most the
+  budget. A wait that runs out is remembered for that pipeline: later draws with it do not wait again and are
+  skipped until it lands (a wait the frame budget cut short is not remembered, because the build may be a
+  millisecond away). A build that failed is never waited for (the cache holds the failure). A pipeline pending for
+  over 2.5 s is still built in place by the render thread. `fable2_pso_wait=false` gives the old behaviour exactly
+  (no wait, skip while pending). The jobs are the board of `runtime_jobs.h` (a waited build goes to two extra
+  workers that take nothing else; the one background worker also takes waited builds first); the rules
+  (caps, frame budget, give-up memory) are in `src/gpu/pipeline/pso_wait.h`, header only and tested with a fake
+  builder (also under ThreadSanitizer). Nothing holds a lock while it waits; at shutdown (`PsoAsyncStop`, from
+  `Video::BeginShutdown`) every waiting draw goes on and no draw waits or is built in place from then on. The game thread is stopped while a draw waits. Log: with each
+  `[perf]` window `[pso] N draws waited M ms in all for pipeline builds this window (longest L ms, G gave up at the
+  cap, C cut short by the frame budget, B skipped with the budget spent)`; nothing when no draw waited. To see the cold
+  case, move (do not delete) `~/Library/Caches/Fable2/cache/pso` and the OS's Metal compile cache of the program,
+  `$(getconf DARWIN_USER_CACHE_DIR)/org.rexglue.fable2` (the folder is named after the program's bundle id; look
+  for the one that has `com.apple.metal` inside), while the game is not running, and move them back afterwards.
