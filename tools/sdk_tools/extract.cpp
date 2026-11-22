@@ -22,7 +22,9 @@
 #include <rex/filesystem/file.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -53,8 +55,19 @@ static void Report(bool force = false) {
   }
 }
 
+// An entry name is one path component: a name with a separator or ".." would write outside the output folder.
+static bool SafeName(const std::string& name) {
+  return !name.empty() && name != "." && name.find('/') == std::string::npos && name.find('\\') == std::string::npos &&
+         name.find("..") == std::string::npos;
+}
+
 static void Dump(Entry* e, const fs::path& out) {
   for (auto& c : e->children()) {
+    if (!SafeName(c->name())) {
+      std::fprintf(stderr, "refusing the entry name \"%s\" (it could leave the output folder)\n", c->name().c_str());
+      ++g_errors;
+      continue;
+    }
     fs::path p = out / c->name();
     if (c->attributes() & kFileAttributeDirectory) {
       if (g_only.empty())
@@ -71,6 +84,12 @@ static void Dump(Entry* e, const fs::path& out) {
       continue;
     }
     std::ofstream os(p, std::ios::binary);
+    if (!os) {
+      std::fprintf(stderr, "cannot create %s: %s\n", p.string().c_str(), std::strerror(errno));
+      f->Destroy();
+      ++g_errors;
+      continue;
+    }
     std::vector<uint8_t> buf(8 << 20);
     size_t off = 0, total = c->size();
     while (off < total) {
@@ -81,11 +100,21 @@ static void Dump(Entry* e, const fs::path& out) {
         break;
       }
       os.write(reinterpret_cast<char*>(buf.data()), got);
+      if (!os) {  // a full disk makes the stream fail; without this the file would be silently short
+        std::fprintf(stderr, "write failed: %s: %s (is the disk full?)\n", p.string().c_str(), std::strerror(errno));
+        ++g_errors;
+        break;
+      }
       off += got;
       g_bytes += got;
       Report();
     }
     f->Destroy();
+    os.close();
+    if (os.fail()) {
+      std::fprintf(stderr, "write failed: %s: %s (is the disk full?)\n", p.string().c_str(), std::strerror(errno));
+      ++g_errors;
+    }
     ++g_files;
   }
 }

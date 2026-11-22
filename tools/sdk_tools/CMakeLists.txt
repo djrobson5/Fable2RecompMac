@@ -2,6 +2,10 @@
 #   cmake -S tools/sdk_tools -B out/sdk_tools -G Ninja -DCMAKE_BUILD_TYPE=Release \
 #         -DCMAKE_PREFIX_PATH=$REXSDK
 #   cmake --build out/sdk_tools
+# Standalone: it needs only the SDK, not codegen or the game's own build, so
+# `cmake --build out/sdk_tools --target extract` works before the game is
+# recompiled. tools/mac/setup_mac.sh builds the extractor this way to unpack the
+# disc image and to check the game files' image hash (extract --image-hash).
 cmake_minimum_required(VERSION 3.25)
 project(fable2_sdk_tools CXX)
 set(CMAKE_CXX_STANDARD 23)
