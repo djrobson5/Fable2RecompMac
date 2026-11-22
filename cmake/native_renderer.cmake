@@ -42,8 +42,13 @@ set(REEOT_D3D12 OFF)
 set(REEOT_GEN_DIR "${CMAKE_BINARY_DIR}/native_generated")
 include("${CMAKE_CURRENT_LIST_DIR}/host_shaders.cmake")
 
-# The game's shaders, captured with fable2_shader_dump_dir, translated ahead of
-# time by XenosRecomp into a shader cache.
+# The game's shaders translated ahead of time by XenosRecomp into the shader cache
+# built into the game: the containers of its shader bank that
+# tools/mac/extract_shaders.py wrote here (tools/mac/setup_mac.sh runs it: every
+# pixel shader and the vertex shaders the console's binder leaves alone), and any
+# captured with fable2_shader_dump_dir. The translator and shader_common.h are the
+# ones the game ships (the runtime's translations are made by the same pair), and
+# a shader in this cache is never translated again while the game runs.
 set(FABLE2_SHADER_INPUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shader_dump" CACHE PATH
     "Captured shader containers (fable2_shader_dump_dir) the shader cache is built from")
 set(FABLE2_SHADER_COMMON_H "${FABLE2_THIRDPARTY}/XenosRecomp/XenosRecomp/shader_common.h")
@@ -60,9 +65,9 @@ if(_fable2_captured_shaders)
         VERBATIM)
     add_library(fable2_shader_cache OBJECT "${FABLE2_SHADER_CACHE_CPP}")
 else()
-    message(STATUS "fable2: no captured shaders in ${FABLE2_SHADER_INPUT_DIR}: the game's shaders "
-                   "are translated while it runs (the first start stutters, later starts load them "
-                   "from shader_runtime/)")
+    message(STATUS "fable2: no shaders in ${FABLE2_SHADER_INPUT_DIR} (tools/mac/setup_mac.sh extracts "
+                   "them from the game's shader bank): the game's shaders are translated while it runs "
+                   "(the first start stutters, later starts load them from shader_runtime/)")
     add_library(fable2_shader_cache OBJECT src/gpu/shaders/shader_cache_empty.cpp)
 endif()
 target_include_directories(fable2_shader_cache PRIVATE src/gpu/shaders)

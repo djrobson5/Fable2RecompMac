@@ -377,7 +377,8 @@ removed, the exit status is 143 and no error event is sent.
   --assets <dir> [--toolchains <dir>] [--reuse-sdk ...] [--reuse-dxc ...]` runs the stages `toolchains`, `extract`
   (builds `tools/sdk_tools` standalone; unpacks the disc into `<assets>/game`, or uses/copies a folder; unpacks the
   title update for the disc's media ID so `default.xexp` sits beside `default.xex` and in `<assets>/update`),
-  `check` (the image hash must be the one in `cmake/launcher.cmake`: `wrong_game` otherwise), `codegen` (skipped
+  `check` (the image hash must be the one in `cmake/launcher.cmake`: `wrong_game` otherwise), `shaders` (the
+  game's shader bank written to `shader_dump/`, see below; it never stops the install), `codegen` (skipped
   when the same inputs were generated before), `configure` (submodules, `cmake --preset mac-arm64-native` with
   `cmake/dxc_from_source.cmake`) and `compile` (target `Fable2` only: the default target also builds the SwiftUI
   launcher app, which needs full Xcode). `--check [--json]` changes nothing and lists what is missing.
@@ -393,3 +394,41 @@ removed, the exit status is 143 and no error event is sent.
   `CFBundleVersion` is `git rev-list --count HEAD`, so a shallow clone gives the length of its shallow history. The result line is `{"result": "ok", "tool":
   "package", "app": ..., "commit": ..., "dirty": ..., "upstream_base": ...}`. It refuses with `game_running` only when
   the app at the target path itself is running.
+
+### Shaders ready at first launch (2026-11-22)
+
+The game's renderer translates each guest shader the first time the game binds it. Until a translation exists the
+shader's draws are skipped, and a few are made only once (the hero's face texture at load stays flat red until the
+next load). So that a first start has nothing to translate that the game's own data can supply:
+
+- **The `shaders` stage** of `setup_mac.sh` (after `check`, before `codegen`; announced even when it skips) runs
+  `tools/mac/extract_shaders.py` on `<game>/data/Shaders/ShadersRelease.sbk`, the only shader bank the game loads
+  (588 containers, 451 pixel and 137 vertex, in zlib chunks). It writes each container to `shader_dump/<hash>.bin`
+  (git-ignored: it is game data), exactly the bytes the renderer hashes at run time (XXH3-64 of the virtual and
+  physical parts, computed by the script itself: Python has no XXH3; `--self-test` checks it against xxHash). The
+  work is skipped when `shader_dump/bank.key` holds the same key (the bank's and the script's SHA-256, like the
+  codegen key); only files it made (`bank.list`) are ever replaced or removed, and a file that is unchanged is not
+  rewritten, so a changed script or key does not make the build translate the same shaders again. `bank.list` names
+  each file `+` (made by the script) or `=` (already there with the same content, never removed by it) and is written
+  before the files, with the earlier bank's files still in it, so a run that stops half way is cleaned up by the next
+  one (stray `.tmp` files too). A chunk or entry that is not what the bank's own table says is refused.
+- **A missing or unreadable bank does not stop the install.** The stage prints
+  `==> warning: shaders: <what is wrong>; the game will translate its shaders while it runs (a rougher first start)`,
+  sends the same text as a progress note (`{"progress": 1, "total": 1, "note": "warning: shaders: ..."}`, no `error`
+  event), and the build goes on with an empty `shader_dump/` (the built-in cache is then empty and every shader is
+  translated at run time, as before). The final result event says `"shaders": "extracted"`, `"up_to_date"`,
+  `"bank_missing"`, `"tool_missing"` or `"unreadable"`.
+- **The build** (`cmake/native_renderer.cmake`, unchanged mechanism) runs the game's own XenosRecomp, with the
+  same `shader_common.h` the app ships, on `shader_dump/` into a generated `shader_cache.cpp` (zstd-compressed
+  SPIR-V, 13.5 MB of data) built into `Fable2`. The renderer looks there first, so nothing in it is translated
+  again while the game runs. Measured on an M5 Pro (18 cores), in a fresh clone's install: the `shaders` stage
+  takes under a second, translating the 588 takes 61 s inside the build (52 s alone), compiling the 48 MB source
+  at `-O0` takes 4.8 s (2.5 GB of memory at its peak) and adds 13.6 MB to the program (the app goes from 145 to
+  158 MB); the cache is decompressed into 77 MB at start. A rerun with nothing changed takes 5 s and skips the
+  stage's work. (The other form, XenosRecomp's `--blob` output as one 77 MB file in the app's `Resources` read by
+  `runtime_shaders.cpp`, translates in 37 s but costs 63 MB more in the app and needs a loader.)
+- **What it covers.** The 109 pixel shaders and 15 of the 65 vertex shaders in a session's translations (the
+  survey's 174 hashes) are in the bank as the game hashes them: 124 of 174. The other vertex shaders are patched in
+  memory when the game binds them (`sub_82BA40F0` writes the vertex fetch constants from the vertex declaration and
+  links the exports to the pixel shader), so their runtime hash is not the bank's; they are translated while the
+  game runs and kept in `~/Library/Caches/Fable2/shader_runtime`.

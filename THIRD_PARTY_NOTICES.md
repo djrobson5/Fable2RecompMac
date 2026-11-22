@@ -11,6 +11,7 @@ when you redistribute the source.
 | [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) project template | `src/hooks.cpp`, `src/heap.cpp`, `src/heap.h` | BSD 3-Clause (see the file headers) | 2026 Tom Clay |
 | [plume](https://github.com/zolaware/plume) | submodule `thirdparty/plume`, Fable II patches in `tools/plume-patches` | MIT | 2024 renderbag and contributors |
 | [reeot-XenosRecomp](https://github.com/goliathret/reeot-XenosRecomp), a fork of [hedge-dev/XenosRecomp](https://github.com/hedge-dev/XenosRecomp) | submodule `thirdparty/XenosRecomp`, Fable II patches in `tools/xenosrecomp-patches` | MIT | 2025 hedge-dev and contributors |
+| [xxHash](https://github.com/Cyan4973/xxHash), its XXH3 default secret (192 bytes of data) in a Python copy of the algorithm | `tools/mac/extract_shaders.py` | BSD 2-Clause | 2012-2023 Yann Collet |
 | [dlmalloc](https://gee.cs.oswego.edu/dl/html/malloc.html) | `thirdparty/dlmalloc` | MIT-0 | 2023 Doug Lea |
 | [RenderDoc](https://renderdoc.org) in-application API header | `thirdparty/renderdoc/renderdoc_app.h` | MIT | 2015-2026 Baldur Karlsson |
 

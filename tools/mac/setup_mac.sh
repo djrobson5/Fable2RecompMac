@@ -34,6 +34,10 @@
 #               assets/game and assets/update in this clone link to them
 #   check       the game program with its update must give the image hash the build was recompiled from
 #               (cmake/launcher.cmake), else `wrong_game`
+#   shaders     the shader containers of the game's own shader bank (<game>/data/Shaders/ShadersRelease.sbk) written
+#               to shader_dump/ as <hash>.bin (tools/mac/extract_shaders.py); the build translates them into the
+#               built-in shader cache, so the game starts with its shaders ready (skipped when the bank is the one
+#               already extracted; a missing or unreadable bank only warns, it never stops the install)
 #   codegen     rexglue codegen Fable2_manifest.toml (skipped when the same inputs were generated already)
 #   configure   submodules (plume; XenosRecomp with smol-v, zstd, xxHash, fmt; never its dxc-bin), cmake
 #   compile     ninja, out/build/mac-arm64-native, target Fable2 (ninja's [n/N] is the progress)
@@ -42,6 +46,9 @@
 #
 # Error codes: missing_packages, no_clang, no_brew, no_disc, disc_not_found, wrong_game, no_update, extract_failed,
 # toolchain_failed, codegen_failed, configure_failed, build_failed, download_failed, disk_full.
+# (The shaders stage has no error code: a shader bank that is missing or unreadable is a warning line and a progress
+# note, "warning: shaders: ...", and the result says "shaders": "extracted", "up_to_date", "bank_missing",
+# "tool_missing" or "unreadable"; the game then translates its shaders while it runs.)
 set -e
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 source "$ROOT/tools/mac/mac_common.sh"
@@ -49,7 +56,7 @@ CLEANUP_HOOK=remove_temporaries
 KILL_WAIT_TICKS=60      # longer than build_toolchains.sh's own wait, so its cleanup finishes first
 install_traps
 
-STAGES="toolchains extract check codegen configure compile"
+STAGES="toolchains extract check shaders codegen configure compile"
 BUILD="$ROOT/out/build/mac-arm64-native"
 LOGS="$ROOT/out/logs"
 SETTINGS="$ROOT/out/install.env"
@@ -727,7 +734,66 @@ step "image $got: $IMAGE_LABEL"
 progress_event 1 1 "" "image hash ok"
 finish_stage check
 
-# ---- 4. codegen ----------------------------------------------------------------------------------------------------------
+# ---- 4. shaders ----------------------------------------------------------------------------------------------------------
+# The game's own shader bank holds every pixel shader and most vertex shaders. Extracted here into shader_dump/ (git-ignored:
+# it is the player's game data), they are translated at build time into the shader cache built into the game (cmake/
+# native_renderer.cmake), so a first start does not translate them, one draw at a time, while it runs.
+# This stage never stops the install: the cache is an optimisation (the game translates what it lacks while it runs, at
+# the cost of a rougher first start). A bank that is missing or cannot be read is a warning line and a progress note,
+# not an error event, and the build goes on with what shader_dump/ holds (nothing, or the last good extraction).
+DEFAULT_ERROR=extract_failed     # (only for a failure nobody foresaw: the stage itself never stops the install)
+sha_of() { shasum -a 256 "$1" 2>/dev/null | cut -c1-64; }
+SHADER_BANK="$GAME_DIR/data/Shaders/ShadersRelease.sbk"
+SHADER_DUMP="$ROOT/shader_dump"
+SHADER_TOOL="$ROOT/tools/mac/extract_shaders.py"
+SHADERS_RESULT=
+shaders_log="$LOGS/shaders.log"
+: > "$shaders_log"
+shaders_warning() {   # shaders_warning <what is wrong>: says so, and the install goes on
+    local note="$1; the game will translate its shaders while it runs (a rougher first start)"
+    SHADERS_RESULT=${2:-failed}
+    printf '==> warning: shaders: %s\n' "$note"
+    progress_event 1 1 "" "warning: $note"
+    printf 'warning: %s\n' "$note" >> "$shaders_log"
+}
+if [ ! -f "$SHADER_TOOL" ]; then
+    stage_event shaders "Extracting the game's shaders from its shader bank"
+    shaders_warning "tools/mac/extract_shaders.py is missing from this clone" tool_missing
+elif [ ! -f "$SHADER_BANK" ]; then
+    stage_event shaders "Extracting the game's shaders from its shader bank"
+    shaders_warning "the game has no shader bank at data/Shaders/ShadersRelease.sbk in $GAME_DIR" bank_missing
+else
+    shader_key="bank=$(sha_of "$SHADER_BANK") extractor=$(sha_of "$SHADER_TOOL")"
+    shader_state=$("$py_path" -I "$SHADER_TOOL" --bank "$SHADER_BANK" --out "$SHADER_DUMP" --key "$shader_key" --check 2>>"$shaders_log") || shader_state=
+    case "$shader_state" in
+    *up_to_date*)
+        stage_event shaders "Extracting the game's shaders from its shader bank: skipped, they are up to date"
+        step "shader_dump/ already holds this shader bank's containers"
+        progress_event 1 1 "" "shaders already extracted"
+        SHADERS_RESULT=up_to_date
+        ;;
+    *)
+        stage_event shaders "Extracting the game's shaders from its shader bank (a few seconds)"
+        step "$SHADER_TOOL: $SHADER_BANK -> shader_dump/"
+        progress_event 0 1 "" "extracting the shaders"
+        shaders_out="$ROOT/out/shaders.out"
+        if run_child "$py_path" -I "$SHADER_TOOL" --bank "$SHADER_BANK" --out "$SHADER_DUMP" --key "$shader_key" >"$shaders_out" 2>>"$shaders_log"; then
+            cat "$shaders_out" >> "$shaders_log"
+            step "$(tail -1 "$shaders_out")"
+            progress_event 1 1 "" "shaders extracted"
+            SHADERS_RESULT=extracted
+        else
+            rc=$?
+            [ "$rc" -ne 143 ] || { ERROR_EMITTED=1; exit 143; }     # a cancel is not a failure
+            shaders_warning "the shader bank could not be read ($(tail -1 "$shaders_log"))" unreadable
+        fi
+        rm -f "$shaders_out"
+        ;;
+    esac
+fi
+finish_stage shaders
+
+# ---- 5. codegen ----------------------------------------------------------------------------------------------------------
 DEFAULT_ERROR=codegen_failed
 # The rexglue CLI must be the SDK version the manifest names: codegen rewrites the manifest (and the stamp turns
 # "+dirty") when they differ, and the generated cmake asks for the CLI's own version.
@@ -740,7 +806,6 @@ if [ -n "$want_sdk" ] && [ -n "$cli_sdk" ]; then
     esac
 fi
 CODEGEN_KEY="$ROOT/out/codegen.key"
-sha_of() { shasum -a 256 "$1" 2>/dev/null | cut -c1-64; }
 want_key="image=$IMAGE_HASH manifest=$(sha_of "$ROOT/Fable2_manifest.toml") config=$(sha_of "$ROOT/Fable2_config.toml") sdk=${REXSDK_PIN:-unknown} rexglue=$(sha_of "$REXGLUE_CLI")"
 if [ -f "$ROOT/generated/rexglue.cmake" ] && [ -f "$ROOT/generated/sources.cmake" ] && [ "$(cat "$CODEGEN_KEY" 2>/dev/null)" = "$want_key" ]; then
     stage_event codegen "Recompiling the game's code: skipped, the generated code is up to date"
@@ -761,7 +826,7 @@ else
 fi
 finish_stage codegen
 
-# ---- 5. configure --------------------------------------------------------------------------------------------------------
+# ---- 6. configure --------------------------------------------------------------------------------------------------------
 DEFAULT_ERROR=configure_failed
 stage_event configure "Setting up the build (the library submodules, cmake)"
 slog="$LOGS/submodules.log"
@@ -813,7 +878,7 @@ run_child cmake --preset mac-arm64-native \
 printf '%s\n' "$toolchain_key" > "$BUILD/.fable2-toolchains"
 finish_stage configure
 
-# ---- 6. compile ------------------------------------------------------------------------------------------------------------
+# ---- 7. compile ------------------------------------------------------------------------------------------------------------
 DEFAULT_ERROR=build_failed
 stage_event compile "Compiling the game (ninja, target Fable2)"
 step "ninja -C out/build/mac-arm64-native Fable2"
@@ -836,4 +901,4 @@ finish_stage compile
 step "Done. Next: tools/mac/package_app.sh --out <Fable 2.app> --toolchains $TOOLCHAINS"
 update_dir_out=
 [ -d "$UPDATE_DIR" ] && update_dir_out=$UPDATE_DIR
-event "{\"result\": \"ok\", \"tool\": \"setup\", \"build\": $(json_str "$BUILD"), \"assets\": $(json_str "$ASSETS"), \"game_dir\": $(json_str "$GAME_DIR"), \"update_dir\": $(json_str "$update_dir_out"), \"toolchains\": $(json_str "$TOOLCHAINS"), \"rexglue\": $(json_str "$REXGLUE_CLI"), \"dxc_lib\": $(json_str "$FABLE2_DXC_LIB"), \"codegen\": $(json_bool $CODEGEN_RAN)}"
+event "{\"result\": \"ok\", \"tool\": \"setup\", \"build\": $(json_str "$BUILD"), \"assets\": $(json_str "$ASSETS"), \"game_dir\": $(json_str "$GAME_DIR"), \"update_dir\": $(json_str "$update_dir_out"), \"toolchains\": $(json_str "$TOOLCHAINS"), \"rexglue\": $(json_str "$REXGLUE_CLI"), \"dxc_lib\": $(json_str "$FABLE2_DXC_LIB"), \"codegen\": $(json_bool $CODEGEN_RAN), \"shaders\": $(json_str "$SHADERS_RESULT")}"
