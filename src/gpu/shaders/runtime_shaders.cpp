@@ -31,6 +31,7 @@
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
 
+#include "app/app_paths.h"
 #include "core/logging.h"
 
 extern char **environ;
@@ -88,9 +89,15 @@ State &state() {
   return s;
 }
 
-fs::path FirstExisting(const std::string &override_path, const char *built, const char *beside_exe) {
+// The cvar wins, then (Fable 2.app) the copy inside the bundle, then the one
+// this build made, then one beside the executable. In app mode the build
+// folder's copy must never be used: it exists on the machine that built the app.
+fs::path FirstExisting(const std::string &override_path, const fs::path &app_path, const char *built,
+                       const char *beside_exe) {
   if (!override_path.empty())
     return override_path;
+  if (fable2::app::AppMode())
+    return app_path;
   std::error_code ec;
   if (built && *built && fs::exists(built, ec))
     return built;
@@ -99,17 +106,20 @@ fs::path FirstExisting(const std::string &override_path, const char *built, cons
 
 fs::path TranslatorPath() {
 #ifdef FABLE2_XENOSRECOMP_EXE
-  return FirstExisting(REXCVAR_GET(fable2_xenosrecomp), FABLE2_XENOSRECOMP_EXE, "XenosRecomp");
+  return FirstExisting(REXCVAR_GET(fable2_xenosrecomp), fable2::app::GetPaths().xenosrecomp, FABLE2_XENOSRECOMP_EXE,
+                       "XenosRecomp");
 #else
-  return FirstExisting(REXCVAR_GET(fable2_xenosrecomp), nullptr, "XenosRecomp");
+  return FirstExisting(REXCVAR_GET(fable2_xenosrecomp), fable2::app::GetPaths().xenosrecomp, nullptr, "XenosRecomp");
 #endif
 }
 
 fs::path ShaderCommonPath() {
 #ifdef FABLE2_SHADER_COMMON_H
-  return FirstExisting(REXCVAR_GET(fable2_shader_common), FABLE2_SHADER_COMMON_H, "shader_common.h");
+  return FirstExisting(REXCVAR_GET(fable2_shader_common), fable2::app::GetPaths().shader_common,
+                       FABLE2_SHADER_COMMON_H, "shader_common.h");
 #else
-  return FirstExisting(REXCVAR_GET(fable2_shader_common), nullptr, "shader_common.h");
+  return FirstExisting(REXCVAR_GET(fable2_shader_common), fable2::app::GetPaths().shader_common, nullptr,
+                       "shader_common.h");
 #endif
 }
 
@@ -291,9 +301,14 @@ void RuntimeShadersInit() {
     const std::string &dir = REXCVAR_GET(fable2_runtime_shader_dir);
 #if defined(FABLE2_CONSTANT_BUFFERS)
     // Translations differ by how shaders read constants: never mix the two kinds.
-    s.dir = dir.empty() ? rex::filesystem::GetExecutableFolder() / "shader_runtime_cb" : fs::path(dir) / "cb";
+    // (Fable 2.app: <caches>/shader_runtime.)
+    s.dir = !dir.empty() ? fs::path(dir) / "cb"
+            : fable2::app::AppMode() ? fable2::app::GetPaths().shader_runtime / "cb"
+                                     : rex::filesystem::GetExecutableFolder() / "shader_runtime_cb";
 #else
-    s.dir = dir.empty() ? rex::filesystem::GetExecutableFolder() / "shader_runtime" : fs::path(dir);
+    s.dir = !dir.empty() ? fs::path(dir)
+            : fable2::app::AppMode() ? fable2::app::GetPaths().shader_runtime
+                                     : rex::filesystem::GetExecutableFolder() / "shader_runtime";
 #endif
   }
   if (!REXCVAR_GET(fable2_runtime_shaders))

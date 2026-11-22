@@ -11,10 +11,12 @@
 #include <cstdlib>
 #include <filesystem>
 #include <string>
+#include <vector>
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_metal.h>
 
+#include "app/app_paths.h"
 #include "core/logging.h"
 #include "platform/process.h"
 
@@ -64,12 +66,20 @@ bool PrepareMoltenVK() {
   const fs::path staged = DataDir() / "vulkan";
   // Fable 2: the ReXGlue build stages the Vulkan loader and MoltenVK in
   // vulkan/lib next to the executable.
-  const fs::path roots[] = {
-      rex::filesystem::GetExecutableFolder() / "vulkan" / "lib",
-      staged / "lib",
-      fs::path("/opt/homebrew/lib"),
-      fs::path("/usr/local/lib"),
-  };
+  // Fable 2.app: the loader and MoltenVK are in Contents/Frameworks and the ICD
+  // file in Contents/Resources (fable2::app::Paths); nothing else is searched.
+  const bool app_mode = fable2::app::AppMode();
+  std::vector<fs::path> roots;
+  if (app_mode) {
+    roots.push_back(fable2::app::GetPaths().vulkan_lib_dir);
+  } else {
+    roots = {
+        rex::filesystem::GetExecutableFolder() / "vulkan" / "lib",
+        staged / "lib",
+        fs::path("/opt/homebrew/lib"),
+        fs::path("/usr/local/lib"),
+    };
+  }
 
   std::error_code ec;
   // Fable 2: the build stages the loader, MoltenVK and its ICD file in
@@ -83,7 +93,9 @@ bool PrepareMoltenVK() {
   const char *system_vulkan = std::getenv("FABLE2_SYSTEM_VULKAN");
   const fs::path bundled_icd =
       rex::filesystem::GetExecutableFolder() / "vulkan" / "share" / "vulkan" / "icd.d" / "MoltenVK_icd.json";
-  if (!(system_vulkan && *system_vulkan == '1') && fs::exists(bundled_icd, ec))
+  if (app_mode)
+    icd = fable2::app::GetPaths().vulkan_icd;
+  else if (!(system_vulkan && *system_vulkan == '1') && fs::exists(bundled_icd, ec))
     icd = bundled_icd;
   if (fs::exists(icd, ec)) {
     SetenvIfUnset("VK_DRIVER_FILES", icd.c_str());
@@ -95,13 +107,13 @@ bool PrepareMoltenVK() {
   // Without a MoltenVK ICD file the loader finds no driver; MoltenVK exports
   // the Vulkan entry points itself, so load it directly then.
   if (!fs::exists(icd, ec))
-    handle = LoadFirst(roots, std::size(roots), "libMoltenVK.dylib", &from);
+    handle = LoadFirst(roots.data(), roots.size(), "libMoltenVK.dylib", &from);
   if (!handle)
-    handle = LoadFirst(roots, std::size(roots), "libvulkan.1.dylib", &from);
+    handle = LoadFirst(roots.data(), roots.size(), "libvulkan.1.dylib", &from);
   if (!handle)
-    handle = LoadFirst(roots, std::size(roots), "libvulkan.dylib", &from);
+    handle = LoadFirst(roots.data(), roots.size(), "libvulkan.dylib", &from);
   if (!handle)
-    handle = LoadFirst(roots, std::size(roots), "libMoltenVK.dylib", &from);
+    handle = LoadFirst(roots.data(), roots.size(), "libMoltenVK.dylib", &from);
   if (!handle) {
     EOT_ERROR("[mvk] no Vulkan runtime: neither {}/lib nor /opt/homebrew/lib nor /usr/local/lib holds "
               "libvulkan.1.dylib or libMoltenVK.dylib (brew install molten-vk, or build with the SDK's "

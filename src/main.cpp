@@ -4,6 +4,7 @@
 #if defined(FABLE2_NATIVE_RENDERER)
 #include "gpu/pipeline/pipeline_cache.h"
 #endif
+#include "app/app_paths.h"
 #include "generated/Fable2_init.h"
 #include "gpu_capture.h"
 #include "heap.h"
@@ -64,6 +65,28 @@ class Fable2App : public rex::ReXApp {
   // Assets root: arg or default to exe_dir/assets, containing game/ and
   // update/. The --game_data_root / --update_data_root cvars still win.
   void OnConfigurePaths(rex::PathConfig& paths) override {
+    if (fable2::app::AppMode()) {
+      // Fable 2.app started with no arguments: its own folders, not the ones
+      // beside the executable (src/app/app_paths.h). First start (settings
+      // file, the build folder's saves) happens here, before the config loads.
+      const auto& app = fable2::app::GetPaths();
+      fable2::app::EnsureFirstStart();
+      if (paths.game_data_root.empty()) {
+        paths.game_data_root = app.assets / "game";
+      }
+      if (paths.update_data_root.empty()) {
+        paths.update_data_root = app.assets / "update";
+      }
+      // The cvars still win.
+      if (rex::cvar::GetFlagByName("user_data_root").empty()) {
+        paths.user_data_root = app.user;
+      }
+      if (rex::cvar::GetFlagByName("cache_root").empty()) {
+        paths.cache_root = app.cache;
+      }
+      paths.config_path = app.config;
+      return;
+    }
     std::filesystem::path assets_root;
     if (auto arg = GetArgument("game_directory")) {
       assets_root = *arg;
@@ -75,6 +98,26 @@ class Fable2App : public rex::ReXApp {
     }
     if (paths.update_data_root.empty()) {
       paths.update_data_root = assets_root / "update";
+    }
+  }
+
+  void OnConfigureLogging(rex::LogConfig& config) override {
+    if (fable2::app::AppMode()) {
+      config.log_dir = fable2::app::GetPaths().logs;
+    }
+  }
+
+  // Logging is up: say what the first start did.
+  void OnPostInitLogging() override {
+    if (!fable2::app::AppMode()) {
+      return;
+    }
+    const auto& app = fable2::app::GetPaths();
+    REXLOG_INFO("[app] app mode: {}", app.mode_note);
+    REXLOG_INFO("[app] data {} caches {} assets {}", app.data.string(), app.caches.string(),
+                app.assets.string());
+    for (const auto& line : fable2::app::EnsureFirstStart().lines) {
+      REXLOG_INFO("[app] first start: {}", line);
     }
   }
 
