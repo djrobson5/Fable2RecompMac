@@ -15,6 +15,9 @@
 # locally built rexglue CLI (to take the achievement icons from the player's own
 # default.xex), and a DirectX Shader Compiler built from source (libdxcompiler).
 #
+# Contents/Resources/settings.json (the player settings a launcher draws as a page) comes
+# from the built game: `Fable2 --describe-settings`.
+#
 # Nothing is written inside the app at run time: settings, saves and logs go to
 # ~/Library/Application Support/Fable2, caches to ~/Library/Caches/Fable2.
 set -euo pipefail
@@ -34,7 +37,7 @@ while [ $# -gt 0 ]; do
         --out) OUT="${2:?--out needs a folder}"; OUT_SET=1; shift 2 ;;
         --seed-cache) SEED="${2:?--seed-cache needs a folder}"; SEED_SET=1; shift 2 ;;
         --no-seed) SEED=; SEED_SET=1; shift ;;
-        -h|--help) sed -n 2,18p "$0"; exit 0 ;;
+        -h|--help) sed -n 2,22p "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -82,6 +85,30 @@ cp "$ROOT/thirdparty/XenosRecomp/XenosRecomp/shader_common.h" "$C/Resources/"
 cp "$ROOT/tools/launcher/AppIcon.icns" "$C/Resources/AppIcon.icns"
 chmod 755 "$C/MacOS/Fable2" "$C/Resources/XenosRecomp"
 chmod 644 "$C/Frameworks/"*.dylib "$C/Resources/libdxcompiler.dylib"
+
+# ---- settings.json: the player settings, for a launcher (Wayfarer) to draw as a page ----
+# The game prints it and exits before any window (src/app/settings_describe.cpp). A build from before that flag
+# would start the game instead, so look for the flag in the binary first.
+grep -aqF -- '--describe-settings' "$BUILD/Fable2" \
+    || die "$BUILD/Fable2 has no --describe-settings: rebuild the game first (cmake --build out/build/mac-arm64-native)"
+SETTINGS_JSON="$C/Resources/settings.json"
+"$BUILD/Fable2" --describe-settings > "$SETTINGS_JSON" 2> "$STAGE/describe-settings.err" \
+    || { cat "$STAGE/describe-settings.err" >&2; die "Fable2 --describe-settings failed"; }
+python3 -I -m json.tool "$SETTINGS_JSON" > /dev/null || die "settings.json is not valid JSON (Fable2 --describe-settings)"
+python3 -I - "$SETTINGS_JSON" <<'PY' || die "settings.json has no usable rows"
+import json, sys
+d = json.load(open(sys.argv[1]))
+rows = d.get("settings")
+if not isinstance(rows, list) or not rows:
+    sys.exit("no settings rows")
+keys = [r.get("key") for r in rows]
+if len(set(keys)) != len(keys) or not all(keys):
+    sys.exit("a setting key is missing or listed twice")
+start = d.get("start")
+if not isinstance(start, dict) or not start or not set(start) <= set(keys):
+    sys.exit("start is missing, or names a setting that is not a row")
+print(f"settings.json: {len(rows)} settings, {len(start)} start values")
+PY
 
 # ---- achievement icons, renamed from image id to achievement id ----
 WORK="$STAGE/achievements-work"
