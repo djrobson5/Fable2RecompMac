@@ -375,3 +375,11 @@ removed, the exit status is 143 and no error event is sent.
 - The DXC hook is `cmake/dxc_from_source.cmake` (`-DCMAKE_PROJECT_Fable2_INCLUDE=`, with `-DFABLE2_DXC_SOURCE=` and
   `-DFABLE2_DXC_BUILD=`). A dev tree can keep a `cmake/local/dxc_from_source.cmake` that sets its own defaults,
   includes the tracked one and adds profiling aids.
+- `tools/mac/package_app.sh --out <path ending .app or .app.partial> --no-data --no-seed --toolchains <dir>
+  [--progress json]` makes the app at exactly that path (the old `--out <folder>` form still writes
+  `<folder>/Fable 2.app`); `--no-data` touches no data or cache folder. It stamps `Fable2SourceCommit` (`+dirty` for
+  tracked changes; the submodules' configure-time patch series does not count) and, when a remote named `upstream`
+  exists (or the one in `FABLE2_UPSTREAM_REMOTE`), `Fable2UpstreamBase` (its `main`'s merge base with HEAD).
+  `CFBundleVersion` is `git rev-list --count HEAD`, so a shallow clone gives the length of its shallow history. The result line is `{"result": "ok", "tool":
+  "package", "app": ..., "commit": ..., "dirty": ..., "upstream_base": ...}`. It refuses with `game_running` only when
+  the app at the target path itself is running.
