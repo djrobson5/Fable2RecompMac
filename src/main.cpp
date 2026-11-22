@@ -5,6 +5,7 @@
 #include "gpu/pipeline/pipeline_cache.h"
 #endif
 #include "app/app_paths.h"
+#include "app/home_claim.h"
 #include "generated/Fable2_init.h"
 #include "gpu_capture.h"
 #include "heap.h"
@@ -186,6 +187,13 @@ class Fable2App : public rex::ReXApp {
 
   // The window and its title exist by now (SetupPresentation runs first).
   void OnPreLaunchModule() override {
+    // Home button on every controller, and the window in front (input is read
+    // only while the window has focus). Before the early return below.
+    fable2::app::ClaimHome([](const char* line) { REXLOG_INFO("[home] {}", line); });
+    if (window()) {
+      window()->Focus();
+    }
+    fable2::app::ActivateApp();
 #if defined(FABLE2_NATIVE_RENDERER)
     if (!eot::gpu::Video::CreateHostDevice(window())) {
       REXLOG_ERROR("Native renderer: failed to create the host device");

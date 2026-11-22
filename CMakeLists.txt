@@ -44,11 +44,18 @@ set(FABLE2_SOURCES
     src/shader_capture.cpp
 )
 
+if(APPLE)
+    # src/app/home_claim.mm (the Home button, the window)
+    enable_language(OBJCXX)
+    list(APPEND FABLE2_SOURCES src/app/home_claim.mm)
+    set_source_files_properties(src/app/home_claim.mm PROPERTIES COMPILE_OPTIONS "-std=c++20;-fobjc-arc")
+endif()
+
 add_executable(Fable2 ${FABLE2_SOURCES})
 
 target_link_libraries(Fable2 PRIVATE dlmalloc)
 if(APPLE)
-    target_link_libraries(Fable2 PRIVATE "-framework Metal" "-Wl,-weak_framework,MetalFX" "-framework Foundation" objc)
+    target_link_libraries(Fable2 PRIVATE "-framework Metal" "-Wl,-weak_framework,MetalFX" "-framework Foundation" "-framework GameController" "-framework Cocoa" objc)
 endif()
 
 # Generated sources, rex::runtime, platform entry point, runtime library
