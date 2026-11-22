@@ -345,3 +345,33 @@ weak-linked (`-weak_framework`), so the binary loads where it is missing and the
 colours in 39 of 40 iterations (0 under the validation layer, which serializes the encoders). The presets (`eot_quality_preset` other than `custom`) write `eot_upscale` at boot,
 so `metalfx` needs the default `custom`. The MetalFX pass itself is not in the `[pass-gpu]` timing: its
 encoders are MetalFX's, so no counter samples can be attached.
+
+## Installing with a launcher
+
+A launcher (Wayfarer) installs the game from the player's own disc by running three scripts in a clone of this
+repository. Everything is built from source; nothing prebuilt is downloaded or run (the XenosRecomp submodule's
+`dxc-bin`, a repository of prebuilt binaries, is never initialised). The scripts print `@fable2 {json}` lines among
+their usual output when given `--progress json` (or `FABLE2_PROGRESS=json`): `{"stage": id, "title": text}`,
+`{"progress": done, "total": n, "eta": s, "note": text}`, `{"error": code, "message": text, "log": path}` and
+`{"result": "ok", ...}`. A TERM, INT or HUP is a cancel: the build's processes are stopped, temporary folders are
+removed, the exit status is 143 and no error event is sent.
+
+- `tools/mac/build_toolchains.sh --into <dir> [--reuse-sdk <dir>] [--reuse-dxc <dir>]` builds the ReXGlue SDK at
+  commit bd833a2a and DXC at v1.8.2407 (with its one CMakeLists edit, CMP0051) from source into `<dir>`. A reused
+  tree is used only when it is at the pin and its outputs are there, and is never changed. It keeps the resolved
+  paths in `<dir>/toolchains.env`. A tree it makes holds a `.fable2-toolchain` marker; it never removes or builds
+  into a folder that has none, and refuses a `--reuse-*` path inside `--into`. Run again with everything built it does
+  nothing. Measured on an M5 Pro (18
+  cores): SDK 85 s, DXC 96 s, 1.6 GB.
+- `tools/mac/setup_mac.sh --game <.iso or folder with default.xex> --update <title update or a folder to search>
+  --assets <dir> [--toolchains <dir>] [--reuse-sdk ...] [--reuse-dxc ...]` runs the stages `toolchains`, `extract`
+  (builds `tools/sdk_tools` standalone; unpacks the disc into `<assets>/game`, or uses/copies a folder; unpacks the
+  title update for the disc's media ID so `default.xexp` sits beside `default.xex` and in `<assets>/update`),
+  `check` (the image hash must be the one in `cmake/launcher.cmake`: `wrong_game` otherwise), `codegen` (skipped
+  when the same inputs were generated before), `configure` (submodules, `cmake --preset mac-arm64-native` with
+  `cmake/dxc_from_source.cmake`) and `compile` (target `Fable2` only: the default target also builds the SwiftUI
+  launcher app, which needs full Xcode). `--check [--json]` changes nothing and lists what is missing.
+  `assets/game` and `assets/update` in the clone become links to `<assets>/...`.
+- The DXC hook is `cmake/dxc_from_source.cmake` (`-DCMAKE_PROJECT_Fable2_INCLUDE=`, with `-DFABLE2_DXC_SOURCE=` and
+  `-DFABLE2_DXC_BUILD=`). A dev tree can keep a `cmake/local/dxc_from_source.cmake` that sets its own defaults,
+  includes the tracked one and adds profiling aids.
