@@ -2,7 +2,7 @@
 # Run from the repo root: rexglue codegen Fable2_manifest.toml
 
 [project]
-sdk_version = "0.10.0"
+sdk_version = "0.10.1"
 name = "Fable2"
 
 [entrypoint]
