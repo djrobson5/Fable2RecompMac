@@ -112,6 +112,9 @@ class Fable2App : public rex::ReXApp {
 
   // The built-in achievement toast, quiet while a launcher shows the pop-up.
   std::unique_ptr<rex::ui::AchievementNotificationDialog> CreateAchievementNotificationDialog() override {
+    if (!fable2::app::AppMode()) {
+      return rex::ReXApp::CreateAchievementNotificationDialog();
+    }
     if (!imgui_drawer() || !immediate_drawer() || !runtime()) {
       return nullptr;
     }
@@ -200,14 +203,17 @@ class Fable2App : public rex::ReXApp {
   void OnPreLaunchModule() override {
     // Home button on every controller, and the window in front (input is read
     // only while the window has focus). Before the early return below.
-    fable2::app::ClaimHome([](const char* line) { REXLOG_INFO("[home] {}", line); });
-    if (window()) {
-      window()->Focus();
+    // App mode only: runs from the build folder (dev, bench) stay as they were.
+    if (fable2::app::AppMode()) {
+      fable2::app::ClaimHome([](const char* line) { REXLOG_INFO("[home] {}", line); });
+      if (window()) {
+        window()->Focus();
+      }
+      fable2::app::ActivateApp();
+      // The achievement ledger for the launcher; rewritten at each unlock. The
+      // list (from the XEX) has been loaded by now.
+      fable2::app::ledger::Start(achievements(), logs_dir_, [](const char* line) { REXLOG_INFO("{}", line); });
     }
-    fable2::app::ActivateApp();
-    // The achievement ledger for the launcher; rewritten at each unlock. The
-    // list (from the XEX) has been loaded by now.
-    fable2::app::ledger::Start(achievements(), logs_dir_, [](const char* line) { REXLOG_INFO("{}", line); });
 #if defined(FABLE2_NATIVE_RENDERER)
     if (!eot::gpu::Video::CreateHostDevice(window())) {
       REXLOG_ERROR("Native renderer: failed to create the host device");

@@ -222,11 +222,11 @@ bool SamePlace(const fs::path& a, const fs::path& b) {
 
 const char* DefaultSettingsText() {
   return "# Fable II: the app's settings, written once at its first start (Metal, full screen,\n"
-         "# rendering at 1080p, MetalFX upscaling). The in-game settings overlay (F4) rewrites\n"
+         "# rendering at 1440p, MetalFX upscaling). The in-game settings overlay (F4) rewrites\n"
          "# this file, and what it saves wins from then on.\n"
          "fable2_gpu_backend = \"metal\"\n"
          "fullscreen = true\n"
-         "eot_resolution = \"1080p\"\n"
+         "eot_resolution = \"1440p\"\n"
          "eot_upscale = \"metalfx\"\n";
 }
 
@@ -274,22 +274,33 @@ StartReport FirstStart(const Paths& p, bool write) {
         r.lines.push_back("settings: cannot put " + p.config.string() + " in place: " + ec.message());
         r.ok = false;
       } else {
-        r.lines.push_back("settings: wrote " + p.config.string() + " (Metal, full screen, 1080p, MetalFX)");
+        r.lines.push_back("settings: wrote " + p.config.string() + " (Metal, full screen, 1440p, MetalFX)");
       }
     }
   } else {
-    r.lines.push_back("settings: would write " + p.config.string() + " (Metal, full screen, 1080p, MetalFX)");
+    r.lines.push_back("settings: would write " + p.config.string() + " (Metal, full screen, 1440p, MetalFX)");
   }
 
-  // The build folder's saves, once: only when the app has none and the old root has the hero save.
+  // The build folder's saves, once. The first start decides, and a marker records it only when every item is in
+  // place, so an interrupted or failed copy is finished at the next start (items already there are kept, never
+  // overwritten). With no hero save in the old root, nothing is copied, then or later.
   static const char* const kSaveItems[] = {"B13EBABEBABEBABE", "4D5307F1", "achievements"};
+  const fs::path marker = p.user / ".old-saves-copied";
+  auto mark = [&](const std::string& why) {
+    if (!write)
+      return;
+    fs::create_directories(p.user, ec);
+    std::ofstream(marker, std::ios::binary | std::ios::trunc) << why << "\n";
+  };
   if (SamePlace(p.old_root, p.user)) {
     r.lines.push_back("saves: the old root is the user data root, nothing to copy");
-  } else if (Exists(p.user / "B13EBABEBABEBABE")) {
-    r.lines.push_back("saves: " + p.user.string() + " already has saves, nothing copied");
+  } else if (Exists(marker)) {
+    r.lines.push_back("saves: decided at an earlier start, nothing copied");
   } else if (!Exists(p.old_root / "B13EBABEBABEBABE")) {
     r.lines.push_back("saves: no hero save in " + p.old_root.string() + ", nothing to copy");
+    mark("no hero save in " + p.old_root.string());
   } else {
+    bool all = true;
     for (const char* item : kSaveItems) {
       const fs::path src = p.old_root / item, dst = p.user / item;
       if (!Exists(src))
@@ -297,11 +308,13 @@ StartReport FirstStart(const Paths& p, bool write) {
       if (Exists(dst)) {
         r.lines.push_back(std::string("saves: ") + item + " is already in " + p.user.string() + ", kept");
       } else if (write) {
-        CopyOnce(src, dst, &r);
+        all = CopyOnce(src, dst, &r) && all;
       } else {
         r.lines.push_back(std::string("saves: ") + would + "copy " + src.string() + " -> " + dst.string());
       }
     }
+    if (all)
+      mark("copied from " + p.old_root.string());
   }
 
   // The build folder's cache, once.

@@ -51,7 +51,7 @@ struct StartReport {
 };
 
 // The one-time work of an app's first start: the data and cache folders, the
-// settings file (Metal backend, full screen, 1080p, MetalFX) when there is none,
+// settings file (Metal backend, full screen, 1440p, MetalFX) when there is none,
 // the build folder's saves and cache copied once. Copies are verified, never
 // delete the source, and land by rename so a half copy is not taken for saves.
 // With `write` false nothing is written; the lines say what would happen.

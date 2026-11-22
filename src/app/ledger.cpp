@@ -102,6 +102,7 @@ bool Write(const rex::system::AchievementManager& achievements, const fs::path& 
   {
     std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
     out << text;
+    out.close();  // a write error shows only once the stream is flushed
     if (!out) {
       Say("[ledger] cannot write " + tmp.string());
       return false;

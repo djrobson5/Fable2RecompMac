@@ -2,7 +2,13 @@
 # Builds "Fable 2.app" (bundle org.rexglue.fable2) from the build tree: the game itself,
 # not a launcher, so a launcher such as Wayfarer can start it with no arguments.
 #
-#   tools/mac/package_app.sh [--out <folder>]      default: ~/Games/Fable 2
+#   tools/mac/package_app.sh [--out <folder>] [--seed-cache <folder> | --no-seed]
+#                                                  default out: ~/Games/Fable 2
+#
+# --seed-cache: where the app's translated shaders live (default ~/Library/Caches/Fable2,
+# only when --out isn't given): the build folder's shader_runtime/ is copied there once,
+# if that folder has none yet, so the app's first play doesn't translate every shader
+# again. --no-seed skips it.
 #
 # The app goes to <folder>/Fable 2.app, and the game files are expected beside it in
 # <folder>/assets/{game,update}. Needs the build in out/build/mac-arm64-native, the
@@ -19,12 +25,16 @@ REXGLUE="${REXGLUE_CLI:-$HOME/Projects/rexglue-sdk/out/install/mac-arm64/bin/rex
 DXC_LIB="${FABLE2_DXC_LIB:-$HOME/Projects/DirectXShaderCompiler/out/build/lib/libdxcompiler.dylib}"
 XEX="${FABLE2_XEX:-$ROOT/assets/game/default.xex}"
 OUT="$HOME/Games/Fable 2"
+SEED="$HOME/Library/Caches/Fable2"
+SEED_SET=
 LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --out) OUT="${2:?--out needs a folder}"; shift 2 ;;
-        -h|--help) sed -n 2,12p "$0"; exit 0 ;;
+        --out) OUT="${2:?--out needs a folder}"; OUT_SET=1; shift 2 ;;
+        --seed-cache) SEED="${2:?--seed-cache needs a folder}"; SEED_SET=1; shift 2 ;;
+        --no-seed) SEED=; SEED_SET=1; shift ;;
+        -h|--help) sed -n 2,18p "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -181,6 +191,21 @@ for f in "$C/Frameworks/"*.dylib "$C/Resources/libdxcompiler.dylib" "$C/Resource
 done
 codesign --force --sign - "$APP"
 codesign --verify --deep --strict "$APP" || die "codesign --verify failed"
+# The translated-shader cache is stamped with the translator's modification time
+# (runtime_shaders.cpp): the app's copy gets the build's, so translations from the build
+# folder's runs stay valid. After signing, which rewrote the file; the time isn't signed.
+touch -r "$BUILD/XenosRecomp/XenosRecomp/XenosRecomp" "$C/Resources/XenosRecomp"
+
+# ---- seed the translated shaders, once ----
+# An app packaged elsewhere (--out, e.g. a test) seeds nothing unless --seed-cache says where.
+if [ -n "${OUT_SET:-}" ] && [ -z "$SEED_SET" ]; then SEED=; fi
+if [ -n "$SEED" ] && [ -d "$BUILD/shader_runtime" ] && [ ! -e "$SEED/shader_runtime" ]; then
+    mkdir -p "$SEED"
+    rm -rf "$SEED/shader_runtime.copying"   # a leftover from an interrupted run would nest the copy
+    cp -R "$BUILD/shader_runtime" "$SEED/shader_runtime.copying"
+    mv "$SEED/shader_runtime.copying" "$SEED/shader_runtime"
+    echo "seeded $SEED/shader_runtime ($(ls "$SEED/shader_runtime" | grep -c '\.f2sc$') files)"
+fi
 
 # ---- swap in ----
 rm -rf "$STAGE/achievements-work"
