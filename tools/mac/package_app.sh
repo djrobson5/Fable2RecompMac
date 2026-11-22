@@ -302,10 +302,8 @@ for f in "$C/Frameworks/"*.dylib "$C/Resources/libdxcompiler.dylib" "$C/Resource
 done
 codesign --force --sign - "$APP"
 codesign --verify --deep --strict "$APP" || die "codesign --verify failed"
-# The translated-shader cache is stamped with the translator's modification time
-# (runtime_shaders.cpp): the app's copy gets the build's, so translations from the build
-# folder's runs stay valid. After signing, which rewrote the file; the time isn't signed.
-touch -r "$BUILD/XenosRecomp/XenosRecomp/XenosRecomp" "$C/Resources/XenosRecomp"
+# (The translated-shader cache is stamped with the contents of shader_common.h, the translator and
+# libdxcompiler, as signed here: runtime_stamp.h. Their dates do not matter.)
 
 # ---- seed the translated shaders, once ----
 # An app packaged elsewhere (--out, e.g. a test) seeds nothing unless --seed-cache says where.
@@ -314,6 +312,32 @@ if [ -n "$SEED" ] && [ -d "$BUILD/shader_runtime" ] && [ ! -e "$SEED/shader_runt
     mkdir -p "$SEED"
     rm -rf "$SEED/shader_runtime.copying"   # a leftover from an interrupted run would nest the copy
     cp -R "$BUILD/shader_runtime" "$SEED/shader_runtime.copying"
+    # Those translations came from this build's translator, the program the app holds (re-signed, so its bytes, and
+    # the stamp by contents, differ). When the folder's own stamp says they fit this build's shader_common.h and
+    # translator, rewrite it in the form that keeps them once (runtime_stamp.h): the hash of shader_common.h and a
+    # date field of 0. A folder that is stale against the build keeps its stamp and is dropped at the first run.
+    "$PYTHON" -I - "$ROOT/thirdparty/XenosRecomp/XenosRecomp/shader_common.h" "$BUILD/XenosRecomp/XenosRecomp/XenosRecomp" \
+        "$SEED/shader_runtime.copying/stamp.txt" <<'PY' || true
+import os, sys
+def fnv(path):
+    h = 1469598103934665603
+    for b in open(path, "rb").read():
+        h = ((h ^ b) * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+    return f"{h:016x}"
+common, translator, stamp = sys.argv[1:4]
+try:
+    fields = open(stamp).read().split(" ")
+except OSError:
+    sys.exit(0)
+want = fnv(common)
+# the old form "<common> <date>", or the form by contents "<common> <translator> <compiler>" (the build tree's
+# compiler is not beside its translator, so that field is not compared)
+if (len(fields) == 2 and fields[0] == want) or (len(fields) == 3 and fields[0] == want and fields[1] == fnv(translator)):
+    tmp = stamp + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(f"{want} 0")
+    os.replace(tmp, stamp)
+PY
     mv "$SEED/shader_runtime.copying" "$SEED/shader_runtime"
     echo "seeded $SEED/shader_runtime ($(ls "$SEED/shader_runtime" | grep -c '\.f2sc$') files)"
 fi

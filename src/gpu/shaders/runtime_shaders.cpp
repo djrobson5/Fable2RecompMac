@@ -33,6 +33,7 @@
 
 #include "app/app_paths.h"
 #include "core/logging.h"
+#include "gpu/shaders/runtime_stamp.h"
 
 extern char **environ;
 
@@ -316,26 +317,29 @@ void RuntimeShadersInit() {
   std::error_code ec;
   fs::create_directories(s.dir / "in", ec);
   {
-    // Translations from another shader_common.h or translator are stale (the
-    // helpers' interface with the renderer changes): drop them.
-    const std::vector<uint8_t> common = ReadFile(ShaderCommonPath());
-    uint64_t h = 1469598103934665603ull;
-    for (const uint8_t c : common)
-      h = (h ^ c) * 1099511628211ull;
-    const auto translator_time = fs::last_write_time(TranslatorPath(), ec);
-    const std::string stamp =
-        std::format("{:016x} {}", h, ec ? 0ll : static_cast<long long>(translator_time.time_since_epoch().count()));
-    ec.clear();
+    // Translations from another shader_common.h, translator or shader compiler are
+    // stale (the helpers' interface with the renderer changes): drop them. The
+    // translator and the compiler sit beside each other in the app's Resources.
+    const fs::path translator = TranslatorPath();
+    const std::string current =
+        stamp::Make(ShaderCommonPath(), translator, translator.parent_path() / "libdxcompiler.dylib");
     const fs::path stamp_path = s.dir / "stamp.txt";
-    const std::vector<uint8_t> old_stamp = ReadFile(stamp_path);
-    if (std::string(old_stamp.begin(), old_stamp.end()) != stamp) {
+    const std::vector<uint8_t> old_bytes = ReadFile(stamp_path);
+    const stamp::Verdict verdict = stamp::Judge(std::string(old_bytes.begin(), old_bytes.end()), current);
+    if (verdict == stamp::Verdict::CarryOver) {
+      stamp::WriteAtomic(stamp_path, current);
+      EOT_INFO("[shaders] runtime: kept earlier translations (the stamp is now by contents, not dates)");
+    } else if (verdict == stamp::Verdict::Stale) {
       size_t dropped = 0;
       for (const auto &item : fs::directory_iterator(s.dir, ec))
         if (item.path().extension() == ".f2sc" && fs::remove(item.path(), ec))
           ++dropped;
-      std::ofstream(stamp_path, std::ios::binary | std::ios::trunc) << stamp;
-      EOT_INFO("[shaders] runtime: shader_common.h or translator changed; dropped {} earlier translations",
+      stamp::WriteAtomic(stamp_path, current);
+      EOT_INFO("[shaders] runtime: shader_common.h, the translator or the shader compiler changed; dropped {} "
+               "earlier translations",
                dropped);
+    } else {
+      EOT_INFO("[shaders] runtime: translations from earlier runs fit this translator (stamp {})", current);
     }
   }
   size_t files = 0, entries = 0;

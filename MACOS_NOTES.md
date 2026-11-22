@@ -88,8 +88,18 @@ MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS=0 ./Fable2 <repo>/assets --log_file=<log> \
   console. Symptom it fixed: no distant trees (the tree impostor atlases build
   each mip from the level above with a -1 bias; without it every mip read
   itself, empty). `fable2_fetch_lod_bias=false` switches it off for A/B.
-  Runtime shader translations are dropped when `shader_common.h` or the
-  translator changes (`shader_runtime/stamp.txt`).
+  Runtime shader translations are dropped when `shader_common.h`, the
+  translator or `libdxcompiler` changes (`shader_runtime/stamp.txt`: the FNV
+  hash of each file's contents, `src/gpu/shaders/runtime_stamp.h`). The stamp
+  used to hold the translator's file date, so every reinstall (a new file, the
+  same code) dropped all translations, the first start skipped draws until
+  they were redone, and a draw the game makes once per load (the hero's face
+  texture) stayed wrong. A stamp of the old form (`<shader_common.h hash>
+  <date>`) with the same `shader_common.h` is kept once and rewritten.
+  Packaging twice from one build gives the same translator and `libdxcompiler`
+  bytes (and the installed app's were the same too), so the stamp survives a
+  reinstall; a rebuilt `libdxcompiler` is not known to come out the same. The
+  stamp file is written through a temporary file and a rename.
 - Resolves into narrow formats (k_1_5_5_5, k_5_6_5, k_4_4_4_4, k_2_10_10_10)
   round to the destination's bits, as the console does (1-bit alpha snaps).
 - Less CPU (2026-11-12, `src/cpu_idle.cpp`): the game thread's fixed-step
