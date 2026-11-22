@@ -6,6 +6,7 @@
 #endif
 #include "app/app_paths.h"
 #include "app/home_claim.h"
+#include "app/ledger.h"
 #include "generated/Fable2_init.h"
 #include "gpu_capture.h"
 #include "heap.h"
@@ -106,6 +107,16 @@ class Fable2App : public rex::ReXApp {
     if (fable2::app::AppMode()) {
       config.log_dir = fable2::app::GetPaths().logs;
     }
+    logs_dir_ = config.log_dir;  // the ledger and wayfarer.lock live beside the logs
+  }
+
+  // The built-in achievement toast, quiet while a launcher shows the pop-up.
+  std::unique_ptr<rex::ui::AchievementNotificationDialog> CreateAchievementNotificationDialog() override {
+    if (!imgui_drawer() || !immediate_drawer() || !runtime()) {
+      return nullptr;
+    }
+    return std::make_unique<fable2::app::ledger::QuietToast>(imgui_drawer(), immediate_drawer(), runtime(),
+                                                             logs_dir_);
   }
 
   // Logging is up: say what the first start did.
@@ -194,6 +205,9 @@ class Fable2App : public rex::ReXApp {
       window()->Focus();
     }
     fable2::app::ActivateApp();
+    // The achievement ledger for the launcher; rewritten at each unlock. The
+    // list (from the XEX) has been loaded by now.
+    fable2::app::ledger::Start(achievements(), logs_dir_, [](const char* line) { REXLOG_INFO("{}", line); });
 #if defined(FABLE2_NATIVE_RENDERER)
     if (!eot::gpu::Video::CreateHostDevice(window())) {
       REXLOG_ERROR("Native renderer: failed to create the host device");
@@ -298,6 +312,7 @@ class Fable2App : public rex::ReXApp {
   }
 
  private:
+  std::filesystem::path logs_dir_;
   // Updates the window title with the frame rate.
   std::jthread title_thread_;
 };

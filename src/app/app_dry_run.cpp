@@ -16,9 +16,12 @@
 // reports what it would do and writes nothing. Outside an app bundle it writes
 // nothing at all.
 //
+// FABLE2_LEDGER_SELFTEST=1 also runs the ledger's byte-for-byte check (app/ledger.h).
+//
 // Exit: 0 fine, 1 something required is missing or a first-start step failed.
 
 #include "app/app_paths.h"
+#include "app/ledger.h"
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <unistd.h>
@@ -89,6 +92,13 @@ void Require(const char* label, const fs::path& p, bool executable = false) {
 int DryRun() {
   const Paths& p = fable2::app::GetPaths();
   std::printf("Fable2 dry run (pid %d)\n", int(getpid()));
+  if (const char* st = std::getenv("FABLE2_LEDGER_SELFTEST"); st && std::strcmp(st, "1") == 0) {
+    std::printf("ledger self-test (FABLE2_LEDGER_SELFTEST=1):\n");
+    const bool ok = fable2::app::ledger::SelfTest();
+    std::printf("ledger self-test: %s\n", ok ? "ok" : "FAILED");
+    if (!ok)
+      ++g_missing;
+  }
   std::printf("app mode: %s\n", p.app_mode ? "yes" : "no");
   std::printf("  why              %s\n", p.mode_note.c_str());
   std::printf("  executable       %s\n", p.exe.c_str());
