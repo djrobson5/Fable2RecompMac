@@ -3412,15 +3412,9 @@ bool CaptureDraw(VideoState &s, u32 device_va, u32 prim, GeometryPlan &geom,
     Dropped("device unreadable", 0x6000);
     return false;
   }
-  pk.window.Capture(regs);
-  pk.unlockGlobal = 0;
-  pk.streamEndian = 0;
-  if (REXCVAR_GET(fable2_diag_late_reads)) {
-    pk.unlockGlobal = ResourceUnlockGlobal();
-    for (u32 stream = 0; stream < 16; ++stream)
-      pk.streamEndian |= (*reinterpret_cast<const be_u32 *>(regs + dev::StreamFetchSlotOffset(stream) + 4) & 3u)
-                         << (2 * stream);
-  }
+  // The shaders come first, before any of the draw's state is captured: a draw
+  // that waits for a translation (below) then cannot leave state captured
+  // from before the wait.
   // Fable 2: GpuLoadShaders loads shaders without touching the device's
   // pointers (which may still hold an older SetPixelShader's shader); the
   // last of GpuLoadShaders and Set*Shader wins per stage. kGpuOwnedNone marks
@@ -3471,6 +3465,41 @@ bool CaptureDraw(VideoState &s, u32 device_va, u32 prim, GeometryPlan &geom,
     Dropped("pixel shader object unreadable", 0x6013);
     return false;
   }
+  // Fable 2: shaders the built-in cache lacks are translated in the background
+  // (runtime_shaders.cpp). A draw that needs one not ready yet waits for it
+  // (fable2_shader_wait; some draws, such as the hero's face texture at load, are
+  // made once and would stay wrong); with the wait off, or after its limit, the
+  // draw drops until the translation lands.
+  if (!vs->entry)
+    AttachRuntimeShader(*vs);
+  if (ps && !ps->entry)
+    AttachRuntimeShader(*ps);
+  if (!vs->entry || (ps && !ps->entry))
+    WaitForRuntimeShaders(*vs, ps);
+  if (!vs->entry || (ps && !ps->entry)) {
+    trace::Bump(trace::Counter::ShaderMiss);
+    auto note_miss = [](GuestShader &sh) {
+      if (sh.entry || sh.cacheMissLogged)
+        return;
+      sh.cacheMissLogged = true;
+      EOT_WARN("[shaders] {} {:#x} hash {:016x} is not in the shader cache",
+               sh.isPixel ? "ps" : "vs", sh.va, sh.hash);
+    };
+    note_miss(*vs);
+    if (ps)
+      note_miss(*ps);
+    Dropped("shader cache miss", 0x6002);
+    return false;
+  }
+  pk.window.Capture(regs);
+  pk.unlockGlobal = 0;
+  pk.streamEndian = 0;
+  if (REXCVAR_GET(fable2_diag_late_reads)) {
+    pk.unlockGlobal = ResourceUnlockGlobal();
+    for (u32 stream = 0; stream < 16; ++stream)
+      pk.streamEndian |= (*reinterpret_cast<const be_u32 *>(regs + dev::StreamFetchSlotOffset(stream) + 4) & 3u)
+                         << (2 * stream);
+  }
   // The texture headers as they are at the draw (replay binds from these).
   // Replay binds only the slots the shaders fetch from (texture_mask in
   // ReplayDrawLocked), so with fable2_capture_used_headers the others are
@@ -3487,27 +3516,6 @@ bool CaptureDraw(VideoState &s, u32 device_va, u32 prim, GeometryPlan &geom,
       pk.texHeaderMask |= 1u << slot;
       DiagStabilityNote(kStabHeader, mem::at<u8>(tex_va + obj::kTextureFetch), 24);
     }
-  }
-  // Fable 2: shaders the built-in cache lacks are translated in the background
-  // (runtime_shaders.cpp); their draws drop only until the translation lands.
-  if (!vs->entry)
-    AttachRuntimeShader(*vs);
-  if (ps && !ps->entry)
-    AttachRuntimeShader(*ps);
-  if (!vs->entry || (ps && !ps->entry)) {
-    trace::Bump(trace::Counter::ShaderMiss);
-    auto note_miss = [](GuestShader &sh) {
-      if (sh.entry || sh.cacheMissLogged)
-        return;
-      sh.cacheMissLogged = true;
-      EOT_WARN("[shaders] {} {:#x} hash {:016x} is not in the shader cache",
-               sh.isPixel ? "ps" : "vs", sh.va, sh.hash);
-    };
-    note_miss(*vs);
-    if (ps)
-      note_miss(*ps);
-    Dropped("shader cache miss", 0x6002);
-    return false;
   }
   pk.vs = vs;
   pk.ps = ps;

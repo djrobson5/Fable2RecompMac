@@ -4,17 +4,9 @@
 
 #include "gpu/shaders/runtime_shaders.h"
 
-#include <fcntl.h>
-#include <spawn.h>
-#include <pthread/spawn.h>
-#include <sys/qos.h>
-#include <sys/wait.h>
-
 #include <algorithm>
-#include <cerrno>
-
+#include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstring>
 #include <deque>
 #include <filesystem>
@@ -25,7 +17,6 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include <rex/cvar.h>
@@ -33,9 +24,9 @@
 
 #include "app/app_paths.h"
 #include "core/logging.h"
+#include "gpu/shaders/runtime_child.h"
+#include "gpu/shaders/runtime_jobs.h"
 #include "gpu/shaders/runtime_stamp.h"
-
-extern char **environ;
 
 REXCVAR_DEFINE_BOOL(fable2_runtime_shaders, true, "Fable2",
                     "Native renderer: translate shaders missing from the built-in cache while the game runs "
@@ -51,6 +42,14 @@ REXCVAR_DEFINE_STRING(fable2_shader_common, "", "Fable2",
                       "build used, or shader_common.h next to the executable)");
 REXCVAR_DEFINE_INT32(fable2_runtime_shader_workers, 3, "Fable2",
                      "Native renderer: background threads translating missing shaders");
+REXCVAR_DEFINE_BOOL(fable2_shader_wait, true, "Fable2",
+                    "Native renderer: a draw whose shader is not translated yet waits for its translation instead "
+                    "of being skipped (a draw the game makes only once, such as the hero's face texture at load, "
+                    "is not made again)");
+REXCVAR_DEFINE_INT32(fable2_shader_wait_max_ms, 5000, "Fable2",
+                     "Native renderer: the longest a draw waits for its shaders' translations (all of them "
+                     "together); after that the draw is skipped as without fable2_shader_wait, with a warning, "
+                     "and the translation goes on for later draws");
 
 namespace eot::gpu {
 namespace {
@@ -67,28 +66,33 @@ struct Blob {
   std::vector<ShaderCacheEntry> entries;
 };
 
-struct Job {
-  uint64_t hash = 0;
-  std::vector<uint8_t> container;
-};
+// The jobs: the container to translate, by hash (runtime_jobs.h: queued, running, done or failed this session).
+using JobBoard = jobs::Board<std::vector<uint8_t>>;
+
+constexpr int kUrgentWorkers = 2;  // they take only the jobs a draw is waiting for
 
 struct State {
-  std::mutex mutex;
+  std::mutex mutex;  // the tables below; never held while a job runs or a draw waits
   std::deque<std::unique_ptr<Blob>> blobs;
   std::unordered_map<uint64_t, const ShaderCacheEntry *> by_hash;
   std::unordered_map<const ShaderCacheEntry *, const Blob *> by_entry;
-  std::unordered_set<uint64_t> requested;  // queued, done or failed this session
-  std::deque<Job> queue;
-  std::condition_variable wake;
+  JobBoard board;
   std::vector<std::thread> workers;
   fs::path dir;
   bool initialized = false;
+  std::mutex wait_mutex;  // the draws' waits since the last window line
+  RuntimeShaderWaitStats wait_stats;
 };
 
+// Never destroyed: the workers are detached, and one that is finishing a job when the process exits must still
+// find its board. Stop() (shutdown) makes them leave.
 State &state() {
-  static State s;
+  static State &s = *new State;
   return s;
 }
+
+std::atomic<bool> g_stopping{false};  // shutdown: a running translator is killed
+constexpr auto kTranslatorLimit = std::chrono::seconds(60);  // one translator run (they take 0.3 to 5 s)
 
 // The cvar wins, then (Fable 2.app) the copy inside the bundle, then the one
 // this build made, then one beside the executable. In app mode the build
@@ -197,96 +201,77 @@ size_t Publish(std::unique_ptr<Blob> blob) {
   for (const ShaderCacheEntry &e : blob->entries)
     if (s.by_hash.emplace(e.hash, &e).second) {
       s.by_entry.emplace(&e, blob.get());
-      s.requested.insert(e.hash);
+      s.board.MarkDone(e.hash);  // (the board's lock is taken under this one, never the other way round)
       ++added;
     }
   s.blobs.push_back(std::move(blob));
   return added;
 }
 
-bool RunTranslator(const fs::path &in, const fs::path &out, std::string *error) {
-  const std::string exe = TranslatorPath().string(), common = ShaderCommonPath().string();
-  const std::string in_s = in.string(), out_s = out.string();
-  std::vector<char *> argv = {const_cast<char *>(exe.c_str()), const_cast<char *>(in_s.c_str()),
-                              const_cast<char *>(out_s.c_str()), const_cast<char *>(common.c_str()),
-                              const_cast<char *>("--blob"), nullptr};
-  posix_spawn_file_actions_t actions;
-  posix_spawn_file_actions_init(&actions);
-  posix_spawn_file_actions_addopen(&actions, 1, "/dev/null", O_WRONLY, 0);
-  posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", O_WRONLY, 0);
-  // The translator would inherit the calling game thread's QoS, which can be
-  // background: macOS then keeps it on the efficiency cores, throttled (a
-  // translation took 36 s instead of 5 s, and on a first start with no built-in
-  // cache the queue fell minutes behind: characters and ground stayed missing).
-  // Utility runs it at full speed while still yielding to the game's threads.
-  posix_spawnattr_t attr;
-  posix_spawnattr_init(&attr);
-  posix_spawnattr_set_qos_class_np(&attr, QOS_CLASS_UTILITY);
-  pid_t pid = 0;
-  const int rc = posix_spawn(&pid, exe.c_str(), &actions, &attr, argv.data(), environ);
-  posix_spawnattr_destroy(&attr);
-  posix_spawn_file_actions_destroy(&actions);
-  if (rc != 0) {
-    *error = std::format("cannot start {} ({})", exe, std::strerror(rc));
-    return false;
-  }
-  int status = 0;
-  while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
-  }
-  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-    *error = std::format("{} exited with {}", exe, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
-    return false;
-  }
-  return true;
+// Runs XenosRecomp --blob on `in`; a run that fails to start, exits with a status or runs over the limit (a hung
+// translator would hold a worker, and the draws waiting for it, for good) is killed and run once more.
+bool RunTranslator(const fs::path &in, const fs::path &out, bool urgent, std::string *error) {
+  const std::vector<std::string> argv = {TranslatorPath().string(), in.string(), out.string(),
+                                         ShaderCommonPath().string(), "--blob"};
+  int attempts = 0;
+  const child::Result r = child::RunRetrying(argv, urgent, kTranslatorLimit, &g_stopping, &attempts);
+  if (r.outcome == child::Outcome::Ok)
+    return true;
+  *error = attempts > 1 ? r.error + " (after a second try)" : r.error;
+  return false;
 }
 
-void Translate(const Job &job) {
+// Translates one container and publishes the result. False when there is none.
+bool Translate(uint64_t hash, const std::vector<uint8_t> &container, bool urgent) {
   auto &s = state();
   const auto start = std::chrono::steady_clock::now();
-  const std::string name = std::format("{:016x}", job.hash);
+  const std::string name = std::format("{:016x}", hash);
   std::error_code ec;
   const fs::path in = s.dir / "in" / (name + ".bin");
   const fs::path tmp = s.dir / (name + ".f2sc.tmp");
   const fs::path out = s.dir / (name + ".f2sc");
   {
     std::ofstream f(in, std::ios::binary);
-    f.write(reinterpret_cast<const char *>(job.container.data()), std::streamsize(job.container.size()));
+    f.write(reinterpret_cast<const char *>(container.data()), std::streamsize(container.size()));
   }
   std::string error;
-  if (!RunTranslator(in, tmp, &error)) {
+  if (!RunTranslator(in, tmp, urgent, &error)) {
     EOT_WARN("[shaders] runtime translation of {} failed: {}", name, error);
-    return;
+    fs::remove(in, ec);
+    fs::remove(tmp, ec);
+    return false;
   }
   auto blob = std::make_unique<Blob>();
   if (!ParseBlob(ReadFile(tmp), *blob)) {
     EOT_WARN("[shaders] runtime translation of {}: unreadable output", name);
+    fs::remove(in, ec);
     fs::remove(tmp, ec);
-    return;
+    return false;
   }
   if (blob->entries.empty()) {
     EOT_WARN("[shaders] runtime translation of {}: XenosRecomp could not translate it (its draws stay dropped)",
              name);
+    fs::remove(in, ec);
     fs::remove(tmp, ec);
-    return;
+    return false;
   }
   fs::rename(tmp, out, ec);
   fs::remove(in, ec);
   Publish(std::move(blob));
   const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-  EOT_INFO("[shaders] runtime: {} translated in {:.0f} ms (kept in {})", name, ms, s.dir.string());
+  EOT_INFO("[shaders] runtime: {} translated in {:.0f} ms{} (kept in {})", name, ms,
+           urgent ? " for a waiting draw" : "", s.dir.string());
+  return true;
 }
 
-void Worker() {
+void Worker(bool urgent_only) {
   auto &s = state();
-  for (;;) {
-    Job job;
-    {
-      std::unique_lock lock(s.mutex);
-      s.wake.wait(lock, [&] { return !s.queue.empty(); });
-      job = std::move(s.queue.front());
-      s.queue.pop_front();
-    }
-    Translate(job);
+  uint64_t hash = 0;
+  std::vector<uint8_t> container;
+  bool urgent = false;
+  while (s.board.Take(urgent_only, &hash, &container, &urgent)) {
+    const bool ok = Translate(hash, container, urgent);
+    s.board.Finish(hash, ok);  // after Translate published it: a waiter that sees Done finds the entry
   }
 }
 
@@ -364,22 +349,83 @@ void RuntimeShaderRequest(uint64_t hash, const uint8_t *virtual_bytes, uint32_t 
     return;
   RuntimeShadersInit();
   auto &s = state();
-  std::lock_guard lock(s.mutex);
-  if (!s.requested.insert(hash).second)
-    return;
-  Job job;
-  job.hash = hash;
-  job.container.assign(virtual_bytes, virtual_bytes + virtual_size);
+  std::vector<uint8_t> container(virtual_bytes, virtual_bytes + virtual_size);
   if (physical_bytes && physical_size)
-    job.container.insert(job.container.end(), physical_bytes, physical_bytes + physical_size);
-  s.queue.push_back(std::move(job));
-  if (s.workers.empty()) {
-    const int n = std::max(1, std::min(8, int(REXCVAR_GET(fable2_runtime_shader_workers))));
-    for (int i = 0; i < n; ++i)
-      s.workers.emplace_back(Worker).detach();
+    container.insert(container.end(), physical_bytes, physical_bytes + physical_size);
+  if (!s.board.Add(hash, std::move(container)))
+    return;  // queued, running, done or failed already
+  {
+    std::lock_guard lock(s.mutex);
+    if (s.workers.empty()) {
+      const int n = std::max(1, std::min(8, int(REXCVAR_GET(fable2_runtime_shader_workers))));
+      for (int i = 0; i < n; ++i)
+        s.workers.emplace_back(Worker, false).detach();
+      for (int i = 0; i < kUrgentWorkers; ++i)
+        s.workers.emplace_back(Worker, true).detach();
+    }
   }
-  s.wake.notify_one();
   EOT_INFO("[shaders] runtime: {:016x} is not in the built-in cache, translating it", hash);
+}
+
+void RuntimeShadersStop() {
+  g_stopping.store(true, std::memory_order_release);
+  state().board.Stop();
+}
+
+bool RuntimeShaderWaitAll(const uint64_t *hashes, size_t count) {
+  if (!REXCVAR_GET(fable2_shader_wait) || !REXCVAR_GET(fable2_runtime_shaders) || g_stopping.load())
+    return false;
+  auto &s = state();
+  // Look at every shader first. A draw that cannot have all of them (one failed, one already ran its wait out,
+  // one was never asked for) has nothing to wait for: it is skipped now, not after the others' translations.
+  for (size_t i = 0; i < count; ++i) {
+    const jobs::Peek p = s.board.Look(hashes[i]);
+    if (p != jobs::Peek::Pending && p != jobs::Peek::Done)
+      return false;
+  }
+  for (size_t i = 0; i < count; ++i)
+    s.board.Prioritize(hashes[i]);  // together, so they translate side by side
+  // One limit for the whole draw, shared by the shaders.
+  const int cap_ms = std::clamp(int(REXCVAR_GET(fable2_shader_wait_max_ms)), 0, 600000);
+  const auto start = std::chrono::steady_clock::now();
+  const auto deadline = start + std::chrono::milliseconds(cap_ms);
+  bool ready = true;
+  bool timed_out = false;
+  uint64_t blamed = 0;
+  for (size_t i = 0; i < count && ready; ++i) {
+    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+    const jobs::WaitResult r = s.board.Wait(hashes[i], std::max(left, std::chrono::milliseconds(0)));
+    ready = r == jobs::WaitResult::Done;
+    timed_out = r == jobs::WaitResult::TimedOut;
+    blamed = hashes[i];
+  }
+  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+  if (ms >= 1.0) {
+    std::lock_guard lock(s.wait_mutex);
+    ++s.wait_stats.waits;
+    s.wait_stats.total_ms += ms;
+    s.wait_stats.max_ms = std::max(s.wait_stats.max_ms, ms);
+    if (timed_out)
+      ++s.wait_stats.gave_up;
+  }
+  if (ready) {
+    if (ms >= 1.0)
+      EOT_INFO("[shaders] a draw waited {:.0f} ms for the translation of {:016x}{}", ms, hashes[0],
+               count > 1 ? std::format(" and {:016x}", hashes[1]) : std::string());
+  } else if (timed_out && ms >= 1.0) {
+    EOT_WARN("[shaders] gave up waiting for the translation of {:016x} after {:.0f} ms (fable2_shader_wait_max_ms): "
+             "its draws are skipped until it lands",
+             blamed, ms);
+  }
+  return ready;
+}
+
+RuntimeShaderWaitStats RuntimeShaderTakeWaitStats() {
+  auto &s = state();
+  std::lock_guard lock(s.wait_mutex);
+  RuntimeShaderWaitStats out = s.wait_stats;
+  s.wait_stats = RuntimeShaderWaitStats{};
+  return out;
 }
 
 const ShaderCacheEntry *RuntimeShaderEntry(uint64_t hash) {

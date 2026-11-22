@@ -41,6 +41,9 @@ const u32 *EntryVertexLayouts(const ShaderCacheEntry &e);
 // Fable 2: picks up a runtime translation for a shader that missed the cache
 // (true once it has an entry).
 bool AttachRuntimeShader(GuestShader &sh);
+// Fable 2: a draw whose shaders (the pixel shader may be null) are not all translated yet waits for the ones that
+// are not (fable2_shader_wait, runtime_shaders.h) and attaches them; the draw goes on if they all have an entry.
+void WaitForRuntimeShaders(GuestShader &vs, GuestShader *ps);
 u64 CanonicalShaderHash(u64 hash);
 void VertexInputsFromEntry(const ShaderCacheEntry &e, std::vector<VertexInput> &out);
 enum class VsVariant : u8 { Trimmed = 0, Full = 1, PositionOnly = 2, Velocity = 3 };

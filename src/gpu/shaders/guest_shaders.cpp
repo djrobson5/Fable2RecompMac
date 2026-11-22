@@ -629,6 +629,23 @@ bool AttachRuntimeShader(GuestShader &sh) {
   return true;
 }
 
+void WaitForRuntimeShaders(GuestShader &vs, GuestShader *ps) {
+  GuestShader *missing[2];
+  uint64_t hashes[2];
+  size_t count = 0;
+  for (GuestShader *sh : {&vs, ps})
+    if (sh && !sh->entry) {
+      missing[count] = sh;
+      hashes[count++] = sh->hash;
+    }
+  // One wait for the draw: its shaders translate side by side, share one time limit, and a draw that cannot have
+  // them all does not wait for any (runtime_shaders.h).
+  const bool all = RuntimeShaderWaitAll(hashes, count);
+  for (size_t i = 0; i < count; ++i)
+    if (all || RuntimeShaderEntry(missing[i]->hash))
+      AttachRuntimeShader(*missing[i]);
+}
+
 void VertexInputsFromEntry(const ShaderCacheEntry &e, std::vector<VertexInput> &out) {
   out.clear();
   for (u32 i = 0; i < e.vertexLayoutCount; ++i) {

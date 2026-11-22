@@ -42,6 +42,7 @@
 #include "gpu/pipeline/pipeline_cache.h"
 #include "gpu/settings.h"
 #include "gpu/shaders/guest_shaders.h"
+#include "gpu/shaders/runtime_shaders.h"
 #include "gpu/surfaces.h"
 #include "gpu/taa.h"
 #include "gpu/textures.h"
@@ -750,6 +751,11 @@ void LogPerfLocked(VideoState &s) {
             p.pull_bytes / p.frames / 1024, static_cast<f64>(p.pull_draws) / p.frames, p.pull_mirrored_bytes / p.frames / 1024,
             static_cast<f64>(p.chunk_submits) / p.frames,
             GpuTimingSummary(p));
+  // Fable 2: draws that waited for a shader's translation this window (nothing is said when none did).
+  if (const RuntimeShaderWaitStats waits = RuntimeShaderTakeWaitStats(); waits.waits > 0)
+    EOT_INFO("[shaders] {} draws waited {:.0f} ms in all for runtime translations this window (longest {:.0f} ms, {} "
+             "gave up and were skipped)",
+             waits.waits, waits.total_ms, waits.max_ms, waits.gave_up);
   {
     plume::g_lazyPassSwitch.store(REXCVAR_GET(fable2_lazy_render_pass), std::memory_order_relaxed);
     plume::g_barrierKeepsPass.store(REXCVAR_GET(fable2_barrier_keeps_pass), std::memory_order_relaxed);

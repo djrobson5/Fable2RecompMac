@@ -432,3 +432,24 @@ next load). So that a first start has nothing to translate that the game's own d
   memory when the game binds them (`sub_82BA40F0` writes the vertex fetch constants from the vertex declaration and
   links the exports to the pixel shader), so their runtime hash is not the bank's; they are translated while the
   game runs and kept in `~/Library/Caches/Fable2/shader_runtime`.
+- **A draw waits for its shader** (`fable2_shader_wait`, on by default). A draw whose shader has no translation
+  yet used to be skipped (`[draw] dropped: shader cache miss`). Now `CaptureDraw` moves the translation of each
+  shader the draw lacks to the front and waits for it (`RuntimeShaderWait`), then the draw goes ahead. The wait ends
+  when the translation lands, when it fails (the draw is skipped at once, as before) or after
+  `fable2_shader_wait_max_ms` (5000, for all the draw's shaders together, one deadline for the vertex and the pixel
+  shader): then a warning is logged and the draw is skipped; later draws with that shader do not wait again, and
+  the translation goes on, so a later draw attaches it. A draw that lacks two shaders looks at both first and does
+  not wait at all when one has failed or already ran its wait out. The wait sits at the top of `CaptureDraw`,
+  before any of the draw's state is captured. Jobs are tracked per shader in `src/gpu/shaders/runtime_jobs.h` (header only, tested
+  with a fake translator under ThreadSanitizer): a queued job a draw waits for goes to two extra workers that take
+  nothing else, so a wait is never behind the background queue; the translator runs as a child process the waiter
+  does not depend on (`runtime_child.h`: killed after 60 s and run once more after a failed start, a non-zero exit or
+  a kill, so a hung child cannot hold a worker), and the waiter holds no lock while it waits. At shutdown
+  (`Video::BeginShutdown`, before the render thread stops) `RuntimeShadersStop` kills the children, ends the workers
+  and releases every waiting draw; the board and the tables are never destroyed, so a worker still finishing cannot
+  touch freed memory. The translator of a waited-for job runs at
+  user-initiated QoS. The background translation of every shader seen when it is created still runs, so most
+  translations are ready before the draw asks. Logs: `[shaders] a draw waited N ms for the translation of <hash>`,
+  `[shaders] runtime: <hash> translated in N ms for a waiting draw`, `[shaders] gave up waiting ...`, and with each
+  `[perf]` window `[shaders] N draws waited M ms in all ...`. The game thread is stopped while it waits, so the
+  frame takes that long; the watchdog's "stuck frame" warning (over 2 s) can show.

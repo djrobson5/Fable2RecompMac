@@ -6,6 +6,7 @@
 #include "gpu/gpu_timing.h"
 #include "gpu/memory_report.h"
 #include "gpu/pipeline/pipeline_cache.h"
+#include "gpu/shaders/runtime_shaders.h"
 #include "gpu/pipeline/pso_precache.h"
 
 #include <algorithm>
@@ -1477,6 +1478,7 @@ bool Video::IsShuttingDown() { return state().shutting_down.load(std::memory_ord
 void Video::BeginShutdown() {
   auto &s = state();
   s.shutting_down.store(true, std::memory_order_release);
+  RuntimeShadersStop();  // first: a draw waiting for a translation goes on, so the render queue can drain
   RenderThreadStop();
   PsoPrecacheStop();
   PsoCacheFlushIfDirty(true);
