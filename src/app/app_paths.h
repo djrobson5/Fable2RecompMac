@@ -11,6 +11,7 @@
 #pragma once
 
 #include <filesystem>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -59,6 +60,17 @@ StartReport FirstStart(const Paths& paths, bool write);
 
 // FirstStart(paths, true) once per process; the report is kept for the log.
 const StartReport& EnsureFirstStart();
+
+// One line of the settings file the first start writes: `name = "value"` for a string, `name = value` otherwise.
+struct StartSetting {
+  const char* name;
+  const char* value;  // the text without quotes
+  bool is_string;
+};
+
+// What the first start writes (Metal, full screen, 1440p, MetalFX). The one source of DefaultSettingsText() and of
+// settings.json's "start" (app/settings_describe.cpp), so the two cannot drift.
+std::span<const StartSetting> StartSettings();
 
 // The settings file's text (first start), exposed for the dry run.
 const char* DefaultSettingsText();

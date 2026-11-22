@@ -8,6 +8,7 @@
 #include <cmath>
 
 #include <string>
+#include <string_view>
 
 #include <rex/types.h>
 
@@ -105,5 +106,7 @@ inline f32 ShadowMapTargetScale() {
 namespace eot::gpu {
 
 void ApplyQualityPresetAtBoot();
+// Whether the quality preset sets this cvar (kGates): changing one by hand makes the preset custom.
+bool IsQualityPresetGate(std::string_view name);
 
 }

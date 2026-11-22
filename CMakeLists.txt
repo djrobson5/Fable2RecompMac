@@ -104,3 +104,8 @@ endif()
 set_property(SOURCE generated/Fable2_register.cpp APPEND PROPERTY COMPILE_OPTIONS -O0 -fno-global-isel)
 # The shared PCH is built at the target's -O level and clang rejects it here.
 set_property(SOURCE generated/Fable2_register.cpp PROPERTY SKIP_PRECOMPILE_HEADERS ON)
+
+# `Fable2 --describe-settings` (src/app/settings_describe.cpp) runs from a constructor, in link order with the static
+# initializers that register the cvars it lists. Keep this the last source added to the target, so the registry is
+# complete when it runs.
+target_sources(Fable2 PRIVATE src/app/settings_describe.cpp)

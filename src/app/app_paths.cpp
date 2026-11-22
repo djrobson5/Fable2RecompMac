@@ -220,14 +220,30 @@ bool SamePlace(const fs::path& a, const fs::path& b) {
 
 }  // namespace
 
+std::span<const StartSetting> StartSettings() {
+  static constexpr StartSetting kStart[] = {
+      {"fable2_gpu_backend", "metal", true},
+      {"fullscreen", "true", false},
+      {"eot_resolution", "1440p", true},
+      {"eot_upscale", "metalfx", true},
+  };
+  return kStart;
+}
+
 const char* DefaultSettingsText() {
-  return "# Fable II: the app's settings, written once at its first start (Metal, full screen,\n"
-         "# rendering at 1440p, MetalFX upscaling). The in-game settings overlay (F4) rewrites\n"
-         "# this file, and what it saves wins from then on.\n"
-         "fable2_gpu_backend = \"metal\"\n"
-         "fullscreen = true\n"
-         "eot_resolution = \"1440p\"\n"
-         "eot_upscale = \"metalfx\"\n";
+  static const std::string text = [] {
+    std::string out =
+        "# Fable II: the app's settings, written once at its first start (Metal, full screen,\n"
+        "# rendering at 1440p, MetalFX upscaling). The in-game settings overlay (F4) rewrites\n"
+        "# this file, and what it saves wins from then on.\n";
+    for (const StartSetting& s : StartSettings()) {
+      out += std::string(s.name) + " = ";
+      out += s.is_string ? "\"" + std::string(s.value) + "\"" : std::string(s.value);
+      out += "\n";
+    }
+    return out;
+  }();
+  return text.c_str();
 }
 
 const Paths& GetPaths() {

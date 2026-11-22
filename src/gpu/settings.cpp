@@ -399,6 +399,13 @@ struct Registrar {
 
 namespace eot::gpu {
 
+bool IsQualityPresetGate(std::string_view name) {
+  for (const Gate &g : kGates)
+    if (name == g.name)
+      return true;
+  return false;
+}
+
 void ApplyQualityPresetAtBoot() {
   static bool done = false;
   if (done)
