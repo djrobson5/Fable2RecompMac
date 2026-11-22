@@ -32,6 +32,7 @@ target_compile_definitions(dlmalloc PUBLIC
 set(FABLE2_SOURCES
     src/main.cpp
     src/app/app_paths.cpp
+    src/app/app_dry_run.cpp
     src/heap.cpp
     src/hooks.cpp
     src/critical_sections.cpp
