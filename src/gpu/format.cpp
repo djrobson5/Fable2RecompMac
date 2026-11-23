@@ -345,13 +345,13 @@ plume::RenderPrimitiveTopology ConvertPrimitiveType(u32 prim, bool *expand_neede
   }
 }
 
-DeclTypeInfo DecodeDeclType(u32 t) {
+DeclTypeInfo DecodeDeclType(u32 t, bool shader_swizzles) {
   using F = plume::RenderFormat;
   DeclTypeInfo d;
   d.xenosFormat = t & 0x3F;
   d.signedData = ((t >> 8) & 1) != 0;
   d.integer = ((t >> 9) & 1) != 0;
-  const bool bgra = ((t >> 16) & 0xFF) == 0x18; // D3DCOLOR swizzle
+  const bool bgra = ((t >> 16) & 0xFF) == 0x18 && !shader_swizzles; // D3DCOLOR swizzle
   switch (d.xenosFormat) {
   case 36: // k_32_FLOAT
     d.format = F::R32_FLOAT;

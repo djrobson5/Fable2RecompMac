@@ -215,9 +215,18 @@ struct VertexInput {
 
 struct InputLayout;
 
+struct VsRecordedDecl;  // shaders/vs_identity.h
+
 struct GuestShader {
   u32 va = 0;
-  u64 hash = 0;
+  u64 hash = 0;  // the translation's key: the container's own hash, or its pristine original's (normalized)
+  // Fable 2 (fable2_vs_pristine): the hash of the container the object holds now; differs from hash for
+  // a vertex shader the game rewrote at bind time, which is translated as the pristine bank original.
+  u64 liveHash = 0;
+  bool normalized = false;
+  // For a normalized shader: the declaration and strides the game rewrote this container with (what draws
+  // with no declaration bound use, and the pull sites' fallback); fixed with the registration.
+  std::shared_ptr<const VsRecordedDecl> recorded;
   u64 fingerprint = 0;  // ShaderFingerprint at registration (bind-time revalidation)
   bool isPixel = false;
   const ShaderCacheEntry *entry = nullptr;

@@ -31,6 +31,7 @@
 #include "gpu/pipeline/pso_precache.h"
 #include "gpu/pipeline/pso_records.h"
 #include "gpu/settings.h"
+#include "gpu/shaders/vs_identity.h"
 #include "gpu/shaders/guest_shaders.h"
 #include "gpu/vertex_layout.h"
 
@@ -351,7 +352,7 @@ u32 EnqueueSlots(const std::vector<Slot> &slots, PsoLane lane, u32 *no_template)
     std::vector<VertexInput> inputs;
     VertexInputsFromEntry(*entry, inputs);
     const InputLayout *layout =
-        GetInputLayoutFromRaw(slot.vsHash, inputs, slot.declRaw, slot.declCount);
+        GetInputLayoutFromRaw(slot.vsHash, inputs, slot.declRaw, slot.declCount, VsHashKeyedPristine(slot.vsHash));
     if (!layout)
       continue;
     bool any = false, caster = false;

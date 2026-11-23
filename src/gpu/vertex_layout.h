@@ -64,8 +64,10 @@ const InputLayout *GetInputLayout(VideoState &s, GuestShader &vs, u32 declaratio
 // Fetch slots the vertex shader reads by vertex pulling (empty for most).
 const std::vector<u8> &PulledSlots(GuestShader &vs);
 
+// normalized: the inputs belong to a pristine bank vertex shader (GuestShader::normalized); the layout
+// carries their component permutation codes.
 const InputLayout *GetInputLayoutFromRaw(u64 vs_hash, const std::vector<VertexInput> &inputs,
-                                         const u8 *decl_raw, u32 decl_count);
+                                         const u8 *decl_raw, u32 decl_count, bool normalized = false);
 
 
 }

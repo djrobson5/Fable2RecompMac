@@ -56,6 +56,7 @@ REXCVAR_DECLARE(bool, fable2_metal_fold_resolve);
 #include "gpu/taa.h"
 #include "gpu/trace.h"
 #include "gpu/vertex_layout.h"
+#include "gpu/shaders/vs_identity.h"
 
 REXCVAR_DEFINE_BOOL(fable2_geometry_caches, true, "Fable2",
                     "Native renderer: reuse host copies of vertex/index data whose sampled bytes "
@@ -217,7 +218,8 @@ REXCVAR_DEFINE_STRING(fable2_zpass_trigger_ps, "383793fa8d5a0716", "Fable2",
 REXCVAR_DEFINE_BOOL(fable2_shadow_bias_in_vs, true, "Fable2",
                     "Native renderer: shadow casters' constant polygon offset is applied in the vertex shader");
 REXCVAR_DEFINE_STRING(fable2_pull_up_stream_vs, "e6415e8304306082", "Fable2",
-                      "Native renderer: vertex shader hashes whose pulled stream 0 is a BeginVertices draw's own data");
+                      "Native renderer: vertex shader hashes whose pulled stream 0 is a BeginVertices draw's own data "
+                      "(of the rewritten form; with fable2_vs_pristine its bank original matches too)");
 // On by default: the game relies on it. The item cards' 3D preview (a warrant
 // lit by the card's spot light) multiplied an infinite constant by zero; IEEE
 // made every pixel NaN and the 7e3 target scrubbed it to black.
@@ -238,6 +240,40 @@ REXCVAR_DEFINE_BOOL(fable2_skip_point_lists, true, "Fable2",
                     "Native renderer: skip point-list draws (point sprites not supported yet)");
 
 namespace eot::gpu {
+
+// Fable 2: vertex shaders the draw code picks out by hash. The game rewrites a vertex shader at bind time, so
+// each (declaration, pixel shader) used to hash to a shader of its own: the first list of each pair holds the
+// hash the capture saw, which is all that matches with fable2_vs_pristine off. With it on, a rewritten shader is
+// keyed by its pristine bank original's hash (the second list: a108f279 has two bank candidates, two bank vertex
+// shaders share its code) and matches by it only when the draw's shader is normalised. The pairs of 36f4dd57
+// and bcc6e2de come from the bind hook's log; those of 4ba0b364, 8f1c881c and a108f279 from matching the
+// captured container to the bank.
+constexpr u64 kVsOcclusionBoxes[] = {0x8f1c881c15849337ull};
+constexpr u64 kVsOcclusionBoxesBank[] = {0x9448bff0f0fdc9faull};
+constexpr u64 kVsFurShells[] = {0x4ba0b3646633c5bfull};
+constexpr u64 kVsFurShellsBank[] = {0xf6d202cd84db621cull};
+constexpr u64 kVsTerrain36f4[] = {0x36f4dd575db99917ull};
+constexpr u64 kVsTerrain36f4Bank[] = {0x287acd551af85b0aull};
+constexpr u64 kVsBcc6[] = {0xbcc6e2def4a3e5c2ull};
+constexpr u64 kVsBcc6Bank[] = {0x3f6e6addc20cb441ull};
+constexpr u64 kVsA108[] = {0xa108f279e72a396bull};
+constexpr u64 kVsA108Bank[] = {0xf257a02b44ad1cc4ull, 0x16be36445403065aull};
+template <size_t N, size_t M>
+bool VsIs(const GuestShader &vs, const u64 (&rewritten)[N], const u64 (&bank)[M]) {
+  for (const u64 h : rewritten)
+    if (vs.hash == h)
+      return true;
+  if (vs.normalized)
+    for (const u64 h : bank)
+      if (vs.hash == h)
+        return true;
+  return false;
+}
+// fable2_pull_up_stream_vs lists e6415e83, the rewritten form of the bank shader fe153195.
+inline u64 PullListHash(const GuestShader &vs) {
+  return vs.normalized && vs.hash == 0xfe153195591071e7ull ? 0xe6415e8304306082ull : vs.hash;
+}
+
 std::atomic<u64> g_pop_events{0}, g_pop_draws{0};
 // Diagnostic (fable2_diag_bake): surfaces whose resolve fills mip 0 of a texture
 // whose next mips are resolved right after (the per-character texture bakes).
@@ -992,10 +1028,64 @@ struct PullSiteEntry {
 static_assert(sizeof(PullSiteEntry) == 16);
 constexpr u32 kPullSites = 16;
 
+// A pristine bank vertex shader (fable2_vs_pristine) has unbound vfetch instructions: every pull site's slot,
+// stride, offset and format come from the declaration by the site's usage (the bound one, or for draws that
+// bind none the one the game rewrote the object with), and its component permutation from the declaration
+// type. The bank's own flags past comp_all and num_fmt_all (signed_rf, exp_adjust) are zero in all 719 of its
+// vertex fetches. A usage the declaration lacks reads nothing (the game's rewrite binds such a fetch to
+// stream 0 as 8888 and forces (0, 0, 0, 1) with its swizzle).
+static void BindPullSitesNormalized(DeviceView dev, const GuestShader &vs, PullSiteEntry (&sites)[kPullSites]) {
+  const u32 decl_va = dev.U32(dev::kVertexDeclaration);
+  u32 decl_count = decl_va ? mem::load<u32>(decl_va + obj::kDeclElementCount) : 0;
+  const DeclElement *decl =
+      decl_count && decl_count <= 32 ? mem::at<DeclElement>(decl_va + obj::kDeclElements) : nullptr;
+  const VsRecordedDecl *recorded = vs.recorded.get();  // the record the no-declaration layout reads too
+  bool from_record = false;
+  if (!decl && recorded && !recorded->decl.empty()) {
+    decl = recorded->decl.data();
+    decl_count = static_cast<u32>(recorded->decl.size());
+    from_record = true;
+  }
+  for (u32 i = 0; i < vs.entry->vertexLayoutCount; ++i) {
+    const u32 w0 = EntryVertexLayouts(*vs.entry)[i * 2];
+    if (!(w0 & 0x400))
+      continue;
+    const u32 site = (w0 >> 16) & 0xFF;
+    if (site >= kPullSites || (w0 & 0xFF) == 0xFF)
+      continue;
+    const DeclElement *found = nullptr;
+    for (u32 e = 0; decl && e < decl_count; ++e) {
+      if (decl[e].stream == 0xFF)
+        break;
+      if (decl[e].usage == (w0 & 0xF) && decl[e].usageIndex == ((w0 >> 4) & 0xF)) {
+        found = &decl[e];
+        break;
+      }
+    }
+    const u32 perm_xor = static_cast<u32>(kVfetchPermIdentity);
+    if (found && found->stream < 16) {
+      const u32 stream = found->stream, type = found->type;
+      const u32 stride = from_record ? recorded->strides[stream] : dev.U8(dev::kStreamStride0 + stream);
+      const u32 flags = ((type >> 8) & 1) | (((type >> 9) & 1) << 1);
+      sites[site] = {(95 - stream) | 0x80000000u | ((DeclTypePermutation(type) ^ perm_xor) << 8), stride,
+                     static_cast<i32>(static_cast<u32>(found->offset) / 4), (type & 0x3F) | (flags << 8)};
+    } else {
+      // Bit 7 of the slot word: no memory behind this site (the upload skips it); format 0 reads zeros and the
+      // code makes (0, 0, 0, 1) of them.
+      sites[site] = {95u | 0x80u | 0x80000000u | ((static_cast<u32>(kMissingInputPermutation) ^ perm_xor) << 8), 0, 0,
+                     0};
+    }
+  }
+}
+
 void BindPullSitesUncached(DeviceView dev, const GuestShader &vs, PullSiteEntry (&sites)[kPullSites]) {
   std::memset(sites, 0, sizeof(sites));
   if (!vs.entry)
     return;
+  if (vs.normalized) {
+    BindPullSitesNormalized(dev, vs, sites);
+    return;
+  }
   const u32 container = vs.va + obj::kVertexShaderContainer;
   const u32 shader_offset = mem::load<u32>(container + 0x18);
   const u32 physical_offset = mem::load<u32>(container + shader_offset);
@@ -1202,7 +1292,7 @@ bool QuadElementSlice(const PullSiteEntry (&sites)[kPullSites], u32 slot, u32 dw
   i32 off_lo = 0, off_hi = 0;
   bool any = false;
   for (const PullSiteEntry &site : sites) {
-    if (!(site.slot & 0x80000000u) || (site.slot & 0x7F) != slot)
+    if (!(site.slot & 0x80000000u) || (site.slot & 0x80u) || (site.slot & 0x7F) != slot)
       continue;
     if (any && site.strideDwords != stride)
       return false;  // one element layout per slot only
@@ -1229,7 +1319,7 @@ bool PulledSlice(DeviceView dev, const GuestShader &vs, const PullSiteEntry (&si
     return false;
   if (vs.hash == kQuadElementVs && slot == 95 && REXCVAR_GET(fable2_pull_slice_quads))
     return QuadElementSlice(sites, slot, dwords, vtx_lo, vtx_hi, first_dword, count_dwords);
-  if (vs.hash != 0x8f1c881c15849337ull || slot != 93)
+  if (!VsIs(vs, kVsOcclusionBoxes, kVsOcclusionBoxesBank) || slot != 93)
     return false;
   const u32 raw = dev.U32(dev::kVsFloatConstants + 48 * 16);
   float k;
@@ -1401,11 +1491,12 @@ bool UploadVertexPullTable(DeviceView dev, const GuestShader &vs, const std::vec
   std::memcpy(&table[96], sites, sizeof(sites));
   u8 slots[96 + kPullSites];
   u32 slot_count = 0;
+  // (A pristine bank shader's records name the bank's placeholder slot, not the slots its sites bind.)
   for (const u8 slot : pulled_slots)
-    if (slot_count < std::size(slots))
+    if (!vs.normalized && slot_count < std::size(slots))
       slots[slot_count++] = slot;
   for (const PullSiteEntry &site : sites)
-    if ((site.slot & 0x80000000u) && slot_count < std::size(slots) &&
+    if ((site.slot & 0x80000000u) && !(site.slot & 0x80u) && slot_count < std::size(slots) &&
         std::find(slots, slots + slot_count, static_cast<u8>(site.slot & 0x7F)) == slots + slot_count)
       slots[slot_count++] = static_cast<u8>(site.slot & 0x7F);
   constexpr u32 kMaxDwords = 4u << 20;  // 16 MB
@@ -3635,7 +3726,7 @@ bool CaptureDraw(VideoState &s, u32 device_va, u32 prim, GeometryPlan &geom,
     // data (Fable 2's tree billboards; the device's fetch constant still points
     // wherever SetStreamSource last left it, and they drew phantom trees).
     const bool up_stream = geom.stream0OverrideVa && !REXCVAR_GET(fable2_pull_up_stream_vs).empty() &&
-                           DrawMatchesList(REXCVAR_GET(fable2_pull_up_stream_vs), vs->hash, 0);
+                           DrawMatchesList(REXCVAR_GET(fable2_pull_up_stream_vs), PullListHash(*vs), 0);
     u32 vtx_lo = 0, vtx_hi = 0;
     if (!geom.indexed && !geom.rectList && geom.vertexCount) {  // the vertices this draw reads
       vtx_lo = geom.startVertex;
@@ -3762,8 +3853,8 @@ bool CaptureDraw(VideoState &s, u32 device_va, u32 prim, GeometryPlan &geom,
   if (REXCVAR_GET(fable2_debug_dump_fur)) {
     static u32 dumped = 0;  // bit 0 fur, bit 1 body
     const u32 count = geom.indexed ? static_cast<u32>(geom.indices.size()) : geom.vertexCount;
-    const u32 which = vs->hash == 0x4ba0b3646633c5bfull ? 1u
-                      : (vs->hash == 0x36f4dd575db99917ull && (count == 20649 || (geom.cached && geom.cached->count == 20649)))
+    const u32 which = VsIs(*vs, kVsFurShells, kVsFurShellsBank) ? 1u
+                      : (VsIs(*vs, kVsTerrain36f4, kVsTerrain36f4Bank) && (count == 20649 || (geom.cached && geom.cached->count == 20649)))
                           ? 2u
                           : 0u;
     if (which && !(dumped & which)) {
@@ -3847,7 +3938,7 @@ bool CaptureDraw(VideoState &s, u32 device_va, u32 prim, GeometryPlan &geom,
                geom.startVertex);
   }
   // Temporary diagnostics: the world shader's lightmap colour index range.
-  if (vs->hash == 0xbcc6e2def4a3e5c2ull && Settings::DiagFrame() > 0 &&
+  if (VsIs(*vs, kVsBcc6, kVsBcc6Bank) && Settings::DiagFrame() > 0 &&
       s.guest_frames + 1 == static_cast<u64>(Settings::DiagFrame())) {
     static u32 n = 0;
     if (n++ < 10) {
@@ -4475,7 +4566,7 @@ void ReplayDraw(VideoState &s, const DrawPacket &pk) {
   // the effects test against the scene. Only where the bound depth is twice
   // the target's size (the half-res pass): the occlusion query passes keep
   // the plane.
-  if (REXCVAR_GET(fable2_plane_scene_depth) && vs->hash == 0xa108f279e72a396bull && ps &&
+  if (REXCVAR_GET(fable2_plane_scene_depth) && VsIs(*vs, kVsA108, kVsA108Bank) && ps &&
       ps->hash == 0x2ac2d68dfe608627ull && !targets.colorCount && targets.depth && targets.depthImage &&
       !targets.offsetX && !targets.offsetY) {
     // The texture as the draw saw it (its captured fetch constant), looked up
@@ -5071,7 +5162,7 @@ void ReplayDraw(VideoState &s, const DrawPacket &pk) {
                    pc(c, 1), pc(c, 2), pc(c, 3));
     }
     // Temporary diagnostics: raw texcoords of the main world shader.
-    if (vs->hash == 0x4ba0b3646633c5bfull) {  // Temporary (missing ground): fur vertex data
+    if (VsIs(*vs, kVsFurShells, kVsFurShellsBank)) {  // Temporary (missing ground): fur vertex data
       static u32 fur_logs = 0;
       if (Settings::DiagFrame() > 0 && s.guest_frames + 1 == static_cast<u64>(Settings::DiagFrame()) &&
           fur_logs++ < 6) {
@@ -5106,7 +5197,7 @@ void ReplayDraw(VideoState &s, const DrawPacket &pk) {
         EOT_INFO("[diag] fur vs consts:{}", cs);
       }
     }
-    if (vs->hash == 0xbcc6e2def4a3e5c2ull) {
+    if (VsIs(*vs, kVsBcc6, kVsBcc6Bank)) {
       static u32 uv_logs = 0;
       if (uv_logs++ < 6) {
         const u32 d0 = dev.U32(dev::StreamFetchSlotOffset(0)), d1 = dev.U32(dev::StreamFetchSlotOffset(0) + 4);
@@ -5383,7 +5474,7 @@ void ReplayDraw(VideoState &s, const DrawPacket &pk) {
   } else {
     cmd->drawInstanced(pk.vertexCount, 1, static_cast<u32>(pk.host_base_vertex), 0);
     // Cost test: the occlusion query boxes drawn twice (visible stays visible).
-    if (REXCVAR_GET(fable2_debug_query_boxes_twice) && vs->hash == 0x8f1c881c15849337ull)
+    if (REXCVAR_GET(fable2_debug_query_boxes_twice) && VsIs(*vs, kVsOcclusionBoxes, kVsOcclusionBoxesBank))
       cmd->drawInstanced(pk.vertexCount, 1, static_cast<u32>(pk.host_base_vertex), 0);
   }
   lap(s.perf.record_ms);

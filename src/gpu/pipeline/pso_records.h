@@ -15,7 +15,9 @@
 
 namespace eot::gpu {
 
-constexpr u32 kPsoCsvVersion = 4;
+// 5: vertex shader hashes of rewritten shaders are their pristine bank originals' and the layout keys carry
+// that (fable2_vs_pristine); rows written before are keyed by the rewritten forms and are not read.
+constexpr u32 kPsoCsvVersion = 5;
 
 #if defined(EOT_MVK)
 constexpr u32 kPsoHoldMaxMs = 60000;

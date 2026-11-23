@@ -10,6 +10,9 @@
 // fable2_shader_dump_dir also set it writes the before and after containers as
 // vs_pre_<hash>.bin / vs_post_<hash>.bin and a vs_rw_<post>_<object>.json with
 // the declaration, the strides and the hashes. Nothing here changes the call.
+//
+// The hook also feeds the pristine-hash registry (vs_identity.cpp, fable2_vs_pristine): the
+// container before the first rewrite is the shader as the bank holds it.
 
 #include <cstdint>
 #include <cstdio>
@@ -30,6 +33,7 @@
 #include "core/logging.h"
 #include "core/memory_helpers.h"
 #include "gpu/d3d.h"
+#include "gpu/shaders/vs_identity.h"
 
 REXCVAR_DEFINE_BOOL(fable2_debug_vs_rewrite_log, false, "Fable2",
                     "Debug: log every bind-time vertex shader rewrite (object, hash before and after, pixel shader, "
@@ -43,34 +47,10 @@ namespace {
 using namespace eot;
 using namespace eot::gpu;
 
-struct Container {
-  std::vector<u8> bytes;  // virtual ++ physical
-  u64 hash = 0;
-  bool ok = false;
-  u32 flags = 0;
-};
+using Container = VsContainer;
 
 Container ReadContainer(u32 object, bool is_pixel) {
-  Container c;
-  if (!object)
-    return c;
-  const u32 container_va = object + (is_pixel ? obj::kPixelShaderContainer : obj::kVertexShaderContainer);
-  const u32 physical_va = mem::load<u32>(object + (is_pixel ? obj::kPixelShaderPhysical : obj::kVertexShaderPhysical));
-  const auto *header = mem::at<ShaderContainerHeader>(container_va);
-  if (!header)
-    return c;
-  const u32 vsize = header->virtualSize, psize = header->physicalSize;
-  const u8 *v = mem::at<u8>(container_va);
-  const u8 *p = physical_va && psize ? mem::at<u8>(physical_va) : nullptr;
-  if (!v || vsize < sizeof(ShaderContainerHeader) || vsize > (1u << 20) || psize > (1u << 20) || (psize && !p))
-    return c;
-  c.flags = header->flags;
-  c.bytes.assign(v, v + vsize);
-  if (psize)
-    c.bytes.insert(c.bytes.end(), p, p + psize);
-  c.hash = XXH3_64bits(c.bytes.data(), c.bytes.size());
-  c.ok = true;
-  return c;
+  return ReadVsContainer(object, is_pixel);
 }
 
 std::mutex g_mutex;
@@ -88,12 +68,21 @@ void WriteBin(const std::filesystem::path &dir, const char *kind, const Containe
 }  // namespace
 
 extern "C" REX_FUNC(sub_82BA40F0) {
-  if (!REXCVAR_GET(fable2_debug_vs_rewrite_log)) {
+  const bool log = REXCVAR_GET(fable2_debug_vs_rewrite_log);
+  if (!log && !VsPristineEnabled()) {
     __imp__sub_82BA40F0(ctx, base);
     return;
   }
   const u32 object = ctx.r3.u32, decl = ctx.r5.u32, strides = ctx.r6.u32, ps = ctx.r7.u32;
   Container before = ReadContainer(object, false);
+  VsIdentityBeforeBind(object, before);
+  if (!log) {
+    VsIdentityEnterBind();
+    __imp__sub_82BA40F0(ctx, base);
+    VsIdentityLeaveBind();
+    VsIdentityAfterBind(object, ReadContainer(object, false));
+    return;
+  }
   const bool first = before.ok && !(before.flags & 0x40);
   if (first) {
     std::lock_guard lock(g_mutex);
@@ -117,9 +106,12 @@ extern "C" REX_FUNC(sub_82BA40F0) {
   }
   const Container ps_c = ReadContainer(ps, true);
 
+  VsIdentityEnterBind();
   __imp__sub_82BA40F0(ctx, base);
+  VsIdentityLeaveBind();
 
   const Container after = ReadContainer(object, false);
+  VsIdentityAfterBind(object, after);
   u64 pristine = 0;
   {
     std::lock_guard lock(g_mutex);

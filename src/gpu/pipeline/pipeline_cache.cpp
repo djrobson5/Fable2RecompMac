@@ -31,6 +31,7 @@
 #include "gpu/pipeline/pso_predictor.h"
 #include "gpu/pipeline/pso_records.h"
 #include "gpu/settings.h"
+#include "gpu/shaders/vs_identity.h"
 #include "gpu/shaders/guest_shaders.h"
 #include "gpu/vertex_layout.h"
 
@@ -565,7 +566,7 @@ PsoBuildResult BuildPipelineFromRecord(VideoState &s, const PsoRecord &r, PsoSou
     return PsoBuildResult::Skipped;
   std::vector<VertexInput> inputs;
   VertexInputsFromEntry(*vs_entry, inputs);
-  st.layout = GetInputLayoutFromRaw(r.state.vsHash, inputs, r.declRaw, r.declCount);
+  st.layout = GetInputLayoutFromRaw(r.state.vsHash, inputs, r.declRaw, r.declCount, VsHashKeyedPristine(r.state.vsHash));
   if (!st.layout)
     return PsoBuildResult::Skipped;
   st.layoutKey = st.layout->key;

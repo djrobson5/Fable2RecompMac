@@ -24,6 +24,7 @@
 #include "gpu/device.h"
 #include "gpu/format.h"
 #include "gpu/shaders/guest_shaders.h"
+#include "gpu/shaders/vs_identity.h"
 
 REXCVAR_DEFINE_BOOL(fable2_layout_from_shader, false, "Fable2",
                     "Native renderer: build vertex layouts from the shader's vfetch instructions, not the declaration");
@@ -113,7 +114,7 @@ const InputLayout *FindLayout(u64 key) {
 
 const InputLayout *BuildInputLayout(u64 vs_hash, const std::vector<VertexInput> &inputs,
                                     const std::vector<DecodedElement> &decl, u64 key,
-                                    const DeclElement *raw, u32 count);
+                                    const DeclElement *raw, u32 count, bool normalized);
 
 void SetSwapBit(InputLayout &l, u32 usage, u32 index) {
   const u32 bit = 1u << (index & 31);
@@ -224,12 +225,65 @@ const std::vector<u8> &PulledSlots(GuestShader &vs) {
   return vs.pulledSlots;
 }
 
+// A normalised shader drawn with no declaration bound: the declaration and strides the game rewrote this
+// container with (GuestShader::recorded, the record the pull sites read too), keyed with the strides. Null when
+// the layout cannot be built: the caller then takes the old path.
+static const InputLayout *RecordedLayout(GuestShader &vs) {
+  if (vs.synthLayout && vs.synthHash == vs.hash)
+    return vs.synthLayout;
+  const VsRecordedDecl *rec = vs.recorded.get();
+  if (!rec || rec->decl.empty() || !vs.entry)
+    return nullptr;
+  // As the layout built from the microcode was (SynthesizeDeclaration): the usages the shader only pulls (the bone
+  // palette rows) are no host vertex inputs, so their streams are not bound per vertex.
+  const u32 *records = EntryVertexLayouts(*vs.entry);
+  auto ordinary = [&](u32 usage, u32 index) {
+    for (u32 i = 0; i < vs.entry->vertexLayoutCount; ++i) {
+      const u32 w0 = records[i * 2];
+      if (!(w0 & 0x600) && (w0 & 0xF) == usage && ((w0 >> 4) & 0xF) == index)
+        return true;
+    }
+    return false;
+  };
+  std::vector<DeclElement> decl;
+  for (const DeclElement &e : rec->decl) {
+    if (e.stream == 0xFF)
+      break;
+    if (ordinary(e.usage, e.usageIndex))
+      decl.push_back(e);
+  }
+  DeclElement end{};
+  end.stream = 0xFF;
+  decl.push_back(end);
+  const u64 strides_hash = XXH3_64bits(rec->strides, sizeof(rec->strides));
+  const InputLayout *layout = GetInputLayoutFromRaw(
+      vs.hash ^ (strides_hash * 0x9E3779B97F4A7C15ull) ^ 0x2545F4914F6CDD1Dull, vs.inputs,
+      reinterpret_cast<const u8 *>(decl.data()), static_cast<u32>(decl.size()), true);
+  if (layout) {
+    auto *mut = const_cast<InputLayout *>(layout);
+    for (const DeclElement &e : decl) {
+      const u32 stream = e.stream;
+      if (stream < 16 && rec->strides[stream])
+        mut->fetchStride[stream] = rec->strides[stream] * 4u;
+    }
+    vs.synthLayout = layout;
+    vs.synthHash = vs.hash;
+  }
+  return layout;
+}
+
 const InputLayout *GetInputLayout(VideoState &s, GuestShader &vs, u32 declaration_va) {
   // Fable 2: the vfetch instructions name the fetch constants the GPU really
   // reads; the bound declaration can disagree (the fur shells fetch from
   // streams 2 and 3 while their declaration says 0 and 1).
-  if (declaration_va && !vs.isPixel && REXCVAR_GET(fable2_layout_from_shader))
+  if (declaration_va && !vs.isPixel && REXCVAR_GET(fable2_layout_from_shader) && !vs.normalized)
     declaration_va = 0;
+  // Pristine bank code (fable2_vs_pristine) has no bound vfetch instructions to read a layout from: draws
+  // with no declaration use the one the game rewrote the object with.
+  if (!declaration_va && !vs.isPixel && vs.normalized) {
+    if (const InputLayout *layout = RecordedLayout(vs))
+      return layout;
+  }
   if (!declaration_va && !vs.isPixel && vs.synthLayout && vs.synthHash == vs.hash)
     return vs.synthLayout;
   if (!declaration_va && !vs.isPixel) {
@@ -238,11 +292,13 @@ const InputLayout *GetInputLayout(VideoState &s, GuestShader &vs, u32 declaratio
     std::vector<DeclElement> decl;
     {
       std::lock_guard lock(mutex);
-      auto it = synthesized.find(vs.hash);
+      // (A normalised shader shares its hash with every object rewritten from the same original.)
+      const u64 synth_key = vs.normalized ? vs.hash ^ (u64(vs.va) * 0x9E3779B97F4A7C15ull) : vs.hash;
+      auto it = synthesized.find(synth_key);
       if (it == synthesized.end()) {
         std::vector<DeclElement> built;
         SynthesizeDeclaration(vs, built);
-        it = synthesized.emplace(vs.hash, std::move(built)).first;
+        it = synthesized.emplace(synth_key, std::move(built)).first;
       }
       decl = it->second;
     }
@@ -407,8 +463,11 @@ static const InputLayout *GetInputLayoutSlow(VideoState &s, GuestShader &vs, u32
                                              u32 raw_count, const DeclElement *raw_elements,
                                              bool raw_ok) {
   (void)s;
+  // Pristine bank code: usages sit on the right fetches, so no relabelling; the key says so.
+  const bool normalized = vs.normalized;
   const u64 relabel_salt =
-      REXCVAR_GET(fable2_relabel_vertex_fetches)
+      normalized ? 0x7A3B1E5D9C2F4A81ull
+      : REXCVAR_GET(fable2_relabel_vertex_fetches)
           ? 0x5BD1E9955BD1E995ull ^ (u64(static_cast<u32>(REXCVAR_GET(fable2_relabel_keep_usages))) * 0x9E3779B97F4A7C15ull)
           : 0;
   if (raw_ok) {
@@ -436,22 +495,22 @@ static const InputLayout *GetInputLayoutSlow(VideoState &s, GuestShader &vs, u32
   const u64 key = decl_hash ^ (vs.hash * 0x9E3779B97F4A7C15ull) ^ relabel_salt;
   if (const InputLayout *hit = FindLayout(key))
     return hit;
-  if (relabel_salt)
+  if (relabel_salt && !normalized)
     RelabelByFetches(vs, decl);
-  return BuildInputLayout(vs.hash, vs.inputs, decl, key, raw_elements, raw_count);
+  return BuildInputLayout(vs.hash, vs.inputs, decl, key, raw_elements, raw_count, normalized);
 }
 
 const InputLayout *GetInputLayoutFromRaw(u64 vs_hash, const std::vector<VertexInput> &inputs,
-                                         const u8 *decl_raw, u32 decl_count) {
+                                         const u8 *decl_raw, u32 decl_count, bool normalized) {
   std::vector<DecodedElement> decl;
   u64 decl_hash = 0;
   const auto *elements = reinterpret_cast<const DeclElement *>(decl_raw);
   if (!DecodeElements(elements, decl_count, decl, &decl_hash))
     return nullptr;
-  const u64 key = decl_hash ^ (vs_hash * 0x9E3779B97F4A7C15ull);
+  const u64 key = decl_hash ^ (vs_hash * 0x9E3779B97F4A7C15ull) ^ (normalized ? 0x7A3B1E5D9C2F4A81ull : 0);
   if (const InputLayout *hit = FindLayout(key))
     return hit;
-  return BuildInputLayout(vs_hash, inputs, decl, key, elements, decl_count);
+  return BuildInputLayout(vs_hash, inputs, decl, key, elements, decl_count, normalized);
 }
 
 namespace {
@@ -484,7 +543,7 @@ plume::RenderFormat ScaledForFloatInput(const DeclTypeInfo &t) {
 
 const InputLayout *BuildInputLayout(u64 vs_hash, const std::vector<VertexInput> &inputs,
                                     const std::vector<DecodedElement> &decl, u64 key,
-                                    const DeclElement *raw, u32 count) {
+                                    const DeclElement *raw, u32 count, bool normalized) {
   auto layout = std::make_unique<InputLayout>();
   layout->key = key;
   u32 location = 0;
@@ -498,14 +557,22 @@ const InputLayout *BuildInputLayout(u64 vs_hash, const std::vector<VertexInput> 
       }
     }
     const char *semantic = DeclUsageSemantic(in.usage);
+    const int perm_slot = normalized ? VfetchPermSlot(in.usage, in.usageIndex) : -1;
     if (!match) {
+      if (perm_slot >= 0)
+        layout->vfetchPerm[perm_slot] = static_cast<u16>(kMissingInputPermutation ^ kVfetchPermIdentity);
       layout->elements.emplace_back(semantic, in.usageIndex, location++,
                                     plume::RenderFormat::R32G32B32A32_FLOAT,
                                     kSyntheticVertexSlot, 0);
       layout->needsSyntheticSlot = true;
       continue;
     }
-    DeclTypeInfo t = DecodeDeclType(match->type);
+    if (perm_slot >= 0)
+      layout->vfetchPerm[perm_slot] = static_cast<u16>(DeclTypePermutation(match->type) ^ kVfetchPermIdentity);
+    // A normalised shader applies the type's swizzle (D3DCOLOR's zyxw) itself, through the permutation code
+    // above: the host must not swap the bytes as well (B8G8R8A8), or the channels come out reversed twice (the
+    // skinned characters' BLENDWEIGHT is a D3DCOLOR type: weights in the wrong channels, bones blended wrong).
+    DeclTypeInfo t = DecodeDeclType(match->type, normalized);
     if (t.format == plume::RenderFormat::UNKNOWN) {
       EOT_WARN("[layout] vs {:016x}: {}{} decl type {:#x} (xenos fmt {}) has no host format",
                vs_hash, semantic, in.usageIndex, match->type, t.xenosFormat);

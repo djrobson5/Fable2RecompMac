@@ -72,7 +72,10 @@ struct DeclTypeInfo {
   bool packed111110 = false;
   u32 byteSize = 0;
 };
-DeclTypeInfo DecodeDeclType(u32 decl_type);
+// The host format of a vertex declaration type. shader_swizzles: the shader applies the type's own swizzle
+// itself (a pristine bank vertex shader's vfetchPerm: D3DCOLOR's zyxw), so the host must not reorder the
+// bytes too (B8G8R8A8 for D3DCOLOR).
+DeclTypeInfo DecodeDeclType(u32 decl_type, bool shader_swizzles = false);
 
 const char *DeclUsageSemantic(u32 usage);
 

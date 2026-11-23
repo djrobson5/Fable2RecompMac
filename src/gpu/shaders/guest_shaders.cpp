@@ -26,6 +26,7 @@
 #include "gpu/device.h"
 #include "gpu/shaders/shader_cache.h"
 #include "gpu/shaders/runtime_shaders.h"
+#include "gpu/shaders/vs_identity.h"
 
 #if !defined(EOT_D3D12)
 #include <smolv.h>
@@ -446,6 +447,31 @@ void RevalidateGuestShader(VideoState &s, u32 object_va, bool is_pixel) {
   }
 }
 
+// Fable 2 (fable2_vs_pristine): bank vertex shaders with more pulled fetches than the pull table has sites (16):
+// the sites past 16 keep the translation's baked values, which in unbound bank code are zeros (the game's rewrite
+// binds them in the microcode a rewritten form is translated from). These two (bank containers c025_e3 and
+// c026_e3, the skinning shaders) are never normalised.
+static bool PristineDenied(u64 pristine_hash) {
+  return pristine_hash == 0x4574908837da17d9ull || pristine_hash == 0x5243696187782727ull;
+}
+
+// A normalised shader whose translation says it has pulled fetches past site 16 (layout record, site 0xFF).
+static void WarnPullOverflow(u64 hash, const ShaderCacheEntry &e) {
+  const u32 *layouts = EntryVertexLayouts(e);
+  for (u32 i = 0; i < e.vertexLayoutCount; ++i) {
+    const u32 w0 = layouts[i * 2];
+    if ((w0 & 0x400) && ((w0 >> 16) & 0xFF) == 0xFF) {
+      static std::mutex mutex;
+      static std::unordered_set<u64> seen;
+      std::lock_guard lock(mutex);
+      if (seen.insert(hash).second)
+        EOT_WARN("[vs-pristine] pristine shader {:016x} has pulled fetches past site 16: their bank values are unbound",
+                 hash);
+      return;
+    }
+  }
+}
+
 GuestShader *RegisterGuestShader(VideoState &s, u32 object_va, bool is_pixel) {
   if (!object_va)
     return nullptr;
@@ -474,8 +500,8 @@ GuestShader *RegisterGuestShader(VideoState &s, u32 object_va, bool is_pixel) {
       EOT_WARN("[shaders] {:#x} bound as a {} shader holds a {} shader container (flags {:#x})", object_va,
                is_pixel ? "pixel" : "vertex", is_pixel ? "vertex" : "pixel", flags);
   }
-  const u32 virtual_size = header->virtualSize;
-  const u32 physical_size = header->physicalSize;
+  u32 virtual_size = header->virtualSize;
+  u32 physical_size = header->physicalSize;
   const u8 *virtual_bytes = mem::at<u8>(container_va);
   const u8 *physical_bytes = physical_va ? mem::at<u8>(physical_va) : nullptr;
   if (!virtual_bytes || (physical_size && !physical_bytes) ||
@@ -490,13 +516,49 @@ GuestShader *RegisterGuestShader(VideoState &s, u32 object_va, bool is_pixel) {
   XXH3_64bits_update(xs, virtual_bytes, virtual_size);
   if (physical_size)
     XXH3_64bits_update(xs, physical_bytes, physical_size);
-  const u64 hash = XXH3_64bits_digest(xs);
+  const u64 live_hash = XXH3_64bits_digest(xs);
   XXH3_freeState(xs);
+
+  // Fable 2 (fable2_vs_pristine): a vertex shader the game rewrote at bind time is translated and keyed
+  // as the pristine bank original the bind hook remembered. Only a container that is one of the object's
+  // remembered rewritten forms qualifies (freed shader memory the game reuses holds other shaders).
+  VsPristine pristine;
+  bool normalized = false;
+  if (!is_pixel) {
+    switch (VsClassify(object_va, live_hash, &pristine)) {
+    case VsRecord::Rewritten:
+      // Needs the declaration it was rewritten with (the rewrite always has one).
+      normalized = pristine.bytes && pristine.rec && !pristine.rec->decl.empty() && !PristineDenied(pristine.hash);
+      break;
+    case VsRecord::Unknown: {
+      // The hook has a record for this object but not this container: translated as it is.
+      static std::mutex mutex;
+      static std::unordered_set<u64> seen;
+      std::lock_guard lock(mutex);
+      if (seen.size() < 64 && seen.insert(live_hash ^ (u64(object_va) << 1)).second)
+        EOT_INFO("[vs-pristine] object {:#x}: container {:016x} is not a form the bind hook remembers for it; "
+                 "translated as it is",
+                 object_va, live_hash);
+      break;
+    }
+    default:
+      break;
+    }
+  }
+  const u64 hash = normalized ? pristine.hash : live_hash;
+  if (normalized) {
+    virtual_bytes = pristine.bytes->data();
+    virtual_size = pristine.virtualSize;
+    physical_bytes = pristine.physicalSize ? pristine.bytes->data() + pristine.virtualSize : nullptr;
+    physical_size = pristine.physicalSize;
+    header = const_cast<ShaderContainerHeader *>(reinterpret_cast<const ShaderContainerHeader *>(virtual_bytes));
+  }
 
   {
     std::lock_guard lock(s.shaders_mutex);
     auto it = s.shaders.find(ShaderKey(object_va, is_pixel));
-    if (it != s.shaders.end() && it->second && it->second->hash == hash) {
+    if (it != s.shaders.end() && it->second && it->second->liveHash == live_hash &&
+        it->second->normalized == normalized) {
       it->second->fingerprint = ShaderFingerprint(object_va, is_pixel);
       return it->second.get();
     }
@@ -504,6 +566,10 @@ GuestShader *RegisterGuestShader(VideoState &s, u32 object_va, bool is_pixel) {
   auto sh = std::make_unique<GuestShader>();
   sh->va = object_va;
   sh->hash = hash;
+  sh->liveHash = live_hash;
+  sh->normalized = normalized;
+  if (normalized)
+    sh->recorded = pristine.rec;
   sh->fingerprint = ShaderFingerprint(object_va, is_pixel);
   sh->isPixel = is_pixel;
   auto &c = cache();
@@ -517,6 +583,14 @@ GuestShader *RegisterGuestShader(VideoState &s, u32 object_va, bool is_pixel) {
     Fable2WriteShaderContainer(virtual_bytes, virtual_size, physical_bytes, physical_size, hash);
   if (sh->entry)
     sh->usesFloatConstants = sh->entry->usesFloatConstants != 0;
+  if (normalized) {
+    static u32 logged = 0;
+    if (logged++ < 64)
+      EOT_INFO("[vs-pristine] object {:#x}: rewritten container {:016x} translated as pristine {:016x}{}", object_va,
+               live_hash, hash, sh->entry ? "" : " (translation pending)");
+    if (sh->entry)
+      WarnPullOverflow(hash, *sh->entry);
+  }
   sh->floatConstantRegs =
       FloatConstantRegisters(virtual_bytes, virtual_size, header->constantTableOffset, is_pixel);
   const u32 shader_off = header->shaderOffset;
@@ -625,6 +699,8 @@ bool AttachRuntimeShader(GuestShader &sh) {
   if (!sh.entry)
     return false;
   FillFromEntry(sh);
+  if (sh.normalized)
+    WarnPullOverflow(sh.hash, *sh.entry);
   EOT_INFO("[shaders] {} {:#x} hash {:016x}: runtime translation attached", sh.isPixel ? "ps" : "vs", sh.va, sh.hash);
   return true;
 }

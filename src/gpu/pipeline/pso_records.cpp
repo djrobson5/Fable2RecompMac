@@ -521,10 +521,15 @@ size_t LoadPsoCsvDir(const std::string &dir, std::vector<PsoRecord> &out) {
     PsoCsvLayout layout{};
     bool have_layout = false;
     u32 version = 0;
+    bool stale = false;
     for (const auto line : Split(data, '\n')) {
       if (!have_layout) {
         if (const u32 v = VersionComment(line))
           version = v;
+        if (version && version < kPsoCsvVersion) {
+          stale = true;
+          break;
+        }
         have_layout = PsoCsvParseHeader(line, &layout);
         continue;
       }
@@ -535,6 +540,10 @@ size_t LoadPsoCsvDir(const std::string &dir, std::vector<PsoRecord> &out) {
       } else if (!Trim(line).empty() && line[0] != '#') {
         ++bad;
       }
+    }
+    if (stale) {
+      EOT_INFO("[pso] {}: written as v{} (before pristine vertex shader hashes), not read", name, version);
+      continue;
     }
     n += rows;
     EOT_DEBUG("[pso] {}: {} rows (v{}){}", name, rows, version ? version : layout.version,

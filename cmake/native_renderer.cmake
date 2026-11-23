@@ -107,6 +107,7 @@ target_sources(Fable2 PRIVATE
     src/gpu/taa.cpp
     src/gpu/shaders/guest_shaders.cpp
     src/gpu/shaders/runtime_shaders.cpp
+    src/gpu/shaders/vs_identity.cpp
     src/gpu/shaders/vs_rewrite_log.cpp
     src/gpu/hooks/stubs.cpp
     src/gpu/hooks/state.cpp
