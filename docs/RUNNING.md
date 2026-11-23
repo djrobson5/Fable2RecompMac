@@ -123,6 +123,8 @@ output to a file:
 | `--eot_resolution` | `1080p` | Render resolution in fullscreen (`720p`, `1080p`, `1440p`, `2160p`, `display`, `native`) |
 | `--eot_render_scale` | `1.0` | Extra scale on top of the render resolution |
 | `--fable2_shader_dump_dir=<dir>` | | Save shaders the build doesn't have yet into `<dir>` |
+| `--fable2_vs_pristine=<bool>` | `true` | A vertex shader the game rewrote when it bound a declaration (vfetch instructions, exports) is translated and keyed as its original in the shader bank; the declaration, strides and component order come as data per draw. `false` translates every rewritten form of its own (the way it was before) |
+| `--fable2_debug_vs_rewrite_log=<bool>` | `false` | Debug: one `[vs-rewrite]` line per bind-time rewrite (object, hash before and after, pixel shader, declaration); with `--fable2_shader_dump_dir` also the containers before and after and a `.json` per rewrite |
 | `--fable2_shader_wait=<bool>` | `true` | A draw whose shader is not translated yet waits for it instead of being skipped (`--fable2_shader_wait_max_ms`, default 5000, caps one draw's wait) |
 | `--fable2_pso_wait=<bool>` | `true` | A depth-tested draw whose pipeline is still being built waits for it instead of being skipped: at most `--fable2_pso_wait_max_ms` (default 20) per draw, `--fable2_pso_wait_frame_ms` (default 33) for all of one frame's waits; during a loading screen `--fable2_pso_wait_loading_ms` (default 500) per draw and `--fable2_pso_wait_loading_frame_ms` (default 1000) per frame (keep each frame limit at or above its per-draw one) |
 | `--eot_perf_frames=<N>` | `600` | Write a `[perf]` timing line (CPU and GPU per frame) to the log every N frames |
