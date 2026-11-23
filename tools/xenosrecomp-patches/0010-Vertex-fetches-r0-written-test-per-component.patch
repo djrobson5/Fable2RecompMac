@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: djrobson5 <256682087+djrobson5@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 12:00:00 -0800
+Subject: [PATCH 10/11] Vertex fetches: r0 written test per component
+
+Vertex fetches: r0 written test per component
+
+A fetch indexed by r0 is a plain vertex input until the shader writes r0
+(then the index is no longer the vertex index and the fetch is pulled). The
+test took a write to r0.y, r0.z or r0.w for a write of the vertex index in
+r0.x, so with the original (bank) register assignment some r0.x-indexed
+fetches were classified as pulled. The test now looks for a write to the
+component the fetch indexes with.
+---
+ XenosRecomp/shader_recompiler.cpp | 9 +-
+ 1 files changed
+
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -214,16 +214,21 @@
+     // r0 holds the vertex index on entry; once the shader has written r0 (e.g.
+     // r0.x += g_LightmapIndexOffset) an r0-indexed fetch is no longer the
+     // plain per-vertex input either.
++    // Only a write to the component the fetch indexes with counts (the vertex
++    // index lives in r0.x: a write to r0.yzw, as the bank's register
++    // assignment makes, leaves an r0.x-indexed fetch a plain vertex input).
+     auto r0Written = [&]
+     {
++        const char indexed = SWIZZLES[instr.srcSwizzle & 3];
+         for (size_t pos = out.find("r0."); pos != std::string::npos; pos = out.find("r0.", pos + 3))
+         {
+             if (pos == 0 || (out[pos - 1] != '\t' && out[pos - 1] != ' '))
+                 continue;
+             size_t q = pos + 3;
++            bool hit = false;
+             while (q < out.size() && (out[q] == 'x' || out[q] == 'y' || out[q] == 'z' || out[q] == 'w'))
+-                ++q;
+-            if (q > pos + 3 && out.compare(q, 3, " = ") == 0)
++                hit |= out[q++] == indexed;
++            if (q > pos + 3 && out.compare(q, 3, " = ") == 0 && hit)
+                 return true;
+         }
+         return false;

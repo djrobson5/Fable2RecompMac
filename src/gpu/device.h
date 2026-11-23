@@ -227,8 +227,14 @@ struct SharedConstants {
   // MagFilter, for fetches whose instruction overrides the sampler's filters.
   u32 samplerPointIndices[16]{};
   u32 samplerLinearIndices[16]{};
+  // byte 1296: component permutation codes of the vertex inputs, 48 entries of
+  // 16 bits (entry i in the low half of word i / 2 when i is even), stored xor
+  // 0x688 so that zero is the identity (InputLayout::vfetchPerm, XenosRecomp
+  // vfetchPerm). Zero for every shader that is not translated from pristine code.
+  u32 vfetchPerm[24]{};
 };
-static_assert(sizeof(SharedConstants) == 64 * 16 + 32 + 64 + 48 + 128);
+static_assert(sizeof(SharedConstants) == 64 * 16 + 32 + 64 + 48 + 128 + 96);
+static_assert(offsetof(SharedConstants, vfetchPerm) == 1296);
 static_assert(offsetof(SharedConstants, samplerPointIndices) == 1168);
 static_assert(offsetof(SharedConstants, samplerLinearIndices) == 1232);
 static_assert(offsetof(SharedConstants, pointViewport) == 1152);

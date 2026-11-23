@@ -4706,6 +4706,8 @@ void ReplayDraw(VideoState &s, const DrawPacket &pk) {
       }
     }
     sc.sintTexcoords = layout->sintTexcoords;
+    static_assert(sizeof(layout->vfetchPerm) == sizeof(sc.vfetchPerm));
+    std::memcpy(sc.vfetchPerm, layout->vfetchPerm, sizeof(sc.vfetchPerm));
     sc.packedDec3 = layout->packedDec3;
     sc.pullFlags = !REXCVAR_GET(fable2_pull_half_order_vs).empty() &&
                            DrawMatchesList(REXCVAR_GET(fable2_pull_half_order_vs), vs->hash, 0)

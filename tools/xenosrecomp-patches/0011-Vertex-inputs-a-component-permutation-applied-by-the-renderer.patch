@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: djrobson5 <256682087+djrobson5@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 12:00:00 -0800
+Subject: [PATCH 11/11] Vertex inputs: a component permutation applied by the renderer
+
+Vertex inputs: a component permutation applied by the renderer
+
+The game rewrites a vertex shader's vfetch instructions when it binds a
+declaration, and one of the things it changes is the destination swizzle: the
+swizzle of the declaration type is composed with the instruction's (zyxw for
+D3DCOLOR, xy01 or xyz1 for types with fewer components) and, for types with
+the 8-in-16 endian field, the low bit of every component select is flipped
+(the half swap of 16-bit data). Translating the unrewritten bank code needs
+that swizzle change as data.
+
+Every ordinary vertex input is now read through vfetchPerm(g_VfetchPerm(slot),
+...), applied after the existing swap and unpack wrappers; the slot is the
+input's entry in a 48 entry table of 16-bit codes in the shared constants
+(byte 1296), by usage and usage index. A pulled fetch reads its code from bits
+8..19 of its pull site's slot word (vfetchSitePerm). A code is four 3-bit
+selects, output x lowest: 0..3 take that component of the value, 4 gives 0 and
+5 gives 1. Codes are stored xor 0x688 (x, y, z, w), so zero (what a renderer
+that does not know the table leaves there) is the identity and costs one test.
+
+A shader with more than 16 pulled fetches (the pull table has 16 sites) keeps
+the recompiled values for the rest; one extra layout record with site 0xFF now
+says so, so the renderer can tell such a shader's bank code is not complete.
+---
+ XenosRecomp/shader_common.h | 30 +-
+ XenosRecomp/shader_recompiler.cpp | 48 +-
+ 2 files changed
+
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -100,6 +100,11 @@
+ #define g_PointViewport            XE_SHARED_F4(1152)
+ // Vertex pulling flags (byte 1144): 1 = 16-bit pairs in memory order (see vfetchPullHalves).
+ #define g_PullFlags                XE_SHARED_U32(1144)
++// Fable 2: component permutation of each vertex input (byte 1296; 48 entries of
++// 16 bits, two to a word; see xeVfetchPerm). The renderer fills them for vertex
++// shaders translated from the pristine shader bank code, which holds the
++// fetch swizzles as they were before the game's bind-time rewrite.
++#define g_VfetchPerm(slot)         ((XE_SHARED_U32(1296 + (((slot) >> 1) << 2)) >> (((slot) & 1) * 16)) & 0xFFFFu)
+ // Xenos alpha to mask (byte 1140): bit 31 enables it, bits 0..7 are the
+ // RB_COLORCONTROL dither offsets of the 2x2 pixel quad (2 bits each).
+ #define g_AlphaToMask              XE_SHARED_U32(1140)
+@@ -450,6 +455,26 @@
+     }
+     return value;
+ }
++
++// Fable 2: the fetched value's components regrouped. code is a 16-bit entry of
++// the table at g_VfetchPerm, stored xor 0x688 so that zero is the identity: four
++// 3-bit selects, output x lowest, each 0..3 = that component of value, 4 = 0.0,
++// 5 = 1.0. These are the dst swizzle changes the game's rewrite makes by
++// declaration type (D3DCOLOR's zyxw, the half swap of 16-bit data, the constants
++// a type with fewer than four components forces).
++float xeVfetchSelect(float4 value, uint select)
++{
++    return select < 4u ? value[select] : (select == 5u ? 1.0 : 0.0);
++}
++
++float4 vfetchPerm(uint code, float4 value)
++{
++    if (code == 0u)
++        return value;
++    code ^= 0x688u;
++    return float4(xeVfetchSelect(value, code & 7u), xeVfetchSelect(value, (code >> 3) & 7u),
++                  xeVfetchSelect(value, (code >> 6) & 7u), xeVfetchSelect(value, (code >> 9) & 7u));
++}
+ #else
+ float4 tfetchR11G11B10(uint4 value)
+ {
+@@ -609,6 +634,9 @@
+ int vfetchPullElement(float index, bool rounded, uint strideDwords) { return 0; }
+ float4 vfetchPull(uint slot, int element, uint format, uint flags, float scale) { return 0.0; }
+ uint vfetchSiteSlot(uint site, uint baked) { return baked; }
++uint vfetchSitePerm(uint site) { return 0u; }
++#undef g_VfetchPerm
++#define g_VfetchPerm(slot) 0u
+ uint vfetchSiteStride(uint site, uint baked) { return baked; }
+ int vfetchSiteOffset(uint site, int baked) { return baked; }
+ uint vfetchSiteFormat(uint site, uint baked) { return baked; }
+@@ -678,6 +706,8 @@
+     return vk::RawBufferLoad<uint4>(table + uint64_t(96 + site) * 16);
+ }
+ uint vfetchSiteSlot(uint site, uint baked) { uint4 e = vfetchSite(site); return (e.x & 0x80000000u) != 0 ? (e.x & 0x7Fu) : baked; }
++// Bits 8..19 of a site's slot word: the site's vfetchPerm code (0 = none).
++uint vfetchSitePerm(uint site) { uint4 e = vfetchSite(site); return (e.x & 0x80000000u) != 0 ? ((e.x >> 8) & 0xFFFu) : 0u; }
+ uint vfetchSiteStride(uint site, uint baked) { uint4 e = vfetchSite(site); return (e.x & 0x80000000u) != 0 ? e.y : baked; }
+ int vfetchSiteOffset(uint site, int baked) { uint4 e = vfetchSite(site); return (e.x & 0x80000000u) != 0 ? int(e.z) : baked; }
+ uint vfetchSiteFormat(uint site, uint baked) { uint4 e = vfetchSite(site); return (e.x & 0x80000000u) != 0 ? (e.w & 0xFFu) : baked; }
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -163,6 +163,33 @@
+     return 4 * 64 + reg * 4;
+ }
+ 
++#ifdef REEOT_RECOMP
++// The entry of a vertex input in the renderer's permutation table (g_VfetchPerm
++// in shader_common.h, SharedConstants byte 1296); -1 = none. The renderer's
++// VfetchPermSlot (vertex_layout.cpp) is the same table.
++static int vfetchPermSlot(DeclUsage usage, uint32_t index)
++{
++    switch (usage)
++    {
++    case DeclUsage::Position:     return index < 8 ? int(index) : -1;
++    case DeclUsage::BlendWeight:  return index < 2 ? 8 + int(index) : -1;
++    case DeclUsage::BlendIndices: return index < 2 ? 10 + int(index) : -1;
++    case DeclUsage::Normal:       return index < 2 ? 12 + int(index) : -1;
++    case DeclUsage::Tangent:      return index < 2 ? 14 + int(index) : -1;
++    case DeclUsage::Binormal:     return index < 2 ? 16 + int(index) : -1;
++    case DeclUsage::Color:        return index < 4 ? 18 + int(index) : -1;
++    case DeclUsage::TexCoord:     return index < 16 ? 22 + int(index) : -1;
++    case DeclUsage::PointSize:    return index == 0 ? 38 : -1;
++    case DeclUsage::TessFactor:   return index == 0 ? 39 : -1;
++    case DeclUsage::PositionT:    return index == 0 ? 40 : -1;
++    case DeclUsage::Fog:          return index == 0 ? 41 : -1;
++    case DeclUsage::Depth:        return index == 0 ? 42 : -1;
++    case DeclUsage::Sample:       return index == 0 ? 43 : -1;
++    default:                      return -1;
++    }
++}
++#endif
++
+ static FetchDestinationSwizzle getDestSwizzle(uint32_t dstSwizzle, uint32_t index)
+ {
+     return FetchDestinationSwizzle((dstSwizzle >> (index * 3)) & 0x7);
+@@ -268,6 +295,13 @@
+             vertexLayout.push_back(rec);
+         }
+     }
++
++    // The renderer's component permutation of the input, applied last (the
++    // wrappers below swap and unpack the raw value; the swizzle selects from
++    // the permuted one).
++    const int permSlot = vfetchPermSlot(findResult->second.usage, uint32_t(findResult->second.usageIndex));
++    if (permSlot >= 0)
++        print("vfetchPerm(g_VfetchPerm({}), ", permSlot);
+ 
+     switch (findResult->second.usage)
+     {
+@@ -338,6 +372,8 @@
+         print(", {})", uint32_t(findResult->second.usageIndex));
+         break;
+     }
++    if (permSlot >= 0)
++        out += ')';
+ #else
+     switch (findResult->second.usage)
+     {
+@@ -383,6 +419,14 @@
+     if (!instr.isMiniFetch)
+         lastFullVfetchAddress = address;
+     const uint32_t site = pullSiteCount < 16 ? pullSiteCount++ : 0xFFu;
++    if (site == 0xFFu && pullSiteCount == 16)
++    {
++        // Sites past 16 keep the recompiled (unbound) values; one record (site
++        // 0xFF, no usage) tells the renderer this shader has some, so it does
++        // not treat the shader's unbound bank code as complete.
++        ++pullSiteCount;
++        vertexLayout.push_back({ 0x400u | (0xFFu << 16) | 0xFFu, 0 });
++    }
+     if (site != 0xFFu)
+     {
+         uint32_t usageKey = 0xFFu;
+@@ -423,8 +467,8 @@
+     print("r{}.", instr.dstRegister);
+     printDstSwizzle(instr.dstSwizzle, false);
+     if (site != 0xFFu)
+-        print(" = vfetchPull(vfetchSiteSlot({0}u, {1}u), vpElement + vfetchSiteOffset({0}u, {2}), vfetchSiteFormat({0}u, {3}u), "
+-              "vfetchSiteFlags({0}u, {4}u), vfetchSiteScale({0}u, asfloat(0x{5:X}u))).",
++        print(" = vfetchPerm(vfetchSitePerm({0}u), vfetchPull(vfetchSiteSlot({0}u, {1}u), vpElement + vfetchSiteOffset({0}u, {2}), "
++              "vfetchSiteFormat({0}u, {3}u), vfetchSiteFlags({0}u, {4}u), vfetchSiteScale({0}u, asfloat(0x{5:X}u)))).",
+             site, slot, int32_t(instr.offset), uint32_t(instr.format), flags, scaleBits);
+     else
+         print(" = vfetchPull({}u, vpElement + ({}), {}u, {}u, asfloat(0x{:X}u)).", slot, int32_t(instr.offset),

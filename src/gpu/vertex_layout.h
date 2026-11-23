@@ -12,6 +12,7 @@
 
 #include "gpu/d3d.h"
 #include "gpu/resources.h"
+#include "gpu/vfetch_perm.h"
 #include "gpu/shaders/guest_shaders.h"
 
 namespace eot::gpu {
@@ -51,7 +52,12 @@ struct InputLayout {
   u32 fetchStride[16] = {};
   u32 morphStreams = 0;
   std::vector<u8> declRaw;
+  // Fable 2: component permutation of each vertex input, by VfetchPermSlot
+  // (the translator's vfetchPerm codes, stored xor kVfetchPermIdentity: zero =
+  // none). Filled only for the shader bank's pristine vertex shaders.
+  u16 vfetchPerm[kVfetchPermSlots] = {};
 };
+
 
 const InputLayout *GetInputLayout(VideoState &s, GuestShader &vs, u32 declaration_va);
 
@@ -60,5 +66,6 @@ const std::vector<u8> &PulledSlots(GuestShader &vs);
 
 const InputLayout *GetInputLayoutFromRaw(u64 vs_hash, const std::vector<VertexInput> &inputs,
                                          const u8 *decl_raw, u32 decl_count);
+
 
 }
